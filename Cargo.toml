@@ -1,0 +1,13 @@
+
+[workspace]
+package.version = "0.1.0"
+package.edition = "2024"
+package.license = "MIT"
+package.repository = "https://github.com/tirbofish/proton-sdk-rs2"
+package.readme = "README.md"
+package.authors = ["Thribhu K <4tkbytes@pm.me>"]
+
+resolver = "3"
+members = [
+    "crates/*"
+]

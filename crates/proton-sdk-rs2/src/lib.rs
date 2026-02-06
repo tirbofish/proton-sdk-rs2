@@ -1,14 +1,62 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+use std::sync::Arc;
+
+use tokio::sync::OnceCell;
+use tokio_util::sync::CancellationToken;
+
+use crate::{api::ResponseCode, auth::AuthenticationApiClientTrait, secret::SessionSecretCache};
+
+pub mod proton {
+    include!(concat!(env!("OUT_DIR"), "/proton.sdk.rs"));
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+mod session;
+mod client;
+mod secret;
+mod api;
+mod auth;
+mod cache;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionId(String);
+
+impl SessionId {
+    pub fn new(value: String) -> Self {
+        Self(value)
     }
+
+    pub fn raw(&self) -> &String {
+        &self.0
+    }
+}
+
+impl ToString for SessionId {
+    fn to_string(&self) -> String {
+        self.0.clone()
+    }
+}
+
+pub struct UserId(String);
+
+impl UserId {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn raw(&self) -> &String {
+        &self.0
+    }
+}
+
+impl ToString for UserId {
+    fn to_string(&self) -> String {
+        self.0.clone()
+    }
+}
+
+pub struct EventId(String);
+
+pub enum PasswordMode
+{
+    Single = 1,
+    Dual = 2,
 }

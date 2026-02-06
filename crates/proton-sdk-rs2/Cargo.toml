@@ -1,7 +1,30 @@
 [package]
 name = "proton-sdk-rs2"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+authors.workspace = true
 
 [dependencies]
-proton-sdk-sys = { path = "../proton-sdk-sys" }
+semver.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+http = "1.4"
+tokio = { version = "1.49", features = ["full"] }
+tokio-util = "0.7.18"
+async-trait = "0.1.89"
+base64 = "0.22.1"
+futures = "0.3.31"
+anyhow.workspace = true
+
+proton-crypto = { version = "*", registry = "proton" }
+log = "0.4.29"
+env_logger = "0.11.8"
+dashmap = "6.1.0"
+
+# todo: use reqwest
+
+[build-dependencies]
+prost-build.workspace = true

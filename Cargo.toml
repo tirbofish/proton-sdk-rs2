@@ -8,6 +8,11 @@ package.readme = "README.md"
 package.authors = ["Thribhu K <4tkbytes@pm.me>"]
 
 resolver = "3"
-members = [
-    "crates/*"
-]
+members = ["crates/*"]
+
+[workspace.dependencies]
+semver = "1.0"
+anyhow = "1.0"
+prost-build = "0.14"
+prost = "0.14"
+prost-types = "0.14"

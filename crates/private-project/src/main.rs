@@ -4,6 +4,7 @@ mod file;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use futures::StreamExt;
 use proton_drive::client::ProtonDriveClient;
 use proton_drive::utils::PotentialObject::Node;
 use proton_sdk_rs2::session::ProtonAPISession;
@@ -57,7 +58,6 @@ async fn main() -> anyhow::Result<()> {
     println!("Renamed folder successfully");
 
     println!("Enumerating children of My Files:");
-    use futures::StreamExt;
     let mut children_stream = client
         .enumerate_folder_children(my_files.base.uid.clone())
         .await?;
@@ -66,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
     while let Some(child_result) = children_stream.next().await {
         let child = child_result?;
         if let Node(node) = child {
+            println!("{} - {}", node.ty(), node.base().name);
             if node.base().name == new_name {
                 println!("Found renamed folder: {:?}", node.base().uid);
                 found = true;

@@ -74,7 +74,7 @@ impl SharesApiClient for DefaultSharesApiClient {
 
         let response = request.send().await?;
         let text = response.text().await?;
-        println!("DEBUG: get_my_files_share raw response: {}", text);
+        tracing::debug!(body = %text, "get_my_files_share raw response");
         let response = serde_json::from_str::<ShareResponseV2>(&text)?;
 
         Ok(response)

@@ -1,3 +1,4 @@
+//! start off at [`session::ProtonAPISession`]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub mod protobuf {
@@ -15,6 +16,11 @@ pub mod secret;
 pub mod session;
 pub mod users;
 pub mod utils;
+pub mod crypto {
+    pub use proton_crypto;
+    pub use proton_rpgp;
+    pub use proton_srp;
+}
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SessionId(String);

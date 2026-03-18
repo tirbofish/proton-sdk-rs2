@@ -149,6 +149,29 @@ pub(crate) mod forgiving_hex_bytes {
     }
 }
 
+pub mod iso8601_opt {
+    use chrono::{DateTime, Utc};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(dt: &Option<DateTime<Utc>>, s: S) -> Result<S::Ok, S::Error> {
+        match dt {
+            Some(dt) => s.serialize_some(&dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<DateTime<Utc>>, D::Error> {
+        let s = Option::<String>::deserialize(d)?;
+        match s {
+            Some(s) => s
+                .parse::<DateTime<Utc>>()
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
+    }
+}
+
 pub mod epoch_seconds_opt {
     use chrono::{DateTime, TimeZone, Utc};
     use serde::{Deserialize, Deserializer, Serializer};

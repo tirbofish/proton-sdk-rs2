@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 use crate::author::Author;
 use crate::client::ProtonDriveClient;
 use crate::error::ProtonDriveError;
@@ -198,6 +200,20 @@ impl TryFrom<String> for NodeUid {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeType {
+    Folder,
+    File,
+    Photo,
+    Album,
+}
+
+impl Display for NodeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Node {
@@ -219,6 +235,16 @@ impl Node {
         match self {
             Node::Folder(n) | Node::Album(n) => &n.base,
             Node::File(n) | Node::Photo(n) => &n.base.base,
+        }
+    }
+
+    /// Returns the type of the current Node, in the case you do not want to match it.
+    pub fn ty(&self) -> NodeType {
+        match self {
+            Node::Folder(_) => NodeType::Folder,
+            Node::File(_) => NodeType::File,
+            Node::Photo(_) => NodeType::Photo,
+            Node::Album(_) => NodeType::Album,
         }
     }
 }
@@ -653,29 +679,29 @@ impl DtoToMetadataConverter {
             None => {
                 // Try to find parent key from cache
                 if let Some(parent_id) = &link_dto.parent_id {
-                    println!("DEBUG: Looking up parent folder key for {:?}", parent_id);
+                    tracing::debug!(parent_link_id = %parent_id.raw(), "Looking up parent folder key");
                     let parent_uid = NodeUid::new(_volume_id.clone(), parent_id.clone());
                     if let Some(secrets) = _secret_cache.try_get_folder_secrets(parent_uid).await? {
                         match secrets {
                             PotentialObject::Node(s) => {
-                                println!("DEBUG: Found parent folder key in cache");
+                                tracing::debug!("Found parent folder key in cache");
                                 Ok(vec![s.base.key])
                             }
                             PotentialObject::Degraded(_) => {
-                                println!("DEBUG: Parent folder key is degraded");
+                                tracing::debug!("Parent folder key is degraded");
                                 Err("Parent folder key is degraded".to_string())
                             }
                         }
                     } else {
-                        println!(
-                            "DEBUG: Parent folder key for {:?} NOT found in cache, trying user keys",
-                            parent_id
+                        tracing::debug!(
+                            parent_link_id = %parent_id.raw(),
+                            "Parent folder key NOT found in cache, trying user keys"
                         );
                         let user_keys = account_client.get_user_keys().await?;
                         if !user_keys.is_empty() {
-                            println!(
-                                "DEBUG: Found {} user keys to try as fallback",
-                                user_keys.len()
+                            tracing::debug!(
+                                count = user_keys.len(),
+                                "Found user keys to try as fallback"
                             );
                             Ok(user_keys.into_iter().map(PgpPrivateKey).collect())
                         } else {
@@ -687,21 +713,21 @@ impl DtoToMetadataConverter {
                     }
                 } else {
                     // Root folder - need share key
-                    println!("DEBUG: Looking up share key for root folder");
+                    tracing::debug!("Looking up share key for root folder");
                     if let Some(sharing) = &link_details.sharing {
                         if let Some(share_key) = _secret_cache
                             .try_get_share_key(sharing.share_id.clone())
                             .await?
                         {
-                            println!(
-                                "DEBUG: Found share key in cache for {}",
-                                sharing.share_id.raw()
+                            tracing::debug!(
+                                share_id = %sharing.share_id.raw(),
+                                "Found share key in cache"
                             );
                             Ok(vec![share_key])
                         } else {
-                            println!(
-                                "DEBUG: Share key for {} NOT found in cache",
-                                sharing.share_id.raw()
+                            tracing::debug!(
+                                share_id = %sharing.share_id.raw(),
+                                "Share key NOT found in cache"
                             );
                             Err(format!(
                                 "Share key for {:?} not found in cache",
@@ -711,9 +737,9 @@ impl DtoToMetadataConverter {
                     } else {
                         // Fallback to My Files share?
                         if let Some(share_id) = _entity_cache.try_get_my_files_share_id().await? {
-                            println!(
-                                "DEBUG: Falling back to My Files share key: {}",
-                                share_id.raw()
+                            tracing::debug!(
+                                share_id = %share_id.raw(),
+                                "Falling back to My Files share key"
                             );
                             if let Some(share_key) =
                                 _secret_cache.try_get_share_key(share_id).await?
@@ -723,8 +749,8 @@ impl DtoToMetadataConverter {
                                 Err("My Files share key not found in cache".to_string())
                             }
                         } else {
-                            println!(
-                                "DEBUG: No parent key, no sharing, and no My Files fallback available"
+                            tracing::debug!(
+                                "No parent key, no sharing, and no My Files fallback available"
                             );
                             Err("Parent key not provided and no sharing info available".to_string())
                         }

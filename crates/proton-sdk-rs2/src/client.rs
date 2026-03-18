@@ -14,7 +14,6 @@ use crate::{
     users::DefaultUsersApiClient,
 };
 
-// the protos are bad
 pub struct ProtonClientOptions {
     pub base_url: Option<http::Uri>,
     pub user_agent: Option<String>,

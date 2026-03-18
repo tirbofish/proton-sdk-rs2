@@ -410,6 +410,7 @@ impl ProtonDriveClient {
         size: i64,
         last_modification_time: Option<std::time::SystemTime>,
         additional_metadata: Option<Vec<AdditionalMetadataProperty>>,
+        media_info: Option<crate::api::attr::MediaExtendedAttributes>,
         override_existing_draft_by_other_client: bool,
     ) -> anyhow::Result<FileUploader> {
         let draft_provider = NewFileDraftProvider {
@@ -425,6 +426,7 @@ impl ProtonDriveClient {
             size,
             last_modification_time,
             additional_metadata,
+            media_info,
         )
         .await
     }
@@ -435,6 +437,7 @@ impl ProtonDriveClient {
         size: i64,
         last_modification_time: Option<std::time::SystemTime>,
         additional_metadata: Option<Vec<AdditionalMetadataProperty>>,
+        media_info: Option<crate::api::attr::MediaExtendedAttributes>,
     ) -> anyhow::Result<FileUploader> {
         let draft_provider = NewRevisionDraftProvider {
             client: Arc::new(self.clone()),
@@ -447,6 +450,7 @@ impl ProtonDriveClient {
             size,
             last_modification_time,
             additional_metadata,
+            media_info,
         )
         .await
     }
@@ -501,6 +505,13 @@ impl ProtonDriveClient {
             .first_or_octet_stream()
             .to_string();
 
+        let file_data = std::fs::read(path)?;
+        let (thumbnails, media_info) = if media_type.starts_with("image/") {
+            crate::utils::thumbnail::ThumbnailGenerator::generate_thumbnails(&file_data)
+        } else {
+            (Vec::new(), None)
+        };
+
         let uploader = self
             .get_file_uploader(
                 parent_folder_uid,
@@ -509,13 +520,13 @@ impl ProtonDriveClient {
                 size,
                 last_modified,
                 None,
+                media_info,
                 override_existing,
             )
             .await?;
 
-        let file = tokio::fs::File::open(path).await?;
         uploader
-            .upload_from_stream(Box::new(file), on_progress)
+            .upload_from_stream(Box::new(std::io::Cursor::new(file_data)), thumbnails, on_progress)
             .await
     }
 
@@ -579,6 +590,7 @@ impl ProtonDriveClient {
         size: i64,
         last_modification_time: Option<std::time::SystemTime>,
         additional_metadata: Option<Vec<AdditionalMetadataProperty>>,
+        media_info: Option<crate::api::attr::MediaExtendedAttributes>,
     ) -> anyhow::Result<FileUploader> {
         FileUploader::create(
             self,
@@ -586,6 +598,7 @@ impl ProtonDriveClient {
             size,
             last_modification_time,
             additional_metadata,
+            media_info,
         )
         .await
     }

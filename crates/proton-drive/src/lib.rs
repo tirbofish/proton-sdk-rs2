@@ -20,6 +20,7 @@ pub mod share_ops;
 pub mod utils;
 pub mod volume;
 pub mod volume_operations;
+pub use proton_sdk_rs2;
 
 pub mod protobuf {
     include!(concat!(env!("OUT_DIR"), "/proton.drive.sdk.rs"));

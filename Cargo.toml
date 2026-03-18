@@ -34,3 +34,19 @@ chrono = { version = "0.4", features = ["serde"]}
 proton-rpgp = { git = "https://github.com/ProtonMail/proton-crypto-rs" }
 bytes = "1.11"
 bitflags = "2.11"
+sha2 = "0.11.0-rc.5"
+sha1 = "0.10.6"
+hmac = "0.13.0-rc.5"
+hex = "0.4.3"
+serde_with = "3.18.0"
+serde_repr = "0.1.20"
+reqwest-middleware = { version = "0.5.1", features = ["json", "multipart"] }
+rand = "0.8.5"
+smallvec = "1.15.1"
+thiserror = "2.0.18"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12.5"
+mime_guess = "2.0.5"
+image = { version = "0.25.5", features = ["png", "jpeg", "webp"] }
+rpassword = "7.4.0"

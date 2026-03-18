@@ -13,6 +13,7 @@ pub struct FileUploader {
     size: i64,
     last_modification_time: Option<DateTime<Utc>>,
     additional_metadata: Option<Vec<AdditionalMetadataProperty>>,
+    media_info: Option<crate::api::attr::MediaExtendedAttributes>,
 }
 
 impl FileUploader {
@@ -22,6 +23,7 @@ impl FileUploader {
         size: i64,
         last_modification_time: Option<std::time::SystemTime>,
         additional_metadata: Option<Vec<AdditionalMetadataProperty>>,
+        media_info: Option<crate::api::attr::MediaExtendedAttributes>,
     ) -> anyhow::Result<Self> {
         let expected_number_of_blocks = (size + 4 * 1024 * 1024 - 1) / (4 * 1024 * 1024);
         client
@@ -36,12 +38,14 @@ impl FileUploader {
             size,
             last_modification_time: last_modification_time.map(DateTime::from),
             additional_metadata,
+            media_info,
         })
     }
 
     pub async fn upload_from_stream(
         &self,
         content_stream: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        thumbnails: Vec<crate::node::thumbnail::Thumbnail>,
         on_progress: Box<dyn Fn(i64, i64) + Send + Sync>,
     ) -> anyhow::Result<()> {
         let draft = self.revision_draft_provider.get_draft().await?;
@@ -60,8 +64,11 @@ impl FileUploader {
                 self.size,
                 self.last_modification_time,
                 self.additional_metadata.clone(),
+                self.media_info.clone(),
             )
             .await?;
+
+        writer.upload_thumbnails(thumbnails).await?;
 
         writer.write(content_stream, on_progress_arc).await?;
         writer.commit().await

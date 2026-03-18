@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct FileContentDigestsDto {
     #[serde(rename = "SHA1")]
@@ -232,7 +232,11 @@ impl FilesApiClient for DefaultFilesApiClient {
             .await?
             .json::<BlockUploadPreparationResponse>()
             .await?;
-        tracing::info!(targets = resp.upload_targets.len(), "Block upload prepared");
+        tracing::info!(
+            blocks = resp.upload_targets.len(),
+            thumbnails = resp.thumbnail_upload_targets.len(),
+            "Block upload prepared"
+        );
         Ok(resp)
     }
 

@@ -104,8 +104,8 @@ impl TrashApiClient for DefaultTrashApiClient {
         let result = match serde_json::from_str::<AggregateApiResponse<LinkIdResponsePair>>(&text) {
             Ok(r) => r,
             Err(e) => {
-                println!("DEBUG: trash_multiple failed to deserialize: {}", e);
-                println!("DEBUG: Full response: {}", text);
+                tracing::warn!(error = %e, "trash_multiple failed to deserialize");
+                tracing::debug!(body = %text, "Full response");
                 return Err(e.into());
             }
         };

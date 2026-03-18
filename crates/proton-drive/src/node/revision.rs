@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use sha1::Digest;
+use proton_rpgp::pgp::ser::Serialize as _;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 
@@ -129,6 +130,7 @@ impl RevisionOperations {
         expected_size: i64,
         last_modification_time: Option<DateTime<Utc>>,
         additional_metadata: Option<Vec<AdditionalMetadataProperty>>,
+        media_info: Option<crate::api::attr::MediaExtendedAttributes>,
     ) -> anyhow::Result<RevisionWriter> {
         let file_permit = client.block_uploader().queue.start_file().await?;
 
@@ -142,10 +144,12 @@ impl RevisionOperations {
             block_number: 1,
             digests: Vec::new(),
             block_sizes: Vec::new(),
+            thumbnail_digests: Vec::new(),
             sha1_hasher: sha1::Sha1::default(),
             expected_size,
             last_modification_time,
             additional_metadata,
+            media_info,
         })
     }
 
@@ -209,10 +213,12 @@ pub struct RevisionWriter {
     block_number: i32,
     digests: Vec<u8>,
     block_sizes: Vec<i32>,
+    thumbnail_digests: Vec<u8>,
     sha1_hasher: sha1::Sha1,
     expected_size: i64,
     last_modification_time: Option<DateTime<Utc>>,
     additional_metadata: Option<Vec<AdditionalMetadataProperty>>,
+    media_info: Option<crate::api::attr::MediaExtendedAttributes>,
 }
 
 impl RevisionWriter {
@@ -272,20 +278,47 @@ impl RevisionWriter {
         }
         Ok(())
     }
-    pub async fn upload_thumbnail(
+    pub async fn upload_thumbnails(
         &mut self,
-        thumbnail_type: crate::node::thumbnail::ThumbnailType,
-        thumbnail_data: &[u8],
+        thumbnails: Vec<crate::node::thumbnail::Thumbnail>,
     ) -> anyhow::Result<()> {
         use crate::api::block::BlockUploadPreparationRequest;
         use crate::api::file::thumbnail::ThumbnailCreationRequest;
         use sha2::{Digest, Sha256};
+        use proton_rpgp::Encryptor;
 
-        // 1. Prepare thumbnail upload
-        let mut hasher = Sha256::new();
-        hasher.update(thumbnail_data);
-        let hash_digest = hasher.finalize().to_vec();
+        if thumbnails.is_empty() {
+            return Ok(());
+        }
 
+        let mut requests = Vec::new();
+        let mut encrypted_thumbnails = Vec::new();
+
+        let sk = self.draft.content_key.to_rpgp_sk()?;
+
+        for thumb in thumbnails {
+            let encryptor = Encryptor::default()
+                .with_session_key(sk.clone())
+                .with_signing_key(&self.draft.signing_key.0);
+
+            // 1. Encrypt the thumbnail data
+            let result = encryptor.encrypt(&thumb.content)?;
+            let encrypted_data = result.to_bytes()?;
+
+            // 2. Compute SHA256 of the ENCRYPTED data
+            let mut hasher = Sha256::new();
+            hasher.update(&encrypted_data);
+            let hash_digest = hasher.finalize().to_vec();
+
+            requests.push(ThumbnailCreationRequest {
+                size: encrypted_data.len() as i32,
+                r#type: thumb.r#type,
+                hash_digest: hash_digest.clone(),
+            });
+            encrypted_thumbnails.push((thumb.r#type, encrypted_data, hash_digest));
+        }
+
+        // 3. Prepare thumbnails upload
         let request = BlockUploadPreparationRequest {
             address_id: crate::account::AddressId::new(
                 self.draft.membership_address.address_id.clone(),
@@ -294,11 +327,7 @@ impl RevisionWriter {
             link_id: self.draft.uid.node_uid.link_id.clone(),
             revision_id: self.draft.uid.revision_id.clone(),
             blocks: vec![],
-            thumbnails: vec![ThumbnailCreationRequest {
-                size: thumbnail_data.len() as i32,
-                r#type: thumbnail_type,
-                hash_digest: hash_digest.clone(),
-            }],
+            thumbnails: requests,
         };
 
         let response = self
@@ -307,22 +336,32 @@ impl RevisionWriter {
             .files()
             .prepare_block_upload(request)
             .await?;
-        if response.thumbnail_upload_targets.is_empty() {
-            anyhow::bail!("No thumbnail upload target received from API");
+        
+        if response.thumbnail_upload_targets.len() != encrypted_thumbnails.len() {
+            anyhow::bail!("Mismatch in received thumbnail upload targets");
         }
 
-        let target = &response.thumbnail_upload_targets[0];
+        for (target, (thumb_type, encrypted_data, hash_digest)) in response.thumbnail_upload_targets.iter().zip(encrypted_thumbnails) {
+            tracing::info!(
+                thumbnail_type = ?thumb_type,
+                url = %target.base.bare_url,
+                "Uploading thumbnail blob"
+            );
 
-        // 2. Upload thumbnail blob
-        self.client
-            .api()
-            .storage()
-            .upload_blob(
-                &target.base.bare_url,
-                &target.base.token,
-                bytes::Bytes::copy_from_slice(thumbnail_data),
-            )
-            .await?;
+            // 4. Upload thumbnail blob
+            self.client
+                .api()
+                .storage()
+                .upload_blob(
+                    &target.base.bare_url,
+                    &target.base.token,
+                    bytes::Bytes::from(encrypted_data),
+                )
+                .await?;
+
+            // 5. Store digest for manifest
+            self.thumbnail_digests.extend_from_slice(&hash_digest);
+        }
 
         Ok(())
     }
@@ -333,10 +372,21 @@ impl RevisionWriter {
         use proton_rpgp::DataEncoding;
         use proton_rpgp::{Encryptor, Signer};
 
-        tracing::info!(total_written = self.total_written, blocks = self.block_sizes.len(), "Committing revision");
+        tracing::info!(
+            total_written = self.total_written,
+            blocks = self.block_sizes.len(),
+            thumbnail_digests = self.thumbnail_digests.len(),
+            content_digests = self.digests.len(),
+            "Committing revision"
+        );
         let signer = Signer::default().with_signing_key(&self.draft.signing_key.0);
+        
+        let mut manifest = Vec::with_capacity(self.thumbnail_digests.len() + self.digests.len());
+        manifest.extend_from_slice(&self.thumbnail_digests);
+        manifest.extend_from_slice(&self.digests);
+
         let manifest_signature = PgpArmoredSignature(String::from_utf8(
-            signer.sign_detached(&self.digests, DataEncoding::Armored)?,
+            signer.sign_detached(&manifest, DataEncoding::Armored)?,
         )?);
 
         // 2. Prepare Extended Attributes
@@ -355,6 +405,7 @@ impl RevisionWriter {
                 block_sizes: Some(self.block_sizes.clone()),
                 digests: Some(crate::api::file::FileContentDigestsDto { sha1: Some(sha1_digest) }),
             }),
+            media: self.media_info.clone(),
             additional_metadata,
         };
 

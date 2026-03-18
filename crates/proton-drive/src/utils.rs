@@ -5,6 +5,7 @@ use ::serde::{Deserialize, Serialize};
 pub mod batch;
 pub mod semaphore;
 pub mod serde;
+pub mod thumbnail;
 
 pub struct AlternateFileNameGenerator;
 
@@ -35,6 +36,7 @@ fn split_name_and_extension(file_name: &str) -> (&str, &str) {
     (file_name, "")
 }
 
+/// An enum used to show between a Node and a DegradedNode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PotentialObject<N, DN> {
     Node(N),

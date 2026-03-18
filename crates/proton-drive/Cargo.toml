@@ -1,7 +1,11 @@
 [package]
 name = "proton-drive"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+authors.workspace = true
 
 [dependencies]
 proton-sdk-rs2 = { path = "../proton-sdk-rs2" }
@@ -22,20 +26,21 @@ base64.workspace = true
 log.workspace = true
 bytes.workspace = true
 http.workspace = true
-sha2 = "0.11.0-rc.5"
-sha1 = "0.10.6"
-hmac = "0.13.0-rc.5"
-hex = "0.4.3"
-serde_with = "3.18.0"
-serde_repr = "0.1.20"
-bitflags = {version = "2.11.0", features = ["serde"]}
-reqwest-middleware = { version = "0.5.1", features = ["json", "multipart"] }
-rand = "0.8.5"
-smallvec = "1.15.1"
-thiserror = "2.0.18"
-tracing = "0.1.44"
-parking_lot = "0.12.5"
-mime_guess = "2.0.5"
+sha2.workspace = true
+sha1.workspace = true
+hmac.workspace = true
+hex.workspace = true
+serde_with.workspace = true
+serde_repr.workspace = true
+bitflags.workspace = true
+reqwest-middleware.workspace = true
+rand.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+mime_guess.workspace = true
+image.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true

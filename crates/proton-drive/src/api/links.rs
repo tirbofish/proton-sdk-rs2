@@ -117,8 +117,8 @@ impl LinksApiClient for DefaultLinksApiClient {
         let result = match serde_json::from_str::<LinkDetailsResponse>(&text) {
             Ok(r) => r,
             Err(e) => {
-                println!("DEBUG: LinkDetailsResponse failed to deserialize: {}", e);
-                println!("DEBUG: Full response: {}", text);
+                tracing::warn!(error = %e, "LinkDetailsResponse failed to deserialize");
+                tracing::debug!(body = %text, "Full response");
                 return Err(e.into());
             }
         };

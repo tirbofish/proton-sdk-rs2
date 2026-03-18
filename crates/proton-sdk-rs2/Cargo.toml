@@ -1,0 +1,33 @@
+[package]
+name = "proton-sdk-rs2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+authors.workspace = true
+
+[dependencies]
+semver.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+http.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+futures.workspace = true
+anyhow.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bitflags.workspace = true
+
+proton-crypto.workspace = true
+log.workspace = true
+env_logger.workspace = true
+dashmap.workspace = true
+proton-srp.workspace = true
+proton-rpgp.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true

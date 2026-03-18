@@ -1,0 +1,148 @@
+use crate::api::ApiResponse;
+use async_trait::async_trait;
+use bytes::Bytes;
+use proton_sdk_rs2::auth::TokenCredential;
+use reqwest_middleware::ClientWithMiddleware;
+use std::time::Duration;
+use tokio::time::sleep;
+
+const MAX_RETRIES: u32 = 3;
+const RETRY_BASE_DELAY_MS: u64 = 500;
+
+#[async_trait]
+pub trait StorageApiClient: Send + Sync {
+    async fn upload_blob(
+        &self,
+        base_url: &str,
+        token: &str,
+        data: bytes::Bytes,
+    ) -> anyhow::Result<ApiResponse>;
+
+    async fn get_blob_stream(
+        &self,
+        base_url: &str,
+        token: &str,
+    ) -> anyhow::Result<reqwest::Response>;
+}
+
+pub struct DefaultStorageApiClient {
+    #[allow(dead_code)]
+    http_client: ClientWithMiddleware,
+    storage_client: ClientWithMiddleware,
+    _default_api_base_url: reqwest::Url,
+    _storage_api_base_url: reqwest::Url,
+    token_credential: Option<TokenCredential>,
+}
+
+impl DefaultStorageApiClient {
+    pub fn new(
+        http_client: ClientWithMiddleware,
+        storage_client: ClientWithMiddleware,
+        default_api_base_url: reqwest::Url,
+        storage_api_base_url: reqwest::Url,
+        token_credential: Option<TokenCredential>,
+    ) -> Self {
+        Self {
+            http_client,
+            storage_client,
+            _default_api_base_url: default_api_base_url,
+            _storage_api_base_url: storage_api_base_url,
+            token_credential,
+        }
+    }
+
+    async fn add_auth_headers(
+        &self,
+        mut builder: reqwest_middleware::RequestBuilder,
+    ) -> anyhow::Result<reqwest_middleware::RequestBuilder> {
+        if let Some(credential) = &self.token_credential {
+            let (access_token, _) = credential.get_tokens().await?;
+            builder = builder.header("Authorization", format!("Bearer {}", access_token));
+            builder = builder.header("x-pm-uid", credential.session_id().raw());
+        }
+        Ok(builder)
+    }
+}
+
+#[async_trait]
+impl StorageApiClient for DefaultStorageApiClient {
+    async fn upload_blob(
+        &self,
+        base_url: &str,
+        token: &str,
+        data: Bytes,
+    ) -> anyhow::Result<ApiResponse> {
+        let mut last_err = None;
+
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let delay = Duration::from_millis(RETRY_BASE_DELAY_MS * (1 << (attempt - 1)));
+                sleep(delay).await;
+            }
+
+            let blob_part = reqwest::multipart::Part::bytes(Vec::<u8>::from(data.clone()))
+                .file_name("blob")
+                .mime_str("application/octet-stream")?;
+
+            let form = reqwest::multipart::Form::new().part("Block", blob_part);
+
+            let builder = self
+                .storage_client
+                .post(base_url)
+                .header("pm-storage-token", token)
+                .multipart(form);
+
+            let builder = self.add_auth_headers(builder).await?;
+
+            match builder.send().await {
+                Ok(response) => {
+                    if response.status().is_server_error() {
+                        last_err = Some(anyhow::anyhow!(
+                            "server error on attempt {}: {}",
+                            attempt + 1,
+                            response.status()
+                        ));
+                        continue;
+                    }
+                    return Ok(response.json::<ApiResponse>().await?);
+                }
+                Err(e) => {
+                    // retry on network errors
+                    if e.is_connect() || e.is_timeout() {
+                        last_err = Some(anyhow::anyhow!(
+                            "network error on attempt {}: {}",
+                            attempt + 1,
+                            e
+                        ));
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            }
+        }
+
+        Err(last_err
+            .unwrap_or_else(|| anyhow::anyhow!("upload failed after {} attempts", MAX_RETRIES + 1)))
+    }
+
+    async fn get_blob_stream(
+        &self,
+        bare_url: &str,
+        token: &str,
+    ) -> anyhow::Result<reqwest::Response> {
+        let builder = self
+            .storage_client
+            .get(bare_url)
+            .header("pm-storage-token", token);
+
+        let builder = self.add_auth_headers(builder).await?;
+
+        let response = builder.send().await?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("blob download failed with status {}", response.status());
+        }
+
+        Ok(response)
+    }
+}

@@ -1,0 +1,28 @@
+[package]
+name = "private-project"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+authors.workspace = true
+
+[dependencies]
+proton-sdk-rs2 = { path = "../proton-sdk-rs2" }
+proton-drive = { path = "../proton-drive" }
+
+tokio.workspace = true
+semver.workspace = true
+serde.workspace = true
+ron.workspace = true
+anyhow.workspace = true
+rpassword = "7.4.0"
+env_logger.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+log.workspace = true
+dashmap.workspace = true
+serde_json.workspace = true
+parking_lot = "*"
+hex = "0.4"
+proton-rpgp.workspace = true

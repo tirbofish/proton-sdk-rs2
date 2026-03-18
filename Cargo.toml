@@ -1,0 +1,36 @@
+
+[workspace]
+package.version = "0.1.0"
+package.edition = "2024"
+package.license = "MIT"
+package.repository = "https://github.com/tirbofish/proton-sdk-rs2"
+package.readme = "README.md"
+package.authors = ["Thribhu K <4tkbytes@pm.me>"]
+
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.dependencies]
+semver = "1.0"
+anyhow = "1.0"
+prost-build = "0.11"
+prost = "0.11"
+prost-types = "0.11"
+reqwest = { version = "0.13", features = ["json"] }
+proton-srp = { git = "https://github.com/ProtonMail/proton-crypto-rs", features = ["pgpinternal"]}
+tokio = { version = "1.50", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+env_logger = "0.11"
+dashmap = "6.1"
+http = "1.4"
+async-trait = "0.1"
+base64 = "0.22"
+futures = "0.3"
+proton-crypto = { version = "*", registry = "proton" }
+ron = "0.12"
+chrono = { version = "0.4", features = ["serde"]}
+proton-rpgp = { git = "https://github.com/ProtonMail/proton-crypto-rs" }
+bytes = "1.11"
+bitflags = "2.11"

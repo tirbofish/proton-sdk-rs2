@@ -1,11 +1,11 @@
-use std::sync::Arc;
 use crate::api::cache::{AccountClientCache, DefaultAccountClientCache};
 use crate::api::client::{AccountApiClients, DefaultAccountApiClients};
 use crate::protobuf::{Address, AddressKey};
 use crate::session::ProtonAPISession;
 use proton_rpgp::{
-    AsPublicKeyRef, DataEncoding, Decryptor, ExternalDetachedSignature, PrivateKey, PublicKey
+    AsPublicKeyRef, DataEncoding, Decryptor, ExternalDetachedSignature, PrivateKey, PublicKey,
 };
+use std::sync::Arc;
 
 pub struct ProtonAccountClient {
     pub api: Arc<dyn AccountApiClients>,
@@ -19,44 +19,31 @@ impl ProtonAccountClient {
                 session.http_client.clone(),
                 session.token_credential.clone(),
             )),
-            cache: Arc::new(DefaultAccountClientCache::new(session.client_config.entity_cache_repository.clone(), session.client_config.secret_cache_repository.clone(), session.session_secret_cache.clone())),
+            cache: Arc::new(DefaultAccountClientCache::new(
+                session.client_config.entity_cache_repository.clone(),
+                session.client_config.secret_cache_repository.clone(),
+                session.session_secret_cache.clone(),
+            )),
         }
     }
 
-    pub async fn get_address(
-        &self,
-        address_id: &str,
-    ) -> anyhow::Result<Address> {
-        if let Some(address) = self
-            .cache
-            .entities()
-            .try_get_address(address_id)
-            .await?
-        {
+    pub async fn get_address(&self, address_id: &str) -> anyhow::Result<Address> {
+        if let Some(address) = self.cache.entities().try_get_address(address_id).await? {
             return Ok(address);
         }
 
-        let response = self
-            .api
-            .addresses()
-            .get_address(address_id)
-            .await?;
+        let response = self.api.addresses().get_address(address_id).await?;
 
         let user_keys = self.get_user_keys().await?;
 
         let address = self
             .convert_from_address_dto(response.address, &user_keys)
             .await?;
-        self.cache
-            .entities()
-            .set_address(&address)
-            .await?;
+        self.cache.entities().set_address(&address).await?;
         Ok(address)
     }
 
-    pub async fn get_current_user_addresses(
-        &self,
-    ) -> anyhow::Result<Vec<Address>> {
+    pub async fn get_current_user_addresses(&self) -> anyhow::Result<Vec<Address>> {
         if let Some(addresses) = self
             .cache
             .entities()
@@ -66,20 +53,13 @@ impl ProtonAccountClient {
             return Ok(addresses);
         }
 
-        let response = self
-            .api
-            .addresses()
-            .get_addresses()
-            .await?;
+        let response = self.api.addresses().get_addresses().await?;
 
         let user_keys = self.get_user_keys().await?;
 
         let mut addresses = Vec::new();
         for dto in response.addresses {
-            match self
-                .convert_from_address_dto(dto, &user_keys, )
-                .await
-            {
+            match self.convert_from_address_dto(dto, &user_keys).await {
                 Ok(address) => addresses.push(address),
                 Err(error) => {
                     log::warn!("Failed to load address: {error}");
@@ -89,15 +69,13 @@ impl ProtonAccountClient {
 
         self.cache
             .entities()
-            .set_current_user_addresses(&addresses, )
+            .set_current_user_addresses(&addresses)
             .await?;
 
         Ok(addresses)
     }
 
-    pub async fn get_current_user_default_address(
-        &self,
-    ) -> anyhow::Result<Address> {
+    pub async fn get_current_user_default_address(&self) -> anyhow::Result<Address> {
         let mut addresses = self.get_current_user_addresses().await?;
         if addresses.is_empty() {
             anyhow::bail!("User has no address")
@@ -113,7 +91,7 @@ impl ProtonAccountClient {
         if let Some(keys) = self
             .cache
             .secrets()
-            .try_get_address_keys(address_id, )
+            .try_get_address_keys(address_id)
             .await?
         {
             log::debug!("Located keys");
@@ -121,12 +99,12 @@ impl ProtonAccountClient {
         }
 
         log::debug!("Address id: {:?}", address_id);
-        let _ = self.get_address(address_id, ).await?;
+        let _ = self.get_address(address_id).await?;
 
         if let Some(keys) = self
             .cache
             .secrets()
-            .try_get_address_keys(address_id, )
+            .try_get_address_keys(address_id)
             .await?
         {
             return Ok(keys);
@@ -139,10 +117,8 @@ impl ProtonAccountClient {
         &self,
         address_id: &str,
     ) -> anyhow::Result<PrivateKey> {
-        let address = self.get_address(address_id, ).await?;
-        let keys = self
-            .get_address_private_keys(address_id, )
-            .await?;
+        let address = self.get_address(address_id).await?;
+        let keys = self.get_address_private_keys(address_id).await?;
         let index = usize::try_from(address.primary_key_index).unwrap_or(0);
         keys.get(index)
             .cloned()
@@ -154,9 +130,7 @@ impl ProtonAccountClient {
         address_id: &str,
         index: usize,
     ) -> anyhow::Result<PrivateKey> {
-        let keys = self
-            .get_address_private_keys(address_id, )
-            .await?;
+        let keys = self.get_address_private_keys(address_id).await?;
         keys.get(index)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Address key index out of bounds"))
@@ -192,48 +166,48 @@ impl ProtonAccountClient {
         Ok(keys)
     }
 
-    pub async fn get_user_keys(
-        &self,
-    ) -> anyhow::Result<Vec<PrivateKey>> {
-        if let Some(keys) = self.cache
-            .secrets()
-            .try_get_user_keys()
-            .await?
-        {
+    pub async fn get_user_keys(&self) -> anyhow::Result<Vec<PrivateKey>> {
+        if let Some(keys) = self.cache.secrets().try_get_user_keys().await? {
             return Ok(keys);
         }
 
-        let response = self
-            .api
-            .users()
-            .get_user()
-            .await?;
+        let response = self.api.users().get_user().await?;
 
         let mut unlocked = Vec::new();
         let mut active_key_found = false;
 
-        for key in response.user.ok_or(anyhow::anyhow!("Unable to get keys from user"))?.keys {
+        for key in response
+            .user
+            .ok_or(anyhow::anyhow!("Unable to get keys from user"))?
+            .keys
+        {
             if !key.is_active {
                 continue;
             }
 
             active_key_found = true;
 
-            if let Ok(unlocked_user_key) = PrivateKey::import_unlocked(key.private_key.as_bytes(), DataEncoding::Auto) {
+            if let Ok(unlocked_user_key) =
+                PrivateKey::import_unlocked(key.private_key.as_bytes(), DataEncoding::Auto)
+            {
                 unlocked.push(unlocked_user_key);
                 continue;
             }
 
-            let Some(passphrase) = self.cache.session_secrets().try_get_account_key_passphrase(
-                &key.id, 
-            ).await? else {
+            let Some(passphrase) = self
+                .cache
+                .session_secrets()
+                .try_get_account_key_passphrase(&key.id)
+                .await?
+            else {
                 log::warn!("Unable to locate passphrase for user key {:?}", key.id);
                 continue;
             };
 
             log::debug!("Passphrase: {:?}", String::from_utf8(passphrase.to_vec()));
 
-            let unlocked_user_key = PrivateKey::import(key.private_key.as_bytes(), &passphrase, DataEncoding::Auto)?;
+            let unlocked_user_key =
+                PrivateKey::import(key.private_key.as_bytes(), &passphrase, DataEncoding::Auto)?;
             unlocked.push(unlocked_user_key);
         }
 
@@ -241,19 +215,14 @@ impl ProtonAccountClient {
             anyhow::bail!(
                 "{}",
                 if active_key_found {
-                    format!(
-                        "At least one active user key exists, but none could be unlocked"
-                    )
+                    format!("At least one active user key exists, but none could be unlocked")
                 } else {
                     "No active user key found".to_string()
                 }
             )
         }
 
-        self.cache
-            .secrets()
-            .set_user_keys(&unlocked, )
-            .await?;
+        self.cache.secrets().set_user_keys(&unlocked).await?;
 
         Ok(unlocked)
     }
@@ -288,8 +257,13 @@ impl ProtonAccountClient {
             let imported = if let (Some(token), Some(signature)) =
                 (key_dto.token.as_ref(), key_dto.signature.as_ref())
             {
-                let passphrase = Self::get_address_key_token_passphrase(token, signature, user_keys)?;
-                PrivateKey::import(key_dto.private_key.as_bytes(), passphrase.as_slice(), DataEncoding::Auto)
+                let passphrase =
+                    Self::get_address_key_token_passphrase(token, signature, user_keys)?;
+                PrivateKey::import(
+                    key_dto.private_key.as_bytes(),
+                    passphrase.as_slice(),
+                    DataEncoding::Auto,
+                )
             } else {
                 let passphrase = self
                     .cache
@@ -322,7 +296,7 @@ impl ProtonAccountClient {
         if !unlocked.is_empty() {
             self.cache
                 .secrets()
-                .set_address_keys(&dto.id, &unlocked, )
+                .set_address_keys(&dto.id, &unlocked)
                 .await?;
         }
 

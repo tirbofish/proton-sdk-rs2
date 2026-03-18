@@ -23,3 +23,8 @@ A port of the Proton SDK (specifically the drive implementation) from c# to rust
 - [ ] uploads
 - [ ] thumbnails
 - [ ] events (doable, not in c# library but available in js lib)
+
+
+<!-- if anyone is reading the comment of this repository:
+yeah hi i previously had done a lot of commits but my dumbass decided to commit my pgp private key when i was doing one of my
+tests so now it only looks like i have done one commit. fuck my fat chungus life... -->

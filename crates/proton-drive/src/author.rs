@@ -4,7 +4,9 @@ pub struct Author {
 }
 
 impl Author {
-    pub const ANONYMOUS: Author = Author { email_address: None };
+    pub const ANONYMOUS: Author = Author {
+        email_address: None,
+    };
 
     pub fn try_get_identity(&self) -> Option<&str> {
         self.email_address.as_deref()

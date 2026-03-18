@@ -1,15 +1,13 @@
+use reqwest::StatusCode;
 use serde::Deserialize;
 use serde::de::Error as _;
-use reqwest::StatusCode;
 
 use crate::api::ApiResponse;
 use crate::auth::TokenCredential;
 
 #[async_trait::async_trait]
 pub trait UsersApiClient: Send + Sync {
-    async fn get_user(
-        &self,
-    ) -> anyhow::Result<UserResponse>;
+    async fn get_user(&self) -> anyhow::Result<UserResponse>;
 }
 
 pub struct DefaultUsersApiClient {
@@ -45,9 +43,7 @@ impl DefaultUsersApiClient {
 
 #[async_trait::async_trait]
 impl UsersApiClient for DefaultUsersApiClient {
-    async fn get_user(
-        &self,
-    ) -> anyhow::Result<UserResponse> {
+    async fn get_user(&self) -> anyhow::Result<UserResponse> {
         let endpoint = Self::endpoint("core/v4/users")?;
 
         let response = if let Some(token_credential) = &self.token_credential {
@@ -64,10 +60,9 @@ impl UsersApiClient for DefaultUsersApiClient {
 
             if first.status() == StatusCode::UNAUTHORIZED {
                 let refreshed = token_credential
-                    .get_refreshed_access_token(access_token, )
+                    .get_refreshed_access_token(access_token)
                     .await?;
-                self
-                    .http_client
+                self.http_client
                     .get(endpoint)
                     .bearer_auth(refreshed)
                     .header("x-pm-uid", session_id.raw())
@@ -78,8 +73,7 @@ impl UsersApiClient for DefaultUsersApiClient {
                 first.error_for_status()?
             }
         } else {
-            self
-                .http_client
+            self.http_client
                 .get(endpoint)
                 .send()
                 .await?
@@ -142,6 +136,8 @@ where
             Err(D::Error::custom("cannot parse boolean-like string"))
         }
         serde_json::Value::Null => Ok(false),
-        _ => Err(D::Error::custom("expected bool/int/string for boolean field")),
+        _ => Err(D::Error::custom(
+            "expected bool/int/string for boolean field",
+        )),
     }
 }

@@ -1,15 +1,13 @@
-pub(crate) mod response;
-pub mod client;
 pub mod cache;
+pub mod client;
+pub(crate) mod response;
 
 use http::Uri;
 use serde::{Deserialize, Deserializer};
 
 use crate::{
-    addresses::DefaultAddressesApiClient,
-    auth::DefaultAuthenticationApiClient,
-    keys::DefaultKeysApiClient,
-    users::DefaultUsersApiClient,
+    addresses::DefaultAddressesApiClient, auth::DefaultAuthenticationApiClient,
+    keys::DefaultKeysApiClient, users::DefaultUsersApiClient,
 };
 
 pub trait ApiClientFactory {
@@ -37,8 +35,8 @@ pub trait ApiClientFactory {
     }
 }
 
-use crate::api::ResponseCode::ProtonDriveUnknown;
 use crate::api::ResponseCode::CustomCode;
+use crate::api::ResponseCode::ProtonDriveUnknown;
 
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
@@ -57,8 +55,7 @@ impl ApiResponse {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ResponseCode
-{
+pub enum ResponseCode {
     Unknown = 0,
 
     Unauthorized = 401,
@@ -149,4 +146,3 @@ impl<'de> Deserialize<'de> for ResponseCode {
         Ok(mapped)
     }
 }
-

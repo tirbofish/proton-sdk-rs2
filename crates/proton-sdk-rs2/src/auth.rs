@@ -2,12 +2,18 @@ use std::sync::Arc;
 
 use http::Uri;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
-use serde::{Serialize};
+use serde::Serialize;
 use tokio::sync::{OnceCell, RwLock, broadcast};
 
 use crate::{
     SessionId,
-    api::{ApiResponse, response::{AuthenticationResponse, ModulusResponse, RefreshSessionResponse, ScopesResponse, SesisonInitiationResponse}},
+    api::{
+        ApiResponse,
+        response::{
+            AuthenticationResponse, ModulusResponse, RefreshSessionResponse, ScopesResponse,
+            SesisonInitiationResponse,
+        },
+    },
 };
 
 #[derive(Clone)]
@@ -50,7 +56,9 @@ impl TokenCredential {
 
     pub async fn get_tokens(&self) -> anyhow::Result<(String, String)> {
         let task = self.tokens_task.read().await.clone();
-        let tokens = task.get().ok_or_else(|| anyhow::anyhow!("Tokens not initialized"))?;
+        let tokens = task
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("Tokens not initialized"))?;
         Ok((tokens.0.clone(), tokens.1.clone()))
     }
 
@@ -111,15 +119,11 @@ impl TokenCredential {
         let refresh_handle = tokio::spawn(async move {
             let result = async {
                 let response = client
-                    .refresh_session(
-                        session_id,
-                        current_access.clone(),
-                        current_refresh.clone(),
-                    )
+                    .refresh_session(session_id, current_access.clone(), current_refresh.clone())
                     .await?;
                 Ok::<_, anyhow::Error>((response.access_token, response.refresh_token))
             }
-                .await;
+            .await;
 
             match result {
                 Ok(tokens) => {
@@ -156,13 +160,10 @@ impl TokenCredential {
     }
 }
 
-
 #[async_trait::async_trait]
 pub trait AuthenticationApiClient: Send + Sync {
-    async fn initiate_session(
-        &self,
-        username: String,
-    ) -> anyhow::Result<SesisonInitiationResponse>;
+    async fn initiate_session(&self, username: String)
+    -> anyhow::Result<SesisonInitiationResponse>;
 
     async fn authenticate(
         &self,
@@ -191,13 +192,9 @@ pub trait AuthenticationApiClient: Send + Sync {
         refresh_token: String,
     ) -> anyhow::Result<RefreshSessionResponse>;
 
-    async fn get_scopes(
-        &self,
-    ) -> anyhow::Result<ScopesResponse>;
+    async fn get_scopes(&self) -> anyhow::Result<ScopesResponse>;
 
-    async fn get_random_srp_modulus(
-        &self,
-    ) -> anyhow::Result<ModulusResponse>;
+    async fn get_random_srp_modulus(&self) -> anyhow::Result<ModulusResponse>;
 }
 
 pub struct DefaultAuthenticationApiClient {
@@ -275,9 +272,7 @@ impl AuthenticationApiClient for DefaultAuthenticationApiClient {
         &self,
         username: String,
     ) -> anyhow::Result<SesisonInitiationResponse> {
-        let request = SessionInitiationRequest {
-            username,
-        };
+        let request = SessionInitiationRequest { username };
         let request_body = serde_json::to_vec(&request)?;
 
         let response = self
@@ -298,7 +293,7 @@ impl AuthenticationApiClient for DefaultAuthenticationApiClient {
         srp_client_handshake: proton_crypto::srp::ClientProof,
         username: String,
     ) -> anyhow::Result<AuthenticationResponse> {
-                let request = AuthenticationRequest {
+        let request = AuthenticationRequest {
             client_ephemeral: srp_client_handshake.ephemeral.clone(),
             client_proof: srp_client_handshake.proof.clone(),
             srp_session_id: initiation_response.srp_session_id,
@@ -322,9 +317,7 @@ impl AuthenticationApiClient for DefaultAuthenticationApiClient {
         &self,
         second_factor_code: String,
     ) -> anyhow::Result<ScopesResponse> {
-        let request = SecondFactorValidationRequest {
-            second_factor_code,
-        };
+        let request = SecondFactorValidationRequest { second_factor_code };
         let request_body = serde_json::to_vec(&request)?;
 
         let response = self
@@ -395,9 +388,7 @@ impl AuthenticationApiClient for DefaultAuthenticationApiClient {
         crate::utils::decode_json::<RefreshSessionResponse>(response).await
     }
 
-    async fn get_scopes(
-        &self,
-    ) -> anyhow::Result<ScopesResponse> {
+    async fn get_scopes(&self) -> anyhow::Result<ScopesResponse> {
         let response = self
             .http_client
             .get(self.endpoint("auth/v4/scopes")?)
@@ -408,9 +399,7 @@ impl AuthenticationApiClient for DefaultAuthenticationApiClient {
         crate::utils::decode_json::<ScopesResponse>(response).await
     }
 
-    async fn get_random_srp_modulus(
-        &self,
-    ) -> anyhow::Result<ModulusResponse> {
+    async fn get_random_srp_modulus(&self) -> anyhow::Result<ModulusResponse> {
         let response = self
             .http_client
             .get(self.endpoint("auth/v4/modulus")?)

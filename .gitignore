@@ -24,3 +24,21 @@ target
 *.ron
 cache.json
 proton-sdk-c-sharp
+sdk
+*.png
+
+# dont EVER make the rookie mistake of commiting your private key to the repository like what i did
+# fucking dumbass OP
+.env
+*.env
+secrets.*
+*.secret
+*.pgp
+*.gpg
+*.asc
+*.key
+secring.gpg
+pubring.gpg
+trustdb.gpg
+random_seed
+.gnupg/

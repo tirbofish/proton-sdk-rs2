@@ -24,7 +24,9 @@ where
             Err(D::Error::custom("cannot parse boolean-like string"))
         }
         serde_json::Value::Null => Ok(false),
-        _ => Err(D::Error::custom("expected bool/int/string for boolean field")),
+        _ => Err(D::Error::custom(
+            "expected bool/int/string for boolean field",
+        )),
     }
 }
 
@@ -48,9 +50,13 @@ where
             if let Ok(parsed) = lower.parse::<i64>() {
                 return Ok(Some(parsed != 0));
             }
-            Err(D::Error::custom("cannot parse optional boolean-like string"))
+            Err(D::Error::custom(
+                "cannot parse optional boolean-like string",
+            ))
         }
-        Some(_) => Err(D::Error::custom("expected bool/int/string for optional boolean field")),
+        Some(_) => Err(D::Error::custom(
+            "expected bool/int/string for optional boolean field",
+        )),
     }
 }
 
@@ -69,7 +75,9 @@ where
                 let b = item
                     .as_u64()
                     .and_then(|n| u8::try_from(n).ok())
-                    .ok_or_else(|| D::Error::custom("KeySalt byte array must contain 0..255 integers"))?;
+                    .ok_or_else(|| {
+                        D::Error::custom("KeySalt byte array must contain 0..255 integers")
+                    })?;
                 out.push(b);
             }
             Ok(out)

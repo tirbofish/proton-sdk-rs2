@@ -47,26 +47,40 @@ pub struct ProtonClientConfiguration {
 
 impl Default for ProtonClientOptions {
     fn default() -> Self {
-        Self { base_url: Default::default(), user_agent: Default::default(), tls_policy: Default::default(), custom_http_message_handler_factory: Default::default(), entity_cache_repository: Default::default(), telemetry: Default::default(), feature_flag_provider: Default::default(), secret_cache_repository: Default::default(), refresh_redirect_uri: Default::default(), bindings_language: Default::default() }
+        Self {
+            base_url: Default::default(),
+            user_agent: Default::default(),
+            tls_policy: Default::default(),
+            custom_http_message_handler_factory: Default::default(),
+            entity_cache_repository: Default::default(),
+            telemetry: Default::default(),
+            feature_flag_provider: Default::default(),
+            secret_cache_repository: Default::default(),
+            refresh_redirect_uri: Default::default(),
+            bindings_language: Default::default(),
+        }
     }
 }
 
 impl ProtonClientConfiguration {
-    pub fn new(
-        app_version: semver::Version,
-        options: ProtonClientOptions,
-    ) -> anyhow::Result<Self> {
+    pub fn new(app_version: semver::Version, options: ProtonClientOptions) -> anyhow::Result<Self> {
         Ok(Self {
             base_url: options.base_url.unwrap_or(ProtonApiDefaults::base_url()),
             app_version,
             user_agent: options.user_agent.unwrap_or(String::new()),
             tls_policy: options.tls_policy.unwrap_or(ProtonClientTlsPolicy::Strict),
             custom_http_message_handler_factory: options.custom_http_message_handler_factory, // todo: dont make this null, make it smth else
-            secret_cache_repository: options.secret_cache_repository.unwrap_or(Arc::new(InMemoryCacheRepository::new())),
-            entity_cache_repository: options.entity_cache_repository.unwrap_or(Arc::new(InMemoryCacheRepository::new())),
+            secret_cache_repository: options
+                .secret_cache_repository
+                .unwrap_or(Arc::new(InMemoryCacheRepository::new())),
+            entity_cache_repository: options
+                .entity_cache_repository
+                .unwrap_or(Arc::new(InMemoryCacheRepository::new())),
             telemetry: options.telemetry.unwrap_or(Arc::new(NullTelemetry {})),
             feature_flag_provider: Arc::new(AlwaysDisabledFeatureFlagProvider),
-            refresh_redirect_uri: options.refresh_redirect_uri.unwrap_or(ProtonApiDefaults::refresh_redirect_uri()),
+            refresh_redirect_uri: options
+                .refresh_redirect_uri
+                .unwrap_or(ProtonApiDefaults::refresh_redirect_uri()),
             bindings_language: options.bindings_language.clone(),
         })
     }
@@ -231,20 +245,14 @@ impl Telemetry for NullTelemetry {
 
 #[async_trait::async_trait]
 pub trait FeatureFlagProvider: Send + Sync {
-    async fn is_enabled(
-        &self,
-        flag_name: String,
-    ) -> anyhow::Result<bool>;
+    async fn is_enabled(&self, flag_name: String) -> anyhow::Result<bool>;
 }
 
 pub struct AlwaysDisabledFeatureFlagProvider;
 
 #[async_trait::async_trait]
 impl FeatureFlagProvider for AlwaysDisabledFeatureFlagProvider {
-    async fn is_enabled(
-        &self,
-        _flag_name: String,
-    ) -> anyhow::Result<bool> {
+    async fn is_enabled(&self, _flag_name: String) -> anyhow::Result<bool> {
         Ok(false)
     }
 }

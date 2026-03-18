@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct FileContentDigestsDto {
     #[serde(rename = "SHA1")]
@@ -177,27 +177,31 @@ impl DefaultFilesApiClient {
 
 #[async_trait]
 impl FilesApiClient for DefaultFilesApiClient {
+    #[tracing::instrument(skip(self, request))]
     async fn create_file(
         &self,
         volume_id: VolumeId,
         request: FileCreationRequest,
     ) -> anyhow::Result<FileCreationResponse> {
-        let url = self.base_url.join(&format!("v2/volumes/{}/files", volume_id.raw()))?;
+        tracing::debug!(volume_id = %volume_id.raw(), "Creating file");
+        let url = self
+            .base_url
+            .join(&format!("v2/volumes/{}/files", volume_id.raw()))?;
         let builder = self.client.post(url).json(&request);
         let builder = self.add_auth_headers(builder).await?;
-        Ok(builder
-            .send()
-            .await?
-            .json::<FileCreationResponse>()
-            .await?)
+        let resp = builder.send().await?.json::<FileCreationResponse>().await?;
+        tracing::info!(link_id = %resp.identifiers.link_id.raw(), revision_id = %resp.identifiers.revision_id.raw(), "File created");
+        Ok(resp)
     }
 
+    #[tracing::instrument(skip(self, request))]
     async fn create_revision(
         &self,
         volume_id: VolumeId,
         link_id: LinkId,
         request: RevisionCreationRequest,
     ) -> anyhow::Result<RevisionCreationResponse> {
+        tracing::debug!(volume_id = %volume_id.raw(), link_id = %link_id.raw(), "Creating revision");
         let url = self.base_url.join(&format!(
             "v2/volumes/{}/files/{}/revisions",
             volume_id.raw(),
@@ -205,27 +209,34 @@ impl FilesApiClient for DefaultFilesApiClient {
         ))?;
         let builder = self.client.post(url).json(&request);
         let builder = self.add_auth_headers(builder).await?;
-        Ok(builder
+        let resp = builder
             .send()
             .await?
             .json::<RevisionCreationResponse>()
-            .await?)
+            .await?;
+        tracing::info!(revision_id = %resp.identity.revision_id.raw(), "Revision created");
+        Ok(resp)
     }
 
+    #[tracing::instrument(skip(self, request))]
     async fn prepare_block_upload(
         &self,
         request: BlockUploadPreparationRequest,
     ) -> anyhow::Result<BlockUploadPreparationResponse> {
+        tracing::debug!("Preparing block upload");
         let url = self.base_url.join("blocks")?;
         let builder = self.client.post(url).json(&request);
         let builder = self.add_auth_headers(builder).await?;
-        Ok(builder
+        let resp = builder
             .send()
             .await?
             .json::<BlockUploadPreparationResponse>()
-            .await?)
+            .await?;
+        tracing::info!(targets = resp.upload_targets.len(), "Block upload prepared");
+        Ok(resp)
     }
 
+    #[tracing::instrument(skip(self, request))]
     async fn update_revision(
         &self,
         volume_id: VolumeId,
@@ -233,6 +244,7 @@ impl FilesApiClient for DefaultFilesApiClient {
         revision_id: RevisionId,
         request: RevisionUpdateRequest,
     ) -> anyhow::Result<ApiResponse> {
+        tracing::debug!(volume_id = %volume_id.raw(), link_id = %link_id.raw(), revision_id = %revision_id.raw(), "Sealing revision");
         let url = self.base_url.join(&format!(
             "v2/volumes/{}/files/{}/revisions/{}",
             volume_id.raw(),
@@ -241,11 +253,13 @@ impl FilesApiClient for DefaultFilesApiClient {
         ))?;
         let builder = self.client.put(url).json(&request);
         let builder = self.add_auth_headers(builder).await?;
-        Ok(builder
-            .send()
-            .await?
-            .json::<ApiResponse>()
-            .await?)
+        let resp = builder.send().await?.json::<ApiResponse>().await?;
+        if resp.is_success() {
+            tracing::info!("Revision sealed successfully");
+        } else {
+            tracing::warn!(code = resp.code.0, error = ?resp.error_message, "Revision sealing failed");
+        }
+        Ok(resp)
     }
 
     async fn get_revision(
@@ -281,11 +295,7 @@ impl FilesApiClient for DefaultFilesApiClient {
         let builder = self.client.get(url);
         let builder = self.add_auth_headers(builder).await?;
 
-        Ok(builder
-            .send()
-            .await?
-            .json::<RevisionResponse>()
-            .await?)
+        Ok(builder.send().await?.json::<RevisionResponse>().await?)
     }
 
     async fn delete_revision(
@@ -302,11 +312,7 @@ impl FilesApiClient for DefaultFilesApiClient {
         ))?;
         let builder = self.client.delete(url);
         let builder = self.add_auth_headers(builder).await?;
-        Ok(builder
-            .send()
-            .await?
-            .json::<ApiResponse>()
-            .await?)
+        Ok(builder.send().await?.json::<ApiResponse>().await?)
     }
 
     async fn get_thumbnail_blocks(
@@ -314,8 +320,13 @@ impl FilesApiClient for DefaultFilesApiClient {
         volume_id: VolumeId,
         thumbnail_ids: Vec<String>,
     ) -> anyhow::Result<ThumbnailBlockListResponse> {
-        let url = self.base_url.join(&format!("volumes/{}/thumbnails", volume_id.raw()))?;
-        let builder = self.client.post(url).json(&ThumbnailBlockListRequest { thumbnail_ids });
+        let url = self
+            .base_url
+            .join(&format!("volumes/{}/thumbnails", volume_id.raw()))?;
+        let builder = self
+            .client
+            .post(url)
+            .json(&ThumbnailBlockListRequest { thumbnail_ids });
         let builder = self.add_auth_headers(builder).await?;
         Ok(builder
             .send()

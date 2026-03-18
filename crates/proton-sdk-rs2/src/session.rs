@@ -5,6 +5,9 @@ use proton_srp::{RPGPVerifier, SRPAuth, SrpHashVersion};
 use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
+use crate::auth::DefaultAuthenticationApiClient;
+use crate::keys::{DefaultKeysApiClient, KeysApiClient};
+use crate::secret::SessionSecretCache;
 use crate::{
     PasswordMode, SessionId, UserId,
     auth::{AuthenticationApiClient, TokenCredential},
@@ -12,9 +15,6 @@ use crate::{
     client::{ApiClient, ProtonClientConfiguration, ProtonClientOptions},
     secret::DefaultSecretCache,
 };
-use crate::auth::DefaultAuthenticationApiClient;
-use crate::keys::{DefaultKeysApiClient, KeysApiClient};
-use crate::secret::SessionSecretCache;
 
 pub struct ProtonAPISession {
     pub session_id: SessionId,
@@ -66,9 +66,9 @@ impl ProtonAPISession {
             &client_config,
             Some((&session_id, token_credential.current_access_token())),
         )
-            .expect("Failed to create session HTTP client");
+        .expect("Failed to create session HTTP client");
         let secret_cache = DefaultSecretCache::new(client_config.secret_cache_repository.clone());
-        
+
         Self {
             session_id,
             username,
@@ -120,7 +120,7 @@ impl ProtonAPISession {
             config.refresh_redirect_uri.clone(),
         )))
     }
-    
+
     pub async fn begin(
         username: impl Into<String>,
         password: &str,
@@ -134,12 +134,13 @@ impl ProtonAPISession {
 
         let configuration = ProtonClientConfiguration::new(app_version, session_options.client)?;
         let auth_api_client = Self::create_authentication_api_client(&configuration)?;
-        let session_init_resp = auth_api_client
-            .initiate_session(username.clone())
-            .await?;
-        
-        log::debug!("SRP session {} initialised", session_init_resp.srp_session_id);
-        
+        let session_init_resp = auth_api_client.initiate_session(username.clone()).await?;
+
+        log::debug!(
+            "SRP session {} initialised",
+            session_init_resp.srp_session_id
+        );
+
         let client = SRPAuth::new(
             &RPGPVerifier::default(),
             Some(&username),
@@ -147,7 +148,7 @@ impl ProtonAPISession {
             SrpHashVersion::V4,
             &session_init_resp.salt,
             &session_init_resp.modulus,
-            &session_init_resp.server_ephemeral, 
+            &session_init_resp.server_ephemeral,
         )?;
 
         let proof = client.generate_proofs()?;
@@ -157,20 +158,16 @@ impl ProtonAPISession {
             expected_server_proof: general_purpose::STANDARD.encode(proof.expected_server_proof),
         };
 
-        let auth_resp = auth_api_client.authenticate(
-            session_init_resp, 
-            client_proof,
-            username.clone(), 
-        ).await?;
+        let auth_resp = auth_api_client
+            .authenticate(session_init_resp, client_proof, username.clone())
+            .await?;
 
-        let access_token = auth_resp
-            .access_token
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("AuthenticationResponse.AccessToken is not yet modeled"))?;
-        let refresh_token = auth_resp
-            .refresh_token
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("AuthenticationResponse.RefreshToken is not yet modeled"))?;
+        let access_token = auth_resp.access_token.clone().ok_or_else(|| {
+            anyhow::anyhow!("AuthenticationResponse.AccessToken is not yet modeled")
+        })?;
+        let refresh_token = auth_resp.refresh_token.clone().ok_or_else(|| {
+            anyhow::anyhow!("AuthenticationResponse.RefreshToken is not yet modeled")
+        })?;
 
         let token_credential = TokenCredential::new(
             auth_api_client,
@@ -197,10 +194,7 @@ impl ProtonAPISession {
         //  && matches!(session.password_mode, PasswordMode::Single)
 
         if !session.is_waiting_for_second_factor_code {
-            if let Err(error) = session
-                .apply_data_password(password, )
-                .await
-            {
+            if let Err(error) = session.apply_data_password(password).await {
                 log::warn!("Failed to apply data password: {error}");
             }
         }
@@ -221,16 +215,16 @@ impl ProtonAPISession {
         secret_cache_repository: Arc<dyn CacheRepository>,
     ) -> ProtonAPISession {
         ProtonAPISession::resume_with_options(
-            session_id, 
-            username, 
-            user_id, 
-            access_token, 
-            refresh_token, 
-            scopes, 
-            is_waiting_for_second_factor_code, 
-            password_mode, 
-            app_version, 
-            secret_cache_repository, 
+            session_id,
+            username,
+            user_id,
+            access_token,
+            refresh_token,
+            scopes,
+            is_waiting_for_second_factor_code,
+            password_mode,
+            app_version,
+            secret_cache_repository,
             ProtonClientOptions::default(),
         )
     }
@@ -316,7 +310,8 @@ impl ProtonAPISession {
         app_version: semver::Version,
         options: Option<ProtonClientOptions>,
     ) -> anyhow::Result<()> {
-        let configuration = ProtonClientConfiguration::new(app_version, options.unwrap_or_default())?;
+        let configuration =
+            ProtonClientConfiguration::new(app_version, options.unwrap_or_default())?;
         let auth_api_client = Self::create_authentication_api_client(&configuration)?;
         let _ = auth_api_client
             .end_session_with_token(SessionId::new(id), access_token)
@@ -326,10 +321,11 @@ impl ProtonAPISession {
 
     pub async fn apply_second_factor_code(
         &mut self,
-        second_factor_code: String, 
+        second_factor_code: String,
     ) -> anyhow::Result<()> {
-        let response = self.authentication_api()?
-            .validate_second_factor(second_factor_code, )
+        let response = self
+            .authentication_api()?
+            .validate_second_factor(second_factor_code)
             .await?;
 
         self.is_waiting_for_second_factor_code = false;
@@ -337,18 +333,16 @@ impl ProtonAPISession {
         Ok(())
     }
 
-    pub async fn apply_data_password(
-        &mut self,
-        password: &str,
-    ) -> anyhow::Result<()> {
-        let response = self
-            .keys_api()?
-            .get_key_salts()
-            .await?;
+    pub async fn apply_data_password(&mut self, password: &str) -> anyhow::Result<()> {
+        let response = self.keys_api()?.get_key_salts().await?;
 
         log::debug!("Key salts response: {} salts", response.key_salts.len());
         for salt in &response.key_salts {
-            log::debug!("Salt key_id: {:?}, value empty: {}", salt.key_id, salt.value.is_empty());
+            log::debug!(
+                "Salt key_id: {:?}, value empty: {}",
+                salt.key_id,
+                salt.value.is_empty()
+            );
 
             if salt.value.is_empty() {
                 continue;
@@ -370,31 +364,29 @@ impl ProtonAPISession {
         Ok(())
     }
 
-    pub async fn ensure_authenticated(
-        &mut self,
-    ) -> anyhow::Result<()> {
-        let (probe_access_token, _) = self
-            .token_credential
-            .get_tokens()
-            .await?;
+    pub async fn ensure_authenticated(&mut self) -> anyhow::Result<()> {
+        let (probe_access_token, _) = self.token_credential.get_tokens().await?;
         let probe = Self::create_http_client(
             &self.client_config,
             Some((&self.session_id, probe_access_token.as_str())),
         )?;
 
-        let probe_response = probe.get("https://drive-api.proton.me/auth/v4/scopes").send().await?;
+        let probe_response = probe
+            .get("https://drive-api.proton.me/auth/v4/scopes")
+            .send()
+            .await?;
 
         if probe_response.status() != StatusCode::UNAUTHORIZED {
-            return probe_response.error_for_status().map(|_| ()).map_err(Into::into);
+            return probe_response
+                .error_for_status()
+                .map(|_| ())
+                .map_err(Into::into);
         }
 
-        let (access_token, _) = self
-            .token_credential
-            .get_tokens()
-            .await?;
+        let (access_token, _) = self.token_credential.get_tokens().await?;
         let refreshed_access_token = self
             .token_credential
-            .get_refreshed_access_token(access_token, )
+            .get_refreshed_access_token(access_token)
             .await?;
 
         self.http_client = Self::create_http_client(
@@ -407,9 +399,7 @@ impl ProtonAPISession {
         Ok(())
     }
 
-    pub async fn end_from_session(
-        &mut self
-    ) -> anyhow::Result<bool> {
+    pub async fn end_from_session(&mut self) -> anyhow::Result<bool> {
         if self.is_ended {
             return Ok(true);
         }
@@ -429,8 +419,12 @@ impl ProtonAPISession {
         if base_route_path.is_none() && attempt_timeout.is_none() && total_timeout.is_none() {
             Ok(self.http_client.clone())
         } else {
-            self.client_config
-                .get_http_client(Some(self), base_route_path, attempt_timeout, total_timeout)
+            self.client_config.get_http_client(
+                Some(self),
+                base_route_path,
+                attempt_timeout,
+                total_timeout,
+            )
         }
     }
 
@@ -451,12 +445,11 @@ impl ProtonAPISession {
             Ok(api.clone())
         } else {
             let client = self.get_http_client(None, None, None)?;
-            let api: Arc<dyn KeysApiClient> = Arc::new(
-                DefaultKeysApiClient::new_with_token_credential(
+            let api: Arc<dyn KeysApiClient> =
+                Arc::new(DefaultKeysApiClient::new_with_token_credential(
                     client,
                     self.token_credential.clone(),
-                ),
-            );
+                ));
             self.keys_api = Some(Arc::clone(&api));
             Ok(api)
         }
@@ -467,7 +460,10 @@ impl ProtonAPISession {
             Ok(api.clone())
         } else {
             let client = self.get_http_client(None, None, None)?;
-            let api = Arc::new(DefaultAuthenticationApiClient::new(client, self.client_config.refresh_redirect_uri.clone()));
+            let api = Arc::new(DefaultAuthenticationApiClient::new(
+                client,
+                self.client_config.refresh_redirect_uri.clone(),
+            ));
             self.authentication_api = Some(api.clone());
             Ok(api)
         }

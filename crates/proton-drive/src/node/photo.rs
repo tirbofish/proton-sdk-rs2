@@ -1,7 +1,7 @@
+use crate::node::NodeUid;
+use crate::node::file::{DegradedFileNode, DegradedFileSecrets, FileNode, FileUploadMetadata};
 use chrono::{DateTime, Utc};
 use serde_repr::{Deserialize_repr, Serialize_repr};
-use crate::node::file::{DegradedFileNode, DegradedFileSecrets, FileNode, FileUploadMetadata};
-use crate::node::NodeUid;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DegradedPhotoNode {
@@ -42,14 +42,14 @@ pub struct PhotosTimelineItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
 #[repr(u32)]
 pub enum PhotoTag {
-    Favorite    = 0,
-    Screenshot  = 1,
-    Video       = 2,
-    LivePhoto   = 3,
+    Favorite = 0,
+    Screenshot = 1,
+    Video = 2,
+    LivePhoto = 3,
     MotionPhoto = 4,
-    Selfie      = 5,
-    Portrait    = 6,
-    Burst       = 7,
-    Panorama    = 8,
-    Raw         = 9,
+    Selfie = 5,
+    Portrait = 6,
+    Burst = 7,
+    Panorama = 8,
+    Raw = 9,
 }

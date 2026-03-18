@@ -1,8 +1,8 @@
-use std::sync::Arc;
-use proton_rpgp::{PublicKey, PrivateKey};
 use crate::account::AccountClient;
 use crate::author::Author;
 use crate::utils::PotentialObject;
+use proton_rpgp::{PrivateKey, PublicKey};
+use std::sync::Arc;
 
 pub enum PgpKeyRingOrKey {
     KeyRing(Vec<PublicKey>),
@@ -35,12 +35,16 @@ impl AuthorshipClaim {
         match account_client.get_address_public_keys(email).await {
             Ok(keys) => Self {
                 keys,
-                author: Author { email_address: Some(email.to_string()) },
+                author: Author {
+                    email_address: Some(email.to_string()),
+                },
                 key_retrieval_error_message: None,
             },
             Err(e) => Self {
                 keys: vec![],
-                author: Author { email_address: Some(email.to_string()) },
+                author: Author {
+                    email_address: Some(email.to_string()),
+                },
                 key_retrieval_error_message: Some(e.to_string()),
             },
         }
@@ -56,7 +60,9 @@ impl AuthorshipClaim {
         }
     }
 
-    pub fn to_potential_author(&self) -> PotentialObject<Author, crate::protobuf::SignatureVerificationError> {
+    pub fn to_potential_author(
+        &self,
+    ) -> PotentialObject<Author, crate::protobuf::SignatureVerificationError> {
         // For now, assume we don't have verification errors here, but in reality we might.
         PotentialObject::Node(self.author.clone())
     }

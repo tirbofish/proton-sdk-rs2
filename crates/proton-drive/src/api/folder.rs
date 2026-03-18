@@ -148,7 +148,11 @@ impl FoldersApiClient for DefaultFoldersApiClient {
         let builder = self.client.get(url);
         let builder = self.add_auth_headers(builder).await?;
 
-        Ok(builder.send().await?.json::<FolderChildrenResponse>().await?)
+        Ok(builder
+            .send()
+            .await?
+            .json::<FolderChildrenResponse>()
+            .await?)
     }
 
     async fn create_folder(
@@ -156,7 +160,9 @@ impl FoldersApiClient for DefaultFoldersApiClient {
         volume_id: VolumeId,
         request: FolderCreationRequest,
     ) -> anyhow::Result<FolderCreationResponse> {
-        let url = self.base_url.join(&format!("v2/volumes/{}/folders", volume_id.raw()))?;
+        let url = self
+            .base_url
+            .join(&format!("v2/volumes/{}/folders", volume_id.raw()))?;
         let builder = self.client.post(url).json(&request);
         let builder = self.add_auth_headers(builder).await?;
         Ok(builder

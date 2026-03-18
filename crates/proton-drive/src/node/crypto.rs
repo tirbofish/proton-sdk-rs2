@@ -1,4 +1,3 @@
-use crate::error::ProtonDriveError;
 use crate::node::authorship::AuthorshipClaim;
 use crate::pgp::{
     PgpArmoredMessage, PgpArmoredPrivateKey, PgpArmoredSignature, PgpPrivateKey, PgpSessionKey,
@@ -6,8 +5,8 @@ use crate::pgp::{
 use hmac::{Hmac, KeyInit, Mac};
 use proton_rpgp::pgp::crypto::sym::SymmetricKeyAlgorithm;
 use proton_rpgp::{
-    AccessKeyInfo, AsPublicKeyRef, DataEncoding, Decryptor, Encryptor, ExternalDetachedSignature,
-    PrivateKey, PublicKey, Signer,
+    AsPublicKeyRef, DataEncoding, Decryptor, Encryptor, ExternalDetachedSignature, PrivateKey,
+    Signer,
 };
 use sha2::Sha256;
 use std::sync::Arc;
@@ -395,7 +394,8 @@ impl NodeCrypto {
             decryptor = decryptor.with_decryption_key(&key.0);
         }
 
-        let session_key = decryptor.decrypt_session_key(&unarmored_buffer)
+        let session_key = decryptor
+            .decrypt_session_key(&unarmored_buffer)
             .map_err(|e| e.to_string())?;
 
         let mut decryptor = Decryptor::default().with_session_key(session_key.clone());

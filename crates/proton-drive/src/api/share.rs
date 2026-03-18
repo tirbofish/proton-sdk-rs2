@@ -8,10 +8,10 @@ use crate::share::ShareId;
 use crate::volume::VolumeId;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use proton_sdk_rs2::auth::TokenCredential;
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
-use proton_sdk_rs2::auth::TokenCredential;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]

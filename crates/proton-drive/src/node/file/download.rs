@@ -26,8 +26,8 @@ impl FileDownloader {
 
     pub fn download_to_stream(
         &self,
-        _content_output_stream: Box<dyn std::io::Write + Send>,
-        _on_progress: Box<dyn Fn(i64, i64) + Send + Sync>,
+        mut content_output_stream: Box<dyn std::io::Write + Send>,
+        on_progress: Box<dyn Fn(i64, i64) + Send + Sync>,
     ) -> DownloadController {
         let client = self.client.clone();
         let revision_uid = self.revision_uid.clone();
@@ -35,15 +35,34 @@ impl FileDownloader {
         let (state_tx, _) = tokio::sync::watch::channel(ControllerState::Running);
 
         let completion = tokio::spawn(async move {
-            let release_block_listing = Box::new(|_| {}); // Simplified
-            let _state = RevisionOperations::create_download_state(
+            let release_block_listing = Box::new(|_| {});
+            let download_state = RevisionOperations::create_download_state(
                 &client,
                 revision_uid,
                 release_block_listing,
             )
             .await?;
 
-            // Simplified reading logic
+            let download_state = Arc::new(download_state);
+            let mut reader = RevisionOperations::open_for_reading(
+                &client,
+                download_state.clone(),
+                Box::new(|_| {}),
+            );
+
+            let total_size = download_state.revision_dto.revision.size;
+            let mut total_downloaded = 0;
+
+            loop {
+                let block = match reader.read_next_block().await? {
+                    Some(b) => b,
+                    None => break,
+                };
+
+                content_output_stream.write_all(&block)?;
+                total_downloaded += block.len() as i64;
+                on_progress(total_downloaded, total_size);
+            }
             Ok(())
         });
 

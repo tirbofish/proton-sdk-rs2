@@ -6,16 +6,12 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 #[derive(Clone)]
 pub struct BlockDownloader {
-    // todo: figure out why its here
-    #[allow(dead_code)]
-    max_degree_of_parallelism: usize,
     pub queue: crate::node::transfer::TransferQueue,
 }
 
 impl BlockDownloader {
     pub fn new(max_degree_of_parallelism: usize) -> Self {
         Self {
-            max_degree_of_parallelism,
             queue: crate::node::transfer::TransferQueue::new(max_degree_of_parallelism),
         }
     }
@@ -23,14 +19,14 @@ impl BlockDownloader {
     pub async fn download(
         &self,
         client: &ProtonDriveClient,
-        revision_uid: RevisionUid,
-        index: i32,
+        _revision_uid: RevisionUid,
+        _index: i32,
         bare_url: String,
         token: String,
         content_key: PgpSessionKey,
         output_stream: &mut (dyn AsyncWrite + Unpin + Send),
     ) -> anyhow::Result<Vec<u8>> {
-        let mut response = client
+        let response = client
             .api()
             .storage()
             .get_blob_stream(&bare_url, &token)

@@ -48,8 +48,14 @@ impl AddressKeyId {
 pub trait AccountClient: Send + Sync {
     async fn get_address(&self, address_id: &AddressId) -> anyhow::Result<Address>;
     async fn get_default_address(&self) -> anyhow::Result<Address>;
-    async fn get_address_primary_private_key(&self, address_id: &AddressId) -> anyhow::Result<PrivateKey>;
-    async fn get_address_private_keys(&self, address_id: &AddressId) -> anyhow::Result<Vec<PrivateKey>>;
+    async fn get_address_primary_private_key(
+        &self,
+        address_id: &AddressId,
+    ) -> anyhow::Result<PrivateKey>;
+    async fn get_address_private_keys(
+        &self,
+        address_id: &AddressId,
+    ) -> anyhow::Result<Vec<PrivateKey>>;
     async fn get_address_public_keys(&self, email_address: &str) -> anyhow::Result<Vec<PublicKey>>;
     async fn get_user_keys(&self) -> anyhow::Result<Vec<PrivateKey>>;
 }
@@ -76,11 +82,19 @@ impl AccountClient for AccountClientAdapter {
         self.client.get_current_user_default_address().await
     }
 
-    async fn get_address_primary_private_key(&self, address_id: &AddressId) -> anyhow::Result<PrivateKey> {
-        self.client.get_address_primary_private_key(address_id.raw()).await
+    async fn get_address_primary_private_key(
+        &self,
+        address_id: &AddressId,
+    ) -> anyhow::Result<PrivateKey> {
+        self.client
+            .get_address_primary_private_key(address_id.raw())
+            .await
     }
 
-    async fn get_address_private_keys(&self, address_id: &AddressId) -> anyhow::Result<Vec<PrivateKey>> {
+    async fn get_address_private_keys(
+        &self,
+        address_id: &AddressId,
+    ) -> anyhow::Result<Vec<PrivateKey>> {
         self.client.get_address_private_keys(address_id.raw()).await
     }
 

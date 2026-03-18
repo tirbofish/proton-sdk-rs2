@@ -17,4 +17,3 @@ impl LinkId {
         &self.0
     }
 }
-

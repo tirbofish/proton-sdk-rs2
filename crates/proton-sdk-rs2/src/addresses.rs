@@ -1,20 +1,15 @@
+use reqwest::StatusCode;
 use serde::Deserialize;
 use serde::de::Error as _;
-use reqwest::StatusCode;
 
 use crate::api::ApiResponse;
 use crate::auth::TokenCredential;
 
 #[async_trait::async_trait]
 pub trait AddressesApiClient: Send + Sync {
-    async fn get_addresses(
-        &self,
-    ) -> anyhow::Result<AddressesResponse>;
+    async fn get_addresses(&self) -> anyhow::Result<AddressesResponse>;
 
-    async fn get_address(
-        &self,
-        address_id: &str,
-    ) -> anyhow::Result<AddressResponse>;
+    async fn get_address(&self, address_id: &str) -> anyhow::Result<AddressResponse>;
 }
 
 pub struct DefaultAddressesApiClient {
@@ -69,8 +64,7 @@ impl AddressesApiClient for DefaultAddressesApiClient {
                 let refreshed = token_credential
                     .get_refreshed_access_token(access_token)
                     .await?;
-                self
-                    .http_client
+                self.http_client
                     .get(endpoint)
                     .bearer_auth(refreshed)
                     .header("x-pm-uid", session_id.raw())
@@ -81,8 +75,7 @@ impl AddressesApiClient for DefaultAddressesApiClient {
                 first.error_for_status()?
             }
         } else {
-            self
-                .http_client
+            self.http_client
                 .get(endpoint)
                 .send()
                 .await?
@@ -112,8 +105,7 @@ impl AddressesApiClient for DefaultAddressesApiClient {
                 let refreshed = token_credential
                     .get_refreshed_access_token(access_token)
                     .await?;
-                self
-                    .http_client
+                self.http_client
                     .get(endpoint)
                     .bearer_auth(refreshed)
                     .header("x-pm-uid", session_id.raw())
@@ -124,8 +116,7 @@ impl AddressesApiClient for DefaultAddressesApiClient {
                 first.error_for_status()?
             }
         } else {
-            self
-                .http_client
+            self.http_client
                 .get(endpoint)
                 .send()
                 .await?
@@ -227,6 +218,8 @@ where
             Err(D::Error::custom("cannot parse boolean-like string"))
         }
         serde_json::Value::Null => Ok(false),
-        _ => Err(D::Error::custom("expected bool/int/string for boolean field")),
+        _ => Err(D::Error::custom(
+            "expected bool/int/string for boolean field",
+        )),
     }
 }

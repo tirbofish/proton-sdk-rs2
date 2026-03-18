@@ -16,5 +16,5 @@ pub struct ThumbnailHeader {
 #[repr(u32)]
 pub enum ThumbnailType {
     Thumbnail = 1,
-    Preview   = 2,
+    Preview = 2,
 }

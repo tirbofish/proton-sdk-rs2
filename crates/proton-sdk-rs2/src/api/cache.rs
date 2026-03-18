@@ -1,11 +1,11 @@
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use dashmap::DashMap;
 use futures::StreamExt;
 use proton_rpgp::{DataEncoding, PrivateKey, PublicKey};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::cache::CacheRepository;
 use crate::protobuf::{Address, AddressKey};
@@ -35,8 +35,12 @@ impl DefaultAccountClientCache {
         session_secret_cache_repository: Arc<dyn SessionSecretCache>,
     ) -> Self {
         Self {
-            entity_cache_repository: Arc::new(DefaultAccountEntityCache::new(entity_cache_repository)),
-            secret_cache_repository: Arc::new(DefaultAccountSecretCache::new(secret_cache_repository)),
+            entity_cache_repository: Arc::new(DefaultAccountEntityCache::new(
+                entity_cache_repository,
+            )),
+            secret_cache_repository: Arc::new(DefaultAccountSecretCache::new(
+                secret_cache_repository,
+            )),
             session_secret_cache_repository,
             public_key_cache_repository: Arc::new(DefaultPublicKeyCache::new()),
         }
@@ -65,37 +69,24 @@ impl AccountClientCache for DefaultAccountClientCache {
 
 #[async_trait]
 pub trait AccountEntityCache: Send + Sync {
-    async fn set_address(
-        &self,
-        address: &Address,
-    ) -> anyhow::Result<()>;
+    async fn set_address(&self, address: &Address) -> anyhow::Result<()>;
 
-    async fn try_get_address(
-        &self,
-        address_id: &str,
-    ) -> anyhow::Result<Option<Address>>;
+    async fn try_get_address(&self, address_id: &str) -> anyhow::Result<Option<Address>>;
 
-    async fn set_current_user_addresses(
-        &self,
-        addresses: &[Address],
-    ) -> anyhow::Result<()>;
+    async fn set_current_user_addresses(&self, addresses: &[Address]) -> anyhow::Result<()>;
 
-    async fn try_get_current_user_addresses(
-        &self,
-    ) -> anyhow::Result<Option<Vec<Address>>>;
+    async fn try_get_current_user_addresses(&self) -> anyhow::Result<Option<Vec<Address>>>;
 }
 
 pub struct DefaultAccountEntityCache {
-    repository: Arc<dyn CacheRepository>
+    repository: Arc<dyn CacheRepository>,
 }
 
 impl DefaultAccountEntityCache {
     const CURRENT_USER_ADDRESS_TAG: &'static str = "user:current:address";
 
     pub fn new(repository: Arc<dyn CacheRepository>) -> Self {
-        Self {
-            repository,
-        }
+        Self { repository }
     }
 
     fn get_address_cache_key(address_id: &str) -> String {
@@ -105,23 +96,15 @@ impl DefaultAccountEntityCache {
 
 #[async_trait]
 impl AccountEntityCache for DefaultAccountEntityCache {
-    async fn set_address(
-        &self,
-        address: &Address,
-    ) -> anyhow::Result<()> {
+    async fn set_address(&self, address: &Address) -> anyhow::Result<()> {
         let key = Self::get_address_cache_key(&address.address_id);
         let value = serde_json::to_string(&AddressCacheValue::from_address(address))?;
-        self.repository
-            .set(&key, value, vec![], )
-            .await
+        self.repository.set(&key, value, vec![]).await
     }
 
-    async fn try_get_address(
-        &self,
-        address_id: &str,
-    ) -> anyhow::Result<Option<Address>> {
+    async fn try_get_address(&self, address_id: &str) -> anyhow::Result<Option<Address>> {
         let key = Self::get_address_cache_key(address_id);
-        let cached = self.repository.try_get(&key, ).await?;
+        let cached = self.repository.try_get(&key).await?;
         let result = match cached {
             Some(raw) => {
                 let value: AddressCacheValue = serde_json::from_str(&raw)?;
@@ -132,12 +115,9 @@ impl AccountEntityCache for DefaultAccountEntityCache {
         Ok(result)
     }
 
-    async fn set_current_user_addresses(
-        &self,
-        addresses: &[Address],
-    ) -> anyhow::Result<()> {
+    async fn set_current_user_addresses(&self, addresses: &[Address]) -> anyhow::Result<()> {
         self.repository
-            .remove_by_tag(Self::CURRENT_USER_ADDRESS_TAG, )
+            .remove_by_tag(Self::CURRENT_USER_ADDRESS_TAG)
             .await?;
 
         for address in addresses {
@@ -148,7 +128,6 @@ impl AccountEntityCache for DefaultAccountEntityCache {
                     &key,
                     value,
                     vec![Self::CURRENT_USER_ADDRESS_TAG.to_string()],
-                    
                 )
                 .await?;
         }
@@ -156,13 +135,10 @@ impl AccountEntityCache for DefaultAccountEntityCache {
         Ok(())
     }
 
-    async fn try_get_current_user_addresses(
-        &self,
-    ) -> anyhow::Result<Option<Vec<Address>>> {
-        let mut stream = self.repository.get_by_tags(
-            vec![Self::CURRENT_USER_ADDRESS_TAG.to_string()],
-            
-        );
+    async fn try_get_current_user_addresses(&self) -> anyhow::Result<Option<Vec<Address>>> {
+        let mut stream = self
+            .repository
+            .get_by_tags(vec![Self::CURRENT_USER_ADDRESS_TAG.to_string()]);
 
         let mut addresses = Vec::new();
         while let Some(item) = stream.next().await {
@@ -180,19 +156,13 @@ impl AccountEntityCache for DefaultAccountEntityCache {
     }
 }
 
-
 // impl -----------------------
 
 #[async_trait]
 pub trait AccountSecretCache: Send + Sync {
-    async fn set_user_keys(
-        &self,
-        unlocked_keys: &[PrivateKey],
-    ) -> anyhow::Result<()>;
+    async fn set_user_keys(&self, unlocked_keys: &[PrivateKey]) -> anyhow::Result<()>;
 
-    async fn try_get_user_keys(
-        &self,
-    ) -> anyhow::Result<Option<Vec<PrivateKey>>>;
+    async fn try_get_user_keys(&self) -> anyhow::Result<Option<Vec<PrivateKey>>>;
 
     async fn set_address_keys(
         &self,
@@ -209,16 +179,14 @@ pub trait AccountSecretCache: Send + Sync {
 // impl -----------------------
 
 pub struct DefaultAccountSecretCache {
-    repository: Arc<dyn CacheRepository>
+    repository: Arc<dyn CacheRepository>,
 }
 
 impl DefaultAccountSecretCache {
     const USER_KEYS_CACHE_KEY: &'static str = "user:current:keys";
 
     pub fn new(repository: Arc<dyn CacheRepository>) -> Self {
-        Self {
-            repository,
-        }
+        Self { repository }
     }
 
     fn get_address_keys_cache_key(address_id: &str) -> String {
@@ -247,23 +215,15 @@ impl DefaultAccountSecretCache {
 
 #[async_trait]
 impl AccountSecretCache for DefaultAccountSecretCache {
-    async fn set_user_keys(
-        &self,
-        unlocked_keys: &[PrivateKey],
-    ) -> anyhow::Result<()> {
+    async fn set_user_keys(&self, unlocked_keys: &[PrivateKey]) -> anyhow::Result<()> {
         let serialized = Self::serialize_private_keys(unlocked_keys)?;
         self.repository
-            .set(Self::USER_KEYS_CACHE_KEY, serialized, vec![], )
+            .set(Self::USER_KEYS_CACHE_KEY, serialized, vec![])
             .await
     }
 
-    async fn try_get_user_keys(
-        &self,
-    ) -> anyhow::Result<Option<Vec<PrivateKey>>> {
-        let raw = self
-            .repository
-            .try_get(Self::USER_KEYS_CACHE_KEY, )
-            .await?;
+    async fn try_get_user_keys(&self) -> anyhow::Result<Option<Vec<PrivateKey>>> {
+        let raw = self.repository.try_get(Self::USER_KEYS_CACHE_KEY).await?;
         match raw {
             Some(value) => Ok(Some(Self::deserialize_private_keys(&value)?)),
             None => Ok(None),
@@ -277,9 +237,7 @@ impl AccountSecretCache for DefaultAccountSecretCache {
     ) -> anyhow::Result<()> {
         let key = Self::get_address_keys_cache_key(address_id);
         let serialized = Self::serialize_private_keys(unlocked_keys)?;
-        self.repository
-            .set(&key, serialized, vec![], )
-            .await
+        self.repository.set(&key, serialized, vec![]).await
     }
 
     async fn try_get_address_keys(
@@ -287,7 +245,7 @@ impl AccountSecretCache for DefaultAccountSecretCache {
         address_id: &str,
     ) -> anyhow::Result<Option<Vec<PrivateKey>>> {
         let key = Self::get_address_keys_cache_key(address_id);
-        let raw = self.repository.try_get(&key, ).await?;
+        let raw = self.repository.try_get(&key).await?;
         log::debug!("raw: {:?}", raw);
         match raw {
             Some(value) => Ok(Some(Self::deserialize_private_keys(&value)?)),
@@ -322,7 +280,8 @@ impl DefaultPublicKeyCache {
 impl PublicKeyCache for DefaultPublicKeyCache {
     fn set_public_keys(&self, email_address: &str, public_keys: Vec<PublicKey>) {
         let entry = PublicKeyCacheEntry {
-            expires_at: Instant::now() + Duration::from_secs(60 * Self::NUMBER_OF_MINUTES_BEFORE_EXPIRATION),
+            expires_at: Instant::now()
+                + Duration::from_secs(60 * Self::NUMBER_OF_MINUTES_BEFORE_EXPIRATION),
             public_keys,
         };
         self.entries.insert(email_address.to_string(), entry);
@@ -407,4 +366,3 @@ struct PublicKeyCacheEntry {
     expires_at: Instant,
     public_keys: Vec<PublicKey>,
 }
-

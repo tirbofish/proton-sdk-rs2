@@ -1,10 +1,10 @@
-use base64::{engine::general_purpose::STANDARD, Engine};
+use crate::pgp::PgpPrivateKey;
+use base64::{Engine, engine::general_purpose::STANDARD};
+use proton_rpgp::{KeyGenerationType, KeyGenerator};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::io::{self, Read, Write};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use crate::pgp::PgpPrivateKey;
-use proton_rpgp::{KeyGenerator, KeyGenerationType};
 
 pub const AEAD_CHUNK_LENGTH: u64 = 1 << 17; // 128 KiB
 

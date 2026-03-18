@@ -11,5 +11,5 @@ pub struct DegradedNodeSecrets {
 
 pub struct ShareAndKey {
     pub share: Share,
-    pub key: PgpPrivateKey
+    pub key: PgpPrivateKey,
 }

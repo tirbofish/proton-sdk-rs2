@@ -56,13 +56,19 @@ impl VolumesApiClient for DefaultVolumesApiClient {
             request_builder = request_builder.header("x-pm-uid", credential.session_id().raw());
         }
 
-        let response = request_builder.send().await?.json::<VolumeCreationResponse>().await?;
+        let response = request_builder
+            .send()
+            .await?
+            .json::<VolumeCreationResponse>()
+            .await?;
 
         Ok(response)
     }
 
     async fn get_volume(&self, volume_id: VolumeId) -> anyhow::Result<VolumeResponse> {
-        let url = self.base_url.join(&format!("volumes/{}", volume_id.raw()))?;
+        let url = self
+            .base_url
+            .join(&format!("volumes/{}", volume_id.raw()))?;
         let mut request_builder = self.client.get(url);
 
         if let Some(credential) = &self.token_credential {
@@ -72,7 +78,11 @@ impl VolumesApiClient for DefaultVolumesApiClient {
             request_builder = request_builder.header("x-pm-uid", credential.session_id().raw());
         }
 
-        let response = request_builder.send().await?.json::<VolumeResponse>().await?;
+        let response = request_builder
+            .send()
+            .await?
+            .json::<VolumeResponse>()
+            .await?;
 
         Ok(response)
     }

@@ -2,10 +2,10 @@ pub mod client;
 pub mod entity;
 pub mod secret;
 
-use serde::{Deserialize, Serialize};
 use crate::node::{DegradedNode, Node};
 use crate::share::ShareId;
 use crate::utils::PotentialObject;
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct CachedNodeInfo {

@@ -1,10 +1,11 @@
-use tokio::sync::Semaphore;
 use std::sync::Arc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[derive(Clone)]
 pub struct TransferQueue {
     file_semaphore: Arc<Semaphore>,
     block_semaphore: Arc<Semaphore>,
+    #[allow(dead_code)]
     max_degree_of_parallelism: usize,
 }
 
@@ -17,28 +18,13 @@ impl TransferQueue {
         }
     }
 
-    pub async fn start_file(&self) -> anyhow::Result<()> {
-        let _permit = self.file_semaphore.acquire().await?;
-        // In Rust, permits are usually held until dropped. 
-        // For mirror C# logic, we might need to store the permit.
-        // For now, let's just acquire and forget if it's meant to be managed externally.
-        Ok(())
+    pub async fn start_file(&self) -> anyhow::Result<OwnedSemaphorePermit> {
+        let permit = self.file_semaphore.clone().acquire_owned().await?;
+        Ok(permit)
     }
 
-    pub fn finish_file(&self) {
-        // Release is automatic when permit drops, but if we don't have it...
-    }
-
-    pub fn try_start_block(&self) -> bool {
-        self.block_semaphore.try_acquire().is_ok()
-    }
-
-    pub async fn start_block(&self) -> anyhow::Result<()> {
-        let _permit = self.block_semaphore.acquire().await?;
-        Ok(())
-    }
-
-    pub fn finish_blocks(&self, _count: usize) {
-        // ...
+    pub async fn start_block(&self) -> anyhow::Result<OwnedSemaphorePermit> {
+        let permit = self.block_semaphore.clone().acquire_owned().await?;
+        Ok(permit)
     }
 }

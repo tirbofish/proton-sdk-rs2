@@ -10,9 +10,7 @@ pub trait KeysApiClient: Send + Sync {
         email_address: String,
     ) -> anyhow::Result<AddressPublicKeyListResponse>;
 
-    async fn get_key_salts(
-        &self,
-    ) -> anyhow::Result<KeySaltListResponse>;
+    async fn get_key_salts(&self) -> anyhow::Result<KeySaltListResponse>;
 }
 
 pub struct DefaultKeysApiClient {
@@ -62,9 +60,7 @@ impl KeysApiClient for DefaultKeysApiClient {
             .append_pair("Email", &email_address);
 
         let response = if let Some(token_credential) = &self.token_credential {
-            let (access_token, _) = token_credential
-                .get_tokens()
-                .await?;
+            let (access_token, _) = token_credential.get_tokens().await?;
             let session_id = token_credential.session_id();
 
             let first = self
@@ -77,12 +73,9 @@ impl KeysApiClient for DefaultKeysApiClient {
 
             if first.status() == StatusCode::UNAUTHORIZED {
                 let refreshed = token_credential
-                    .get_refreshed_access_token(
-                        access_token,
-                    )
+                    .get_refreshed_access_token(access_token)
                     .await?;
-                self
-                    .http_client
+                self.http_client
                     .get(url)
                     .bearer_auth(refreshed)
                     .header("x-pm-uid", session_id.raw())
@@ -93,25 +86,16 @@ impl KeysApiClient for DefaultKeysApiClient {
                 first.error_for_status()?
             }
         } else {
-            self
-                .http_client
-                .get(url)
-                .send()
-                .await?
-                .error_for_status()?
+            self.http_client.get(url).send().await?.error_for_status()?
         };
         crate::utils::decode_json::<AddressPublicKeyListResponse>(response).await
     }
 
-    async fn get_key_salts(
-        &self,
-    ) -> anyhow::Result<KeySaltListResponse> {
+    async fn get_key_salts(&self) -> anyhow::Result<KeySaltListResponse> {
         let endpoint = Self::endpoint("core/v4/keys/salts")?;
 
         let response = if let Some(token_credential) = &self.token_credential {
-            let (access_token, _) = token_credential
-                .get_tokens()
-                .await?;
+            let (access_token, _) = token_credential.get_tokens().await?;
             let session_id = token_credential.session_id();
 
             let first = self
@@ -124,12 +108,9 @@ impl KeysApiClient for DefaultKeysApiClient {
 
             if first.status() == StatusCode::UNAUTHORIZED {
                 let refreshed = token_credential
-                    .get_refreshed_access_token(
-                        access_token,
-                    )
+                    .get_refreshed_access_token(access_token)
                     .await?;
-                self
-                    .http_client
+                self.http_client
                     .get(endpoint)
                     .bearer_auth(refreshed)
                     .header("x-pm-uid", session_id.raw())
@@ -140,8 +121,7 @@ impl KeysApiClient for DefaultKeysApiClient {
                 first.error_for_status()?
             }
         } else {
-            self
-                .http_client
+            self.http_client
                 .get(endpoint)
                 .send()
                 .await?

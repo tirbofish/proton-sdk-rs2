@@ -1,9 +1,8 @@
 use crate::client::ProtonDriveClient;
 use crate::node::crypto::NodeCrypto;
-use crate::node::file::{FileNode, FileSecrets};
 use crate::node::{
-    DegradedNode, DtoToMetadataConverter, Node, NodeBase,
-    NodeMetadataResult, NodeSecrets, NodeUid, OwnedBy,
+    DegradedNode, DtoToMetadataConverter, Node, NodeBase, NodeMetadataResult, NodeSecrets, NodeUid,
+    OwnedBy,
 };
 use crate::pgp::PgpPrivateKey;
 use crate::utils::PotentialObject;
@@ -22,7 +21,6 @@ impl FolderOperations {
         let membership_address = client
             .account()
             .get_address_primary_private_key(&crate::account::AddressId::new(
-                // FIXME: this should be the address ID of the parent folder
                 client
                     .account()
                     .get_default_address()
@@ -123,7 +121,11 @@ impl FolderOperations {
         };
 
         // Cache the newly created folder secrets
-        client.cache().secrets().set_folder_secrets(node.base.uid.clone(), PotentialObject::Node(folder_secrets)).await?;
+        client
+            .cache()
+            .secrets()
+            .set_folder_secrets(node.base.uid.clone(), PotentialObject::Node(folder_secrets))
+            .await?;
 
         Ok(node)
     }

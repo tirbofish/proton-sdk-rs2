@@ -16,6 +16,7 @@ semver.workspace = true
 serde.workspace = true
 ron.workspace = true
 anyhow.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rpassword = "7.4.0"
 env_logger.workspace = true
 futures.workspace = true

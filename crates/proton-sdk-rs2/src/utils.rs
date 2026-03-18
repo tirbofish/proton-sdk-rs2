@@ -13,9 +13,9 @@ pub trait FromProtobuf<From> {
 }
 
 pub mod response_result_serde {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use crate::protobuf::response::Result as ResponseResult;
     use crate::protobuf::Error;
+    use crate::protobuf::response::Result as ResponseResult;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     #[derive(Serialize, Deserialize)]
     #[serde(rename_all = "PascalCase")]
@@ -32,14 +32,14 @@ pub mod response_result_serde {
                     value: any.value.clone(),
                 }))
             }
-            Some(ResponseResult::Error(err)) => {
-                s.serialize_some(&ResultHelper::Error(err.clone()))
-            }
+            Some(ResponseResult::Error(err)) => s.serialize_some(&ResultHelper::Error(err.clone())),
             None => s.serialize_none(),
         }
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<ResponseResult>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<ResponseResult>, D::Error> {
         let h = Option::<ResultHelper>::deserialize(d)?;
         Ok(h.map(|h| match h {
             ResultHelper::Value(any) => ResponseResult::Value(super::Any {
@@ -68,8 +68,18 @@ pub struct Timestamp {
 
 impl prost::Message for Timestamp {
     fn encode_raw<B: prost::bytes::BufMut>(&self, _buf: &mut B) {}
-    fn merge_field<B: prost::bytes::Buf>(&mut self, _tag: u32, _wire_type: prost::encoding::WireType, _buf: &mut B, _ctx: prost::encoding::DecodeContext) -> Result<(), prost::DecodeError> { Ok(()) }
-    fn encoded_len(&self) -> usize { 0 }
+    fn merge_field<B: prost::bytes::Buf>(
+        &mut self,
+        _tag: u32,
+        _wire_type: prost::encoding::WireType,
+        _buf: &mut B,
+        _ctx: prost::encoding::DecodeContext,
+    ) -> Result<(), prost::DecodeError> {
+        Ok(())
+    }
+    fn encoded_len(&self) -> usize {
+        0
+    }
     fn clear(&mut self) {}
 }
 
@@ -81,12 +91,24 @@ pub struct Any {
 
 impl prost::Message for Any {
     fn encode_raw<B: prost::bytes::BufMut>(&self, _buf: &mut B) {}
-    fn merge_field<B: prost::bytes::Buf>(&mut self, _tag: u32, _wire_type: prost::encoding::WireType, _buf: &mut B, _ctx: prost::encoding::DecodeContext) -> Result<(), prost::DecodeError> { Ok(()) }
-    fn encoded_len(&self) -> usize { 0 }
+    fn merge_field<B: prost::bytes::Buf>(
+        &mut self,
+        _tag: u32,
+        _wire_type: prost::encoding::WireType,
+        _buf: &mut B,
+        _ctx: prost::encoding::DecodeContext,
+    ) -> Result<(), prost::DecodeError> {
+        Ok(())
+    }
+    fn encoded_len(&self) -> usize {
+        0
+    }
     fn clear(&mut self) {}
 }
 
-pub(crate) async fn decode_json<T: DeserializeOwned>(response: reqwest::Response) -> anyhow::Result<T> {
+pub(crate) async fn decode_json<T: DeserializeOwned>(
+    response: reqwest::Response,
+) -> anyhow::Result<T> {
     let body = response.bytes().await?;
     Ok(serde_json::from_slice::<T>(&body)?)
 }
@@ -99,12 +121,18 @@ macro_rules! define_id {
         pub struct $t(String);
 
         impl $t {
-            pub fn new(value: String) -> Self { Self(value) }
-            pub fn raw(&self) -> &str { &self.0 }
+            pub fn new(value: String) -> Self {
+                Self(value)
+            }
+            pub fn raw(&self) -> &str {
+                &self.0
+            }
         }
 
         impl Default for $t {
-            fn default() -> Self { Self(String::new()) }
+            fn default() -> Self {
+                Self(String::new())
+            }
         }
     };
 }

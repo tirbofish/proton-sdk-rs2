@@ -1,21 +1,23 @@
-use serde::{Deserialize, Serialize};
-use serde_repr::{Deserialize_repr, Serialize_repr};
+use crate::author::Author;
+use crate::client::ProtonDriveClient;
+use crate::error::ProtonDriveError;
 use crate::links::LinkId;
-use crate::node::{NodeUid};
+use crate::meta::AdditionalMetadataProperty;
+use crate::node::NodeUid;
+use crate::node::download::DownloadState;
+use crate::node::draft::RevisionDraft;
+use crate::node::file::FileContentDigests;
+use crate::protobuf::SignatureVerificationError;
+use crate::protobuf::ThumbnailHeader;
 use crate::revision::RevisionId;
+use crate::utils::PotentialObject;
 use crate::volume::VolumeId;
 use chrono::{DateTime, Utc};
-use crate::node::file::FileContentDigests;
-use crate::protobuf::ThumbnailHeader;
-use crate::meta::AdditionalMetadataProperty;
-use crate::utils::PotentialObject;
-use crate::author::Author;
-use crate::protobuf::SignatureVerificationError;
-use crate::error::ProtonDriveError;
-use crate::client::ProtonDriveClient;
-use crate::node::draft::RevisionDraft;
-use crate::node::download::DownloadState;
+use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
+use sha1::Digest;
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
 
 pub const REVISION_WRITER_DEFAULT_BLOCK_SIZE: usize = 4 * 1024 * 1024;
 
@@ -50,8 +52,8 @@ pub struct Revision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 #[repr(u32)]
 pub enum RevisionState {
-    Draft      = 0,
-    Active     = 1,
+    Draft = 0,
+    Active = 1,
     Superseded = 2,
 }
 
@@ -64,7 +66,10 @@ pub struct RevisionUid {
 
 impl RevisionUid {
     pub fn new(node_uid: NodeUid, revision_id: RevisionId) -> Self {
-        Self { node_uid, revision_id }
+        Self {
+            node_uid,
+            revision_id,
+        }
     }
 
     pub fn from_parts(volume_id: VolumeId, link_id: LinkId, revision_id: RevisionId) -> Self {
@@ -121,18 +126,26 @@ impl RevisionOperations {
         client: &ProtonDriveClient,
         draft: RevisionDraft,
         release_blocks_action: Box<dyn Fn(i32) + Send + Sync>,
+        expected_size: i64,
+        last_modification_time: Option<DateTime<Utc>>,
+        additional_metadata: Option<Vec<AdditionalMetadataProperty>>,
     ) -> anyhow::Result<RevisionWriter> {
-        client.block_uploader().queue.start_file().await?;
+        let file_permit = client.block_uploader().queue.start_file().await?;
 
         Ok(RevisionWriter {
             client: Arc::new(client.clone()),
             draft,
             release_blocks_action,
-            finish_file_action: Box::new({
-                let client = client.clone();
-                move || { client.block_uploader().queue.finish_file(); }
-            }),
+            _file_permit: file_permit,
             target_block_size: client.target_block_size(),
+            total_written: 0,
+            block_number: 1,
+            digests: Vec::new(),
+            block_sizes: Vec::new(),
+            sha1_hasher: sha1::Sha1::default(),
+            expected_size,
+            last_modification_time,
+            additional_metadata,
         })
     }
 
@@ -141,17 +154,27 @@ impl RevisionOperations {
         revision_uid: RevisionUid,
         release_block_listing_action: Box<dyn Fn(i32) + Send + Sync>,
     ) -> anyhow::Result<DownloadState> {
-        let _node_metadata = crate::node::operations::NodeOperations::get_node(client, revision_uid.node_uid.clone()).await?;
-        let secrets = crate::node::file::FileOperations::get_secrets(client, revision_uid.node_uid.clone()).await?;
+        let _node_metadata = crate::node::operations::NodeOperations::get_node(
+            client,
+            revision_uid.node_uid.clone(),
+        )
+        .await?;
+        let secrets =
+            crate::node::file::FileOperations::get_secrets(client, revision_uid.node_uid.clone())
+                .await?;
 
-        let revision_response = client.api().files().get_revision(
-            revision_uid.node_uid.volume_id.clone(),
-            revision_uid.node_uid.link_id.clone(),
-            revision_uid.revision_id.clone(),
-            Some(crate::node::download::MIN_BLOCK_INDEX),
-            Some(crate::node::download::DEFAULT_BLOCK_PAGE_SIZE),
-            false,
-        ).await?;
+        let revision_response = client
+            .api()
+            .files()
+            .get_revision(
+                revision_uid.node_uid.volume_id.clone(),
+                revision_uid.node_uid.link_id.clone(),
+                revision_uid.revision_id.clone(),
+                Some(crate::node::download::MIN_BLOCK_INDEX),
+                Some(crate::node::download::DEFAULT_BLOCK_PAGE_SIZE),
+                false,
+            )
+            .await?;
 
         release_block_listing_action(1);
 
@@ -172,10 +195,6 @@ impl RevisionOperations {
             Arc::new(client.clone()),
             download_state,
             release_block_listing_action,
-            Box::new({
-                let client = client.clone();
-                move || { client.block_downloader().queue.finish_file(); }
-            })
         )
     }
 }
@@ -184,12 +203,190 @@ pub struct RevisionWriter {
     client: Arc<ProtonDriveClient>,
     draft: RevisionDraft,
     release_blocks_action: Box<dyn Fn(i32) + Send + Sync>,
-    finish_file_action: Box<dyn Fn() + Send + Sync>,
+    _file_permit: tokio::sync::OwnedSemaphorePermit,
     target_block_size: usize,
+    total_written: i64,
+    block_number: i32,
+    digests: Vec<u8>,
+    block_sizes: Vec<i32>,
+    sha1_hasher: sha1::Sha1,
+    expected_size: i64,
+    last_modification_time: Option<DateTime<Utc>>,
+    additional_metadata: Option<Vec<AdditionalMetadataProperty>>,
 }
 
-impl Drop for RevisionWriter {
-    fn drop(&mut self) {
-        (self.finish_file_action)();
+impl RevisionWriter {
+    #[tracing::instrument(skip(self, content_stream, on_progress))]
+    pub async fn write(
+        &mut self,
+        mut content_stream: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        on_progress: Arc<dyn Fn(i64, i64) + Send + Sync>,
+    ) -> anyhow::Result<()> {
+        tracing::debug!(expected_size = self.expected_size, "Starting write");
+        let mut buffer = vec![0u8; self.target_block_size];
+
+        loop {
+            let mut n = 0;
+            while n < self.target_block_size {
+                let read_bytes = content_stream.read(&mut buffer[n..]).await?;
+                if read_bytes == 0 {
+                    break;
+                }
+                n += read_bytes;
+            }
+
+            if n == 0 {
+                break;
+            }
+
+            let block_data = &buffer[..n];
+            sha1::Digest::update(&mut self.sha1_hasher, block_data);
+
+            let on_block_progress: Box<dyn Fn(i64) + Send + Sync> = Box::new({
+                let on_progress = on_progress.clone();
+                let current_total = self.total_written;
+                let expected_size = self.expected_size;
+                move |progress| {
+                    on_progress(current_total + progress, expected_size);
+                }
+            });
+
+            let result = self
+                .client
+                .block_uploader()
+                .upload_content(
+                    &self.client,
+                    &self.draft,
+                    self.block_number,
+                    block_data,
+                    Some(&on_block_progress),
+                )
+                .await?;
+
+            self.digests.extend_from_slice(&result.sha256_digest);
+            self.block_sizes.push(n as i32);
+            self.total_written += n as i64;
+            self.block_number += 1;
+
+            (self.release_blocks_action)(1);
+        }
+        Ok(())
+    }
+    pub async fn upload_thumbnail(
+        &mut self,
+        thumbnail_type: crate::node::thumbnail::ThumbnailType,
+        thumbnail_data: &[u8],
+    ) -> anyhow::Result<()> {
+        use crate::api::block::BlockUploadPreparationRequest;
+        use crate::api::file::thumbnail::ThumbnailCreationRequest;
+        use sha2::{Digest, Sha256};
+
+        // 1. Prepare thumbnail upload
+        let mut hasher = Sha256::new();
+        hasher.update(thumbnail_data);
+        let hash_digest = hasher.finalize().to_vec();
+
+        let request = BlockUploadPreparationRequest {
+            address_id: crate::account::AddressId::new(
+                self.draft.membership_address.address_id.clone(),
+            ),
+            volume_id: self.draft.uid.node_uid.volume_id.clone(),
+            link_id: self.draft.uid.node_uid.link_id.clone(),
+            revision_id: self.draft.uid.revision_id.clone(),
+            blocks: vec![],
+            thumbnails: vec![ThumbnailCreationRequest {
+                size: thumbnail_data.len() as i32,
+                r#type: thumbnail_type,
+                hash_digest: hash_digest.clone(),
+            }],
+        };
+
+        let response = self
+            .client
+            .api()
+            .files()
+            .prepare_block_upload(request)
+            .await?;
+        if response.thumbnail_upload_targets.is_empty() {
+            anyhow::bail!("No thumbnail upload target received from API");
+        }
+
+        let target = &response.thumbnail_upload_targets[0];
+
+        // 2. Upload thumbnail blob
+        self.client
+            .api()
+            .storage()
+            .upload_blob(
+                &target.base.bare_url,
+                &target.base.token,
+                bytes::Bytes::copy_from_slice(thumbnail_data),
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn commit(&mut self) -> anyhow::Result<()> {
+        use crate::pgp::{PgpArmoredMessage, PgpArmoredSignature};
+        use proton_rpgp::DataEncoding;
+        use proton_rpgp::{Encryptor, Signer};
+
+        tracing::info!(total_written = self.total_written, blocks = self.block_sizes.len(), "Committing revision");
+        let signer = Signer::default().with_signing_key(&self.draft.signing_key.0);
+        let manifest_signature = PgpArmoredSignature(String::from_utf8(
+            signer.sign_detached(&self.digests, DataEncoding::Armored)?,
+        )?);
+
+        // 2. Prepare Extended Attributes
+        let sha1_digest = self.sha1_hasher.clone().finalize().to_vec();
+        let mut additional_metadata = std::collections::HashMap::new();
+        if let Some(meta) = &self.additional_metadata {
+            for prop in meta {
+                additional_metadata.insert(prop.key.clone(), serde_json::Value::String(prop.value.clone()));
+            }
+        }
+
+        let xattr = crate::api::attr::ExtendedAttributes {
+            common: Some(crate::api::attr::CommonExtendedAttributes {
+                size: Some(self.total_written),
+                modification_time: self.last_modification_time,
+                block_sizes: Some(self.block_sizes.clone()),
+                digests: Some(crate::api::file::FileContentDigestsDto { sha1: Some(sha1_digest) }),
+            }),
+            additional_metadata,
+        };
+
+        let xattr_json = serde_json::to_vec(&xattr)?;
+
+        // 3. Encrypt Extended Attributes
+        use proton_rpgp::AsPublicKeyRef;
+        let xattr_encryptor = Encryptor::default()
+            .with_encryption_key(self.draft.file_key.0.as_public_key())
+            .with_signing_key(&self.draft.signing_key.0);
+        let xattr_result = xattr_encryptor.encrypt(&xattr_json)?;
+        let encrypted_xattr = PgpArmoredMessage(String::from_utf8(xattr_result.armor()?)?);
+
+        // 4. Update Revision
+        let request = crate::api::revision::RevisionUpdateRequest {
+            manifest_signature,
+            signature_email_address: self.draft.membership_address.email_address.clone(),
+            extended_attributes: Some(encrypted_xattr),
+            photos_attributes: None,
+        };
+
+        self.client
+            .api()
+            .files()
+            .update_revision(
+                self.draft.uid.node_uid.volume_id.clone(),
+                self.draft.uid.node_uid.link_id.clone(),
+                self.draft.uid.revision_id.clone(),
+                request,
+            )
+            .await?;
+
+        Ok(())
     }
 }

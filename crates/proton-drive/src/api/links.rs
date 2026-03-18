@@ -104,8 +104,13 @@ impl LinksApiClient for DefaultLinksApiClient {
         volume_id: VolumeId,
         link_ids: Vec<LinkId>,
     ) -> anyhow::Result<LinkDetailsResponse> {
-        let url = self.base_url.join(&format!("v2/volumes/{}/links", volume_id.raw()))?;
-        let builder = self.client.post(url).json(&LinkDetailsRequest::new(link_ids));
+        let url = self
+            .base_url
+            .join(&format!("v2/volumes/{}/links", volume_id.raw()))?;
+        let builder = self
+            .client
+            .post(url)
+            .json(&LinkDetailsRequest::new(link_ids));
         let builder = self.add_auth_headers(builder).await?;
         let response = builder.send().await?;
         let text = response.text().await?;
@@ -157,7 +162,9 @@ impl LinksApiClient for DefaultLinksApiClient {
         volume_id: VolumeId,
         request: MoveMultipleLinksRequest,
     ) -> anyhow::Result<ApiResponse> {
-        let url = self.base_url.join(&format!("volumes/{}/links/move-multiple", volume_id.raw()))?;
+        let url = self
+            .base_url
+            .join(&format!("volumes/{}/links/move-multiple", volume_id.raw()))?;
         let builder = self.client.put(url).json(&request);
         let builder = self.add_auth_headers(builder).await?;
         Ok(builder.send().await?.json::<ApiResponse>().await?)
@@ -184,7 +191,9 @@ impl LinksApiClient for DefaultLinksApiClient {
         volume_id: VolumeId,
         link_ids: Vec<LinkId>,
     ) -> anyhow::Result<AggregateApiResponse<LinkIdResponsePair>> {
-        let url = self.base_url.join(&format!("v2/volumes/{}/delete_multiple", volume_id.raw()))?;
+        let url = self
+            .base_url
+            .join(&format!("v2/volumes/{}/delete_multiple", volume_id.raw()))?;
         let builder = self
             .client
             .post(url)

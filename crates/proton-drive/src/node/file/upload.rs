@@ -2,14 +2,17 @@ use crate::client::ProtonDriveClient;
 use crate::meta::AdditionalMetadataProperty;
 use crate::node::draft::RevisionDraftProvider;
 use crate::node::revision::RevisionOperations;
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 pub struct FileUploader {
     client: Arc<ProtonDriveClient>,
     revision_draft_provider: Box<dyn RevisionDraftProvider>,
-    size: i64,
     remaining_number_of_blocks: AtomicI32,
+    size: i64,
+    last_modification_time: Option<DateTime<Utc>>,
+    additional_metadata: Option<Vec<AdditionalMetadataProperty>>,
 }
 
 impl FileUploader {
@@ -17,8 +20,8 @@ impl FileUploader {
         client: &ProtonDriveClient,
         revision_draft_provider: Box<dyn RevisionDraftProvider>,
         size: i64,
-        _last_modification_time: Option<std::time::SystemTime>,
-        _additional_metadata: Option<Vec<AdditionalMetadataProperty>>,
+        last_modification_time: Option<std::time::SystemTime>,
+        additional_metadata: Option<Vec<AdditionalMetadataProperty>>,
     ) -> anyhow::Result<Self> {
         let expected_number_of_blocks = (size + 4 * 1024 * 1024 - 1) / (4 * 1024 * 1024);
         client
@@ -29,22 +32,39 @@ impl FileUploader {
         Ok(Self {
             client: Arc::new(client.clone()),
             revision_draft_provider,
-            size,
             remaining_number_of_blocks: AtomicI32::new(expected_number_of_blocks as i32),
+            size,
+            last_modification_time: last_modification_time.map(DateTime::from),
+            additional_metadata,
         })
     }
 
     pub async fn upload_from_stream(
         &self,
-        _content_stream: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-        _on_progress: Box<dyn Fn(i64, i64) + Send + Sync>,
+        content_stream: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        on_progress: Box<dyn Fn(i64, i64) + Send + Sync>,
     ) -> anyhow::Result<()> {
         let draft = self.revision_draft_provider.get_draft().await?;
-        let _writer =
-            RevisionOperations::open_for_writing(&self.client, draft, Box::new(|_| {})).await?;
 
-        // Simplified upload logic
-        Ok(())
+        let on_progress_arc: Arc<dyn Fn(i64, i64) + Send + Sync> = Arc::from(on_progress);
+
+        let release_blocks_action = Box::new(|_| {
+            // Sequential implementation for now
+        });
+
+        let mut writer =
+            RevisionOperations::open_for_writing(
+                &self.client,
+                draft,
+                release_blocks_action,
+                self.size,
+                self.last_modification_time,
+                self.additional_metadata.clone(),
+            )
+            .await?;
+
+        writer.write(content_stream, on_progress_arc).await?;
+        writer.commit().await
     }
 }
 

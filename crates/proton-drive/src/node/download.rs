@@ -1,17 +1,17 @@
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Mutex;
-use std::sync::Arc;
-use std::time::Duration;
-use log::{debug, info};
-use sha2::{Digest, Sha256};
-use tokio::sync::watch;
 use crate::api::block::BlockListingRevisionDto;
 use crate::client::ProtonDriveClient;
 use crate::node::revision::RevisionUid;
-use crate::pgp::{PgpSessionKey, PgpPrivateKey};
 use crate::node::transfer::TransferQueue;
+use crate::pgp::{PgpPrivateKey, PgpSessionKey};
+use log::{debug, info};
 use proton_rpgp::{DataEncoding, Decryptor, SessionKey, pgp::crypto::sym::SymmetricKeyAlgorithm};
+use sha2::{Digest, Sha256};
+use std::io::Write;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
+use tokio::sync::watch;
 
 pub const MIN_BLOCK_INDEX: i32 = 1;
 pub const DEFAULT_BLOCK_PAGE_SIZE: i32 = 10;
@@ -24,7 +24,9 @@ pub struct CompletedDownloadManifestVerificationException {
 
 impl CompletedDownloadManifestVerificationException {
     pub fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into() }
+        Self {
+            message: message.into(),
+        }
     }
 }
 
@@ -36,7 +38,9 @@ pub struct DataIntegrityException {
 
 impl DataIntegrityException {
     pub fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into() }
+        Self {
+            message: message.into(),
+        }
     }
 }
 
@@ -122,7 +126,10 @@ impl DownloadState {
 
     pub fn set_is_completed(&self) {
         self.is_completed.store(true, Ordering::Relaxed);
-        debug!("Download disposed before completion for revision {:?}", self.uid);
+        debug!(
+            "Download disposed before completion for revision {:?}",
+            self.uid
+        );
     }
 }
 
@@ -163,7 +170,10 @@ impl BlockDownloader {
                             .unwrap();
                         if retry_after > now {
                             let wait = retry_after - now;
-                            info!("Waiting {:?} before retrying blob download due to 429 response", wait);
+                            info!(
+                                "Waiting {:?} before retrying blob download due to 429 response",
+                                wait
+                            );
                             tokio::time::sleep(wait).await;
                         }
                     }
@@ -178,11 +188,16 @@ impl BlockDownloader {
                 tokio::time::sleep(delay).await;
             }
 
-            match self.execute_download(bare_url, token, content_key, output).await {
+            match self
+                .execute_download(bare_url, token, content_key, output)
+                .await
+            {
                 Ok(digest) => return Ok(digest),
                 Err(e) => {
                     // Don't retry decryption errors
-                    if e.downcast_ref::<FileContentsDecryptionException>().is_some() {
+                    if e.downcast_ref::<FileContentsDecryptionException>()
+                        .is_some()
+                    {
                         return Err(e);
                     }
                     last_err = Some(e);
@@ -190,7 +205,9 @@ impl BlockDownloader {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Download failed after {} attempts", max_retries + 1)))
+        Err(last_err.unwrap_or_else(|| {
+            anyhow::anyhow!("Download failed after {} attempts", max_retries + 1)
+        }))
     }
 
     async fn execute_download(
@@ -200,7 +217,12 @@ impl BlockDownloader {
         content_key: &PgpSessionKey,
         output: &mut Vec<u8>,
     ) -> anyhow::Result<Vec<u8>> {
-        let response: reqwest::Response = self.client.api().storage().get_blob_stream(bare_url, token).await?;
+        let response: reqwest::Response = self
+            .client
+            .api()
+            .storage()
+            .get_blob_stream(bare_url, token)
+            .await?;
         let blob_bytes = response.bytes().await?;
 
         let mut hasher = Sha256::new();
@@ -226,7 +248,6 @@ impl BlockDownloader {
         None
     }
 }
-
 
 pub trait FileDownloader: Send + Sync {
     fn download_to_stream(
@@ -279,16 +300,15 @@ impl DownloadController {
     }
 
     pub fn get_is_download_complete_with_verification_issue(&self) -> bool {
-        self.is_download_complete_with_verification_issue.load(Ordering::Relaxed)
+        self.is_download_complete_with_verification_issue
+            .load(Ordering::Relaxed)
     }
 }
-
 
 pub struct RevisionReader {
     client: Arc<ProtonDriveClient>,
     state: Arc<DownloadState>,
     release_block_listing: Box<dyn Fn(i32) + Send + Sync>,
-    release_file_semaphore: Box<dyn Fn() + Send + Sync>,
 }
 
 impl RevisionReader {
@@ -296,13 +316,47 @@ impl RevisionReader {
         client: Arc<ProtonDriveClient>,
         state: Arc<DownloadState>,
         release_block_listing: Box<dyn Fn(i32) + Send + Sync>,
-        release_file_semaphore: Box<dyn Fn() + Send + Sync>,
     ) -> Self {
         Self {
             client,
             state,
             release_block_listing,
-            release_file_semaphore,
         }
+    }
+
+    pub async fn read_next_block(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+        let block_index = self.state.get_next_block_index_to_download();
+        let total_blocks = self.state.revision_dto.blocks.len() as i32;
+
+        if block_index > total_blocks {
+            return Ok(None);
+        }
+
+        let block_dto = &self.state.revision_dto.blocks[(block_index - 1) as usize];
+
+        let mut block_data = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut block_data);
+
+        let digest = self
+            .client
+            .block_downloader()
+            .download(
+                &self.client,
+                self.state.uid.clone(),
+                block_index,
+                block_dto.bare_url.clone(),
+                block_dto.token.clone(),
+                self.state.content_key.clone(),
+                &mut cursor,
+            )
+            .await?;
+
+        self.state.add_downloaded_block_digest(digest);
+        self.state
+            .add_number_of_bytes_written(block_data.len() as i64);
+
+        (self.release_block_listing)(1);
+
+        Ok(Some(block_data))
     }
 }

@@ -175,14 +175,14 @@ impl ProtonDriveClient {
         drive_api_clients_factory: Arc<dyn DriveApiClientsFactory>,
         uid: String,
         token_credential: Option<TokenCredential>,
-        api_url: String,
+        _api_url: String,
     ) -> anyhow::Result<Self> {
         let api = drive_api_clients_factory.create(
             default_api_http_client.clone(),
             storage_api_http_client.clone(),
-            default_api_base_url,
+            default_api_base_url.clone(),
             storage_api_base_url,
-            token_credential,
+            token_credential.clone(),
         );
 
         Ok(Self::from_components(
@@ -190,8 +190,9 @@ impl ProtonDriveClient {
             api,
             cache,
             Arc::new(DefaultBlockVerifierFactory::new(
-                reqwest::Client::new(),
-                api_url,
+                default_api_http_client,
+                default_api_base_url,
+                token_credential,
             )) as Arc<dyn BlockVerifierFactory>,
             feature_flag_provider,
             telemetry,
@@ -307,19 +308,20 @@ impl ProtonDriveClient {
         self.target_block_size = value;
     }
 
-    pub fn account(&self) -> &Arc<dyn AccountClient> {
+    pub(crate) fn account(&self) -> &Arc<dyn AccountClient> {
         &self.account
     }
 
-    pub fn api(&self) -> &Arc<dyn DriveApiClients> {
+    // this should always be pub(crate), not pub. reduce the visibility.
+    pub(crate) fn api(&self) -> &Arc<dyn DriveApiClients> {
         &self.api
     }
 
-    pub fn cache(&self) -> &Arc<dyn DriveClientCache> {
+    pub(crate) fn cache(&self) -> &Arc<dyn DriveClientCache> {
         &self.cache
     }
 
-    pub fn block_verifier_factory(&self) -> &Arc<dyn BlockVerifierFactory> {
+    pub(crate) fn block_verifier_factory(&self) -> &Arc<dyn BlockVerifierFactory> {
         &self.block_verifier_factory
     }
 
@@ -365,8 +367,11 @@ impl ProtonDriveClient {
     pub async fn enumerate_nodes(
         &self,
         node_uids: Vec<NodeUid>,
-    ) -> anyhow::Result<Vec<PotentialObject<Node, DegradedNode>>> {
-        NodeOperations::enumerate_nodes(self, node_uids).await
+    ) -> anyhow::Result<
+        impl futures::Stream<Item = anyhow::Result<PotentialObject<Node, DegradedNode>>> + '_,
+    > {
+        let results = NodeOperations::enumerate_nodes(self, node_uids).await?;
+        Ok(futures::stream::iter(results.into_iter().map(Ok)))
     }
 
     pub async fn create_folder(
@@ -381,16 +386,20 @@ impl ProtonDriveClient {
     pub async fn enumerate_folder_children(
         &self,
         folder_id: NodeUid,
-    ) -> anyhow::Result<Vec<PotentialObject<Node, DegradedNode>>> {
-        FolderOperations::enumerate_children(self, folder_id).await
+    ) -> anyhow::Result<
+        impl futures::Stream<Item = anyhow::Result<PotentialObject<Node, DegradedNode>>> + '_,
+    > {
+        let results = FolderOperations::enumerate_children(self, folder_id).await?;
+        Ok(futures::stream::iter(results.into_iter().map(Ok)))
     }
 
     pub async fn enumerate_thumbnails(
         &self,
         file_uids: Vec<NodeUid>,
         thumbnail_type: ThumbnailType,
-    ) -> anyhow::Result<Vec<FileThumbnail>> {
-        FileOperations::enumerate_thumbnails(self, file_uids, thumbnail_type).await
+    ) -> anyhow::Result<impl futures::Stream<Item = anyhow::Result<FileThumbnail>> + '_> {
+        let results = FileOperations::enumerate_thumbnails(self, file_uids, thumbnail_type).await?;
+        Ok(futures::stream::iter(results.into_iter().map(Ok)))
     }
 
     pub async fn get_file_uploader(
@@ -420,47 +429,6 @@ impl ProtonDriveClient {
         .await
     }
 
-    pub async fn upload_file(
-        &self,
-        path: &std::path::Path,
-        parent_folder_uid: NodeUid,
-        override_existing_draft_by_other_client: bool,
-        on_progress: impl Fn(i64, i64) + Send + Sync + 'static,
-    ) -> anyhow::Result<()> {
-        let file = tokio::fs::File::open(path).await?;
-        let size = file.metadata().await?.len() as i64;
-
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| anyhow::anyhow!("Invalid file name: {:?}", path))?
-            .to_string();
-
-        let media_type = mime_guess::from_path(path)
-            .first_or_octet_stream()
-            .to_string();
-
-        let last_modification_time = file.metadata().await?.modified().ok();
-
-        let uploader = self
-            .get_file_uploader(
-                parent_folder_uid,
-                name,
-                media_type,
-                size,
-                last_modification_time,
-                None,
-                override_existing_draft_by_other_client,
-            )
-            .await?;
-
-        uploader
-            .upload_from_stream(Box::new(file), Box::new(on_progress))
-            .await?;
-
-        Ok(())
-    }
-
     pub async fn get_file_revision_uploader(
         &self,
         current_active_revision_uid: RevisionUid,
@@ -488,6 +456,67 @@ impl ProtonDriveClient {
         revision_uid: RevisionUid,
     ) -> anyhow::Result<FileDownloader> {
         FileDownloader::create(self, revision_uid).await
+    }
+
+    pub async fn download_to_file(
+        &self,
+        node_uid: NodeUid,
+        path: &std::path::Path,
+        on_progress: Box<dyn Fn(i64, i64) + Send + Sync>,
+    ) -> anyhow::Result<()> {
+        let potential_node = self.get_node(node_uid).await?;
+        let node = potential_node
+            .result()
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let file = match node {
+            crate::node::Node::File(f) => f,
+            _ => anyhow::bail!("Expected file node"),
+        };
+
+        let downloader = self
+            .get_file_downloader(file.active_revision.uid.clone())
+            .await?;
+        let file = std::fs::File::create(path)?;
+        let controller = downloader.download_to_stream(Box::new(file), on_progress);
+        controller.completion.await?
+    }
+
+    pub async fn upload_file(
+        &self,
+        path: &std::path::Path,
+        parent_folder_uid: NodeUid,
+        override_existing: bool,
+        on_progress: Box<dyn Fn(i64, i64) + Send + Sync>,
+    ) -> anyhow::Result<()> {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| anyhow::anyhow!("Invalid file name"))?
+            .to_string();
+        let metadata = std::fs::metadata(path)?;
+        let size = metadata.len() as i64;
+        let last_modified = metadata.modified().ok();
+
+        let media_type = mime_guess::from_path(path)
+            .first_or_octet_stream()
+            .to_string();
+
+        let uploader = self
+            .get_file_uploader(
+                parent_folder_uid,
+                name,
+                media_type,
+                size,
+                last_modified,
+                None,
+                override_existing,
+            )
+            .await?;
+
+        let file = tokio::fs::File::open(path).await?;
+        uploader
+            .upload_from_stream(Box::new(file), on_progress)
+            .await
     }
 
     pub async fn get_available_name(

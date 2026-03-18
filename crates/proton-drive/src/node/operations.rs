@@ -7,7 +7,6 @@ use crate::pgp::PgpPrivateKey;
 use crate::share_ops::ShareOperations;
 use crate::utils::PotentialObject;
 use hmac::{Hmac, KeyInit, Mac};
-use proton_rpgp::DataEncoding;
 use proton_sdk_rs2::protobuf::Address;
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -370,7 +369,7 @@ impl NodeOperations {
         let metadata_result = Self::get_node_metadata(client, uid.clone()).await?;
         let (node, node_and_secrets, _, original_name_hash_digest) =
             metadata_result.result()?.deconstruct();
-        let secrets = match node_and_secrets {
+        let _secrets = match node_and_secrets {
             crate::node::NodeAndSecrets::File(_, s) => s.base,
             crate::node::NodeAndSecrets::Folder(_, s) => s.base,
         };

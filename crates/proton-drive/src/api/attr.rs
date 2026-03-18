@@ -1,10 +1,10 @@
-use std::collections::HashMap;
-use chrono::{DateTime, Utc};
-use serde::Deserialize;
-use serde_json::Value;
 use crate::api::file::FileContentDigestsDto;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct CommonExtendedAttributes {
     pub size: Option<i64>,
@@ -17,7 +17,7 @@ pub struct CommonExtendedAttributes {
     pub digests: Option<FileContentDigestsDto>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ExtendedAttributes {
     pub common: Option<CommonExtendedAttributes>,

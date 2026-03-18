@@ -23,6 +23,7 @@ log.workspace = true
 bytes.workspace = true
 http.workspace = true
 sha2 = "0.11.0-rc.5"
+sha1 = "0.10.6"
 hmac = "0.13.0-rc.5"
 hex = "0.4.3"
 serde_with = "3.18.0"

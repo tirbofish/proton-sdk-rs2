@@ -1,10 +1,10 @@
-use ::serde::{Deserialize, Serialize};
 use crate::node::file::{DegradedFileMetadata, FileMetadata};
-use crate::node::{DegradedNode, DegradedNodeMetadata, Node, NodeMetadata};
 use crate::node::folder::{DegradedFolderMetadata, FolderMetadata};
+use crate::node::{DegradedNodeMetadata, NodeMetadata};
+use ::serde::{Deserialize, Serialize};
+pub mod batch;
 pub mod semaphore;
 pub mod serde;
-pub mod batch;
 
 pub struct AlternateFileNameGenerator;
 
@@ -87,7 +87,9 @@ impl PotentialObject<FolderMetadata, DegradedFolderMetadata> {
     pub fn folder_to_node_metadata(self) -> PotentialObject<NodeMetadata, DegradedNodeMetadata> {
         match self {
             PotentialObject::Node(n) => PotentialObject::Node(NodeMetadata::from_folder(n)),
-            PotentialObject::Degraded(d) => PotentialObject::Degraded(DegradedNodeMetadata::from_folder(d))
+            PotentialObject::Degraded(d) => {
+                PotentialObject::Degraded(DegradedNodeMetadata::from_folder(d))
+            }
         }
     }
 }
@@ -96,7 +98,9 @@ impl PotentialObject<FileMetadata, DegradedFileMetadata> {
     pub fn file_to_node_metadata(self) -> PotentialObject<NodeMetadata, DegradedNodeMetadata> {
         match self {
             PotentialObject::Node(n) => PotentialObject::Node(NodeMetadata::from_file(n)),
-            PotentialObject::Degraded(d) => PotentialObject::Degraded(DegradedNodeMetadata::from_file(d))
+            PotentialObject::Degraded(d) => {
+                PotentialObject::Degraded(DegradedNodeMetadata::from_file(d))
+            }
         }
     }
 }
@@ -155,5 +159,4 @@ impl<N, DN> PotentialObject<N, DN> {
     }
 }
 
-impl PotentialObject<NodeMetadata, DegradedNodeMetadata> {
-}
+impl PotentialObject<NodeMetadata, DegradedNodeMetadata> {}

@@ -1,12 +1,12 @@
-use std::sync::Arc;
 use crate::addresses::AddressesApiClient;
-use crate::client::ApiClient;
-use crate::keys::KeysApiClient;
-use crate::users::UsersApiClient;
-use crate::auth::TokenCredential;
 use crate::addresses::DefaultAddressesApiClient;
-use crate::users::DefaultUsersApiClient;
+use crate::auth::TokenCredential;
+use crate::client::ApiClient;
 use crate::keys::DefaultKeysApiClient;
+use crate::keys::KeysApiClient;
+use crate::users::DefaultUsersApiClient;
+use crate::users::UsersApiClient;
+use std::sync::Arc;
 
 pub trait AccountApiClients: Send + Sync {
     fn keys(&self) -> Arc<dyn KeysApiClient>;
@@ -68,7 +68,9 @@ impl AccountApiClients for DefaultAccountApiClients {
                 token_credential.clone(),
             ))
         } else {
-            Arc::new(ApiClient::create_addresses_api_client(self.http_client.clone()))
+            Arc::new(ApiClient::create_addresses_api_client(
+                self.http_client.clone(),
+            ))
         }
     }
 }

@@ -1,7 +1,7 @@
-use std::collections::VecDeque;
-use tokio::sync::Notify;
-use std::sync::Arc;
 use parking_lot::Mutex;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use tokio::sync::Notify;
 
 #[derive(Debug, Clone)]
 pub struct FifoFlexibleSemaphore {

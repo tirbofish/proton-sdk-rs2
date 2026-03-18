@@ -94,7 +94,9 @@ impl TrashApiClient for DefaultTrashApiClient {
         volume_id: VolumeId,
         request: MultipleLinksNullaryRequest,
     ) -> anyhow::Result<AggregateApiResponse<LinkIdResponsePair>> {
-        let url = self.base_url.join(&format!("v2/volumes/{}/trash_multiple", volume_id.raw()))?;
+        let url = self
+            .base_url
+            .join(&format!("v2/volumes/{}/trash_multiple", volume_id.raw()))?;
         let builder = self.client.post(url).json(&request);
         let builder = self.add_auth_headers(builder).await?;
         let response = builder.send().await?;
@@ -147,7 +149,9 @@ impl TrashApiClient for DefaultTrashApiClient {
     }
 
     async fn empty(&self, volume_id: VolumeId) -> anyhow::Result<ApiResponse> {
-        let url = self.base_url.join(&format!("volumes/{}/trash", volume_id.raw()))?;
+        let url = self
+            .base_url
+            .join(&format!("volumes/{}/trash", volume_id.raw()))?;
         let builder = self.client.delete(url);
         let builder = self.add_auth_headers(builder).await?;
         Ok(builder.send().await?.json::<ApiResponse>().await?)

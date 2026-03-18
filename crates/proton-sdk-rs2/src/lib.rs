@@ -4,17 +4,17 @@ pub mod protobuf {
     include!(concat!(env!("OUT_DIR"), "/proton.sdk.rs"));
 }
 
-pub mod session;
-pub mod client;
-pub mod secret;
+pub mod account;
+pub mod addresses;
 pub mod api;
 pub mod auth;
 pub mod cache;
-pub mod utils;
+pub mod client;
 pub mod keys;
+pub mod secret;
+pub mod session;
 pub mod users;
-pub mod addresses;
-pub mod account;
+pub mod utils;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SessionId(String);
@@ -58,8 +58,7 @@ impl ToString for UserId {
 pub struct EventId(String);
 
 #[derive(Debug, Clone, Copy)]
-pub enum PasswordMode
-{
+pub enum PasswordMode {
     Single = 1,
     Dual = 2,
 }

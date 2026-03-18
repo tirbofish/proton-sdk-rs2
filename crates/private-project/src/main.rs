@@ -26,7 +26,9 @@ impl Drop for DriveClient {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let _ = env_logger::try_init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
 
     let client = DriveClient::auth().await?;
     let session = &client.session;
@@ -54,22 +56,16 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     println!("Renamed folder successfully");
 
-    // issue to fix: on each iteration this should be displaying the info of a new child, not everything all grouped up together
     println!("Enumerating children of My Files:");
-    let children = match client
+    use futures::StreamExt;
+    let mut children_stream = client
         .enumerate_folder_children(my_files.base.uid.clone())
-        .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            println!("Warning: Failed to enumerate some children: {}", e);
-            vec![client.get_node(test_folder.base.uid.clone()).await?]
-        }
-    };
+        .await?;
+
     let mut found = false;
-    for child in &children {
+    while let Some(child_result) = children_stream.next().await {
+        let child = child_result?;
         if let Node(node) = child {
-            let node: &proton_drive::node::Node = node;
             if node.base().name == new_name {
                 println!("Found renamed folder: {:?}", node.base().uid);
                 found = true;
@@ -92,16 +88,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!("Looking for a file containing 'Screenshot'...");
-    let children = match client
+    let mut children_stream = client
         .enumerate_folder_children(my_files.base.uid.clone())
-        .await
-    {
-        Ok(c) => c,
-        Err(_) => Vec::new(),
-    };
+        .await?;
 
     let mut target_file = None;
-    for child in &children {
+    while let Some(child_result) = children_stream.next().await {
+        let child = child_result?;
         if let Node(node) = child {
             if let proton_drive::node::Node::File(file) = node {
                 if file.base.base.name.contains("Screenshot") {
@@ -118,98 +111,51 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // issues: this is directly using the client api(). most, if not all should be done with the ProtonDriveClient.
     if let Some(file) = target_file {
         println!("Downloading file: {}", file.base.base.name);
-        let revision = file.active_revision;
 
-        let mut file_content = Vec::new();
+        let file_name = PathBuf::from(file.base.base.name);
+        println!("Downloading content to local file: {}", file_name.display());
 
-        let revision_details = client
-            .api()
-            .files()
-            .get_revision(
-                revision.uid.node_uid.volume_id.clone(),
-                revision.uid.node_uid.link_id.clone(),
-                revision.uid.revision_id.clone(),
-                None,
-                None,
-                false,
+        client
+            .download_to_file(
+                file.base.base.uid.clone(),
+                &file_name,
+                Box::new(|current, total| {
+                    println!("Downloaded {}/{} bytes", current, total);
+                }),
             )
             .await?;
 
-        let secrets = proton_drive::node::file::FileOperations::get_secrets(
-            &client,
-            file.base.base.uid.clone(),
-        )
-        .await?;
-        let content_key = secrets.content_key;
-
-        // issue: again, this should be accessed through the client/have a way to access through the ProtonDriveClient, not the API directly.
-        for block in revision_details.revision.blocks {
-            println!("Downloading block: {}", block.index);
-            let response = client
-                .api()
-                .storage()
-                .get_blob_stream(&block.bare_url, &block.token)
-                .await?;
-            let encrypted_data = response.bytes().await?;
-            println!(
-                "Downloaded block {} as {} bytes",
-                block.index,
-                encrypted_data.len()
-            );
-
-            let sk = content_key.to_rpgp_sk()?;
-            let result = proton_rpgp::Decryptor::default()
-                .with_session_key(sk)
-                .decrypt(&encrypted_data, proton_rpgp::DataEncoding::Auto)?;
-
-            file_content.extend_from_slice(&result.data);
-        }
-        println!("Downloaded {} bytes", file_content.len());
-
-        let file_name = PathBuf::from(file.base.base.name);
-
-        println!(
-            "Saving decrypted content to local file: {}",
-            file_name.display()
-        );
-        std::fs::write(&file_name, &file_content)?;
-        println!("Saved successfully");
+        println!("Downloaded successfully");
 
         println!("Reading from file: {}", file_name.display());
         let read_content = std::fs::read(&file_name)?;
         println!("Read {} bytes from file", read_content.len());
 
-        if read_content != file_content {
-            anyhow::bail!("Read content does not match original content!");
-        }
+        println!("file media type: {}", file.base.media_type);
 
-        let new_folder_name = format!(
-            "upload-test-{}",
+        let upload_name = format!(
+            "uploaded-file-{}.png",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs()
         );
-        println!("Creating new folder for re-upload: {}", new_folder_name);
-        let upload_folder = client
-            .create_folder(my_files.base.uid.clone(), new_folder_name, None)
-            .await?;
+        let upload_path = std::path::PathBuf::from(&upload_name);
+        std::fs::copy(&file_name, &upload_path)?;
 
-        println!("file media type: {}", file.base.media_type);
-
-        // this hasnt been implemented yet.
+        println!("Uploading file: {} to root", upload_name);
         client
             .upload_file(
-                &file_name,
-                upload_folder.base.uid,
+                &upload_path,
+                my_files.base.uid.clone(),
                 false,
                 Box::new(|current, total| {
                     println!("Uploaded {}/{} bytes", current, total);
                 }),
             )
             .await?;
+        println!("Uploaded successfully to root as {}", upload_name);
     } else {
         println!("No file containing 'Screenshot' found to test download/upload.");
     }

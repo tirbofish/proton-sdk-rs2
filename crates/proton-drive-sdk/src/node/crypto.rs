@@ -40,6 +40,7 @@ pub struct LinkDecryptionResult {
 pub struct FileDecryptionResult {
     pub link: LinkDecryptionResult,
     pub content_key: Result<DecryptionOutput<PgpSessionKey>, Option<String>>,
+    pub content_authorship_claim: AuthorshipClaim,
 }
 
 pub struct FolderDecryptionResult {
@@ -129,6 +130,24 @@ impl NodeCrypto {
         ))
     }
 
+    /// Encrypts passphrase bytes for a new parent key WITHOUT signing (for regular, non-anonymous moves).
+    pub fn reencrypt_passphrase(
+        passphrase: &[u8],
+        new_parent_key: &PgpPrivateKey,
+    ) -> anyhow::Result<PgpArmoredMessage> {
+        let session_key = crate::crypto::CryptoGenerator::generate_session_key();
+        let sk = session_key.to_rpgp_sk()?;
+
+        let encryptor = Encryptor::default()
+            .with_session_key(sk)
+            .with_encryption_key(new_parent_key.0.as_public_key());
+
+        let result = encryptor.encrypt(passphrase)?;
+        let armored_bytes = result.armor()?;
+        let armored = String::from_utf8(armored_bytes)?;
+        Ok(PgpArmoredMessage(armored))
+    }
+
     pub fn encrypt_folder_hash_key(
         node_key: &PgpPrivateKey,
         hash_key: &[u8],
@@ -155,19 +174,28 @@ impl NodeCrypto {
         parent_keys_result: Result<Vec<PgpPrivateKey>, String>,
     ) -> FileDecryptionResult {
         let link_decryption_result =
-            Self::decrypt_link(account_client, link, parent_keys_result).await;
+            Self::decrypt_link(account_client.clone(), link, parent_keys_result).await;
+
+        let content_authorship_claim = crate::node::authorship::AuthorshipClaim::create(
+            account_client,
+            file.active_revision
+                .as_ref()
+                .and_then(|r| r.signature_email_address.as_deref()),
+        )
+        .await;
 
         let node_key = link_decryption_result.node_key.as_ref().ok();
         let content_key_result = Self::decrypt_content_key(
             node_key,
             &file.content_key_packet,
             file.content_key_signature.as_ref(),
-            &link_decryption_result.node_authorship_claim,
+            &content_authorship_claim,
         );
 
         FileDecryptionResult {
             link: link_decryption_result,
             content_key: content_key_result,
+            content_authorship_claim,
         }
     }
 

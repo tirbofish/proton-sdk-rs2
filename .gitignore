@@ -27,11 +27,14 @@ proton-sdk-c-sharp
 sdk
 *.png
 
+GEMINI.md
+
 # dont EVER make the rookie mistake of commiting your private key to the repository like what i did
 # fucking dumbass OP
 .env
 *.env
 secrets.*
+!secrets.rs
 *.secret
 *.pgp
 *.gpg

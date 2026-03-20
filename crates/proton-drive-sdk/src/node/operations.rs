@@ -167,6 +167,144 @@ impl NodeOperations {
         anyhow::bail!("No available names found")
     }
 
+    pub async fn move_multiple(
+        client: &ProtonDriveClient,
+        uids: Vec<NodeUid>,
+        new_parent_uid: NodeUid,
+    ) -> anyhow::Result<()> {
+        if uids.is_empty() {
+            return Ok(());
+        }
+
+        if uids.len() == 1 {
+            return Self::move_single(client, uids[0].clone(), new_parent_uid, None).await;
+        }
+
+        let membership_address = Self::get_membership_address(client, &new_parent_uid).await?;
+        let signing_key = client
+            .account()
+            .get_address_primary_private_key(&crate::account::AddressId::new(
+                membership_address.address_id.clone(),
+            ))
+            .await?;
+
+        let destination_folder_secrets =
+            crate::node::folder::FolderOperations::get_secrets(client, new_parent_uid.clone())
+                .await?;
+
+        let mut batch = Vec::new();
+
+        for uid in uids {
+            if uid == new_parent_uid {
+                anyhow::bail!("Node {} cannot be moved onto itself", uid);
+            }
+
+            if uid.volume_id != new_parent_uid.volume_id {
+                anyhow::bail!(
+                    "Node {} cannot have destination node {} as parent as they are not on the same volume",
+                    uid,
+                    new_parent_uid
+                );
+            }
+
+            let metadata_result =
+                crate::node::DtoToMetadataConverter::get_fresh_node_metadata(client, uid.clone(), None)
+                    .await?;
+            let (node, node_and_secrets, _, origin_name_hash_digest) =
+                metadata_result.clone().result()?.deconstruct();
+            let secrets = match node_and_secrets {
+                crate::node::NodeAndSecrets::File(_, s) => s.base,
+                crate::node::NodeAndSecrets::Folder(_, s) => s.base,
+            };
+
+            let name = match &node {
+                Node::Folder(f) => f.base.name.clone(),
+                Node::File(f) | Node::Photo(f) => f.base.base.name.clone(),
+                Node::Album(f) => f.base.name.clone(),
+            };
+
+            let encrypted_name = crate::node::crypto::NodeCrypto::encrypt_name(
+                &name,
+                &secrets.name_session_key,
+                &destination_folder_secrets.base.key,
+                &PgpPrivateKey(signing_key.clone()),
+            )?;
+
+            let mut hmac = HmacSha256::new_from_slice(&destination_folder_secrets.hash_key)?;
+            hmac.update(name.as_bytes());
+            let name_hash_digest = hmac.finalize().into_bytes().to_vec();
+
+            let is_anonymous = secrets.passphrase_for_anonymous_move.is_some();
+            let (encrypted_passphrase, passphrase_signature) = if is_anonymous {
+                let (passphrase, sig, _) = crate::node::crypto::NodeCrypto::encrypt_and_sign_passphrase(
+                    &secrets.passphrase_session_key.key,
+                    &destination_folder_secrets.base.key,
+                    &PgpPrivateKey(signing_key.clone()),
+                )?;
+                (passphrase, sig)
+            } else {
+                let passphrase = crate::node::crypto::NodeCrypto::reencrypt_passphrase(
+                    &secrets.passphrase_session_key.key,
+                    &destination_folder_secrets.base.key,
+                )?;
+                (passphrase, None)
+            };
+
+            let media_type = match &node {
+                Node::File(f) | Node::Photo(f) => Some(f.base.media_type.clone()),
+                _ => None,
+            };
+
+            batch.push(crate::api::links::MoveMultipleLinksItem {
+                link_id: uid.link_id.clone(),
+                name: encrypted_name,
+                passphrase: encrypted_passphrase,
+                passphrase_signature,
+                name_hash_digest,
+                original_name_hash_digest: origin_name_hash_digest,
+            });
+        }
+
+        let signature_email_address = if batch.iter().any(|i| i.passphrase_signature.is_some()) {
+            Some(membership_address.email_address.clone())
+        } else {
+            None
+        };
+
+        let request = crate::api::links::MoveMultipleLinksRequest {
+            parent_link_id: new_parent_uid.link_id.clone(),
+            batch,
+            name_signature_email_address: membership_address.email_address.clone(),
+            signature_email_address,
+        };
+
+        client
+            .api()
+            .links()
+            .move_multiple(new_parent_uid.volume_id.clone(), request.clone())
+            .await?;
+
+        // Update cache for each moved node
+        for item in request.batch {
+            let uid = NodeUid::new(new_parent_uid.volume_id.clone(), item.link_id);
+            if let Some(mut cached_info) = client.cache().entities().try_get_node(uid.clone()).await? {
+                if let PotentialObject::Node(ref mut node) = cached_info.node_provision_result {
+                    node.set_parent_uid(Some(new_parent_uid.clone()));
+                    // Note: name might have changed if we supported new_name in move_multiple,
+                    // but currently we don't.
+                }
+                client.cache().entities().set_node(
+                    uid,
+                    cached_info.node_provision_result,
+                    cached_info.membership_share_id,
+                    item.name_hash_digest,
+                ).await?;
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn move_single(
         client: &ProtonDriveClient,
         uid: NodeUid,
@@ -197,25 +335,27 @@ impl NodeOperations {
             );
         }
 
-        let metadata_result = Self::get_node_metadata(client, uid.clone()).await?;
-        let (node, node_and_secrets, _, origin_name_hash_digest) =
-            metadata_result.result()?.deconstruct();
+        let metadata_result =
+            crate::node::DtoToMetadataConverter::get_fresh_node_metadata(client, uid.clone(), None)
+                .await?;
+        let (node, node_and_secrets, _membership_share_id, origin_name_hash_digest) =
+            metadata_result.clone().result()?.deconstruct();
         let secrets = match node_and_secrets {
             crate::node::NodeAndSecrets::File(_, s) => s.base,
             crate::node::NodeAndSecrets::Folder(_, s) => s.base,
         };
 
-        let name_to_use = new_name.unwrap_or_else(|| match &node {
+        let name_to_use = new_name.as_ref().cloned().unwrap_or_else(|| match &node {
             Node::Folder(f) => f.base.name.clone(),
-            Node::File(f) => f.base.base.name.clone(),
-            Node::Photo(f) => f.base.base.name.clone(),
+            Node::File(f) | Node::Photo(f) => f.base.base.name.clone(),
             Node::Album(f) => f.base.name.clone(),
         });
 
-        let name_session_key = crate::crypto::CryptoGenerator::generate_session_key();
+        log::debug!("Moving node: name={}, original_hash={}", name_to_use, hex::encode(&origin_name_hash_digest));
+
         let encrypted_name = crate::node::crypto::NodeCrypto::encrypt_name(
             &name_to_use,
-            &name_session_key,
+            &secrets.name_session_key,
             &destination_folder_secrets.base.key,
             &PgpPrivateKey(signing_key.clone()),
         )?;
@@ -224,17 +364,21 @@ impl NodeOperations {
         hmac.update(name_to_use.as_bytes());
         let name_hash_digest = hmac.finalize().into_bytes().to_vec();
 
-        let passphrase_bytes = secrets
-            .passphrase_for_anonymous_move
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Passphrase for anonymous move missing"))?;
-
-        let (encrypted_passphrase, passphrase_signature, _) =
-            crate::node::crypto::NodeCrypto::encrypt_and_sign_passphrase(
-                passphrase_bytes,
+        let is_anonymous = secrets.passphrase_for_anonymous_move.is_some();
+        let (encrypted_passphrase, passphrase_signature, signature_email_address) = if is_anonymous {
+            let (passphrase, sig, _) = crate::node::crypto::NodeCrypto::encrypt_and_sign_passphrase(
+                &secrets.passphrase_session_key.key,
                 &destination_folder_secrets.base.key,
                 &PgpPrivateKey(signing_key.clone()),
             )?;
+            (passphrase, sig, Some(membership_address.email_address.clone()))
+        } else {
+            let passphrase = crate::node::crypto::NodeCrypto::reencrypt_passphrase(
+                &secrets.passphrase_session_key.key,
+                &destination_folder_secrets.base.key,
+            )?;
+            (passphrase, None, None)
+        };
 
         let request = crate::api::links::MoveSingleLinkRequest {
             name: encrypted_name,
@@ -243,119 +387,35 @@ impl NodeOperations {
             parent_link_id: new_parent_uid.link_id.clone(),
             original_name_hash_digest: origin_name_hash_digest,
             name_signature_email_address: membership_address.email_address.clone(),
+            content_hash: None,
             passphrase_signature,
-            signature_email_address: Some(membership_address.email_address),
+            signature_email_address,
         };
 
         client
             .api()
             .links()
             .move_link(
-                new_parent_uid.volume_id.clone(),
+                uid.volume_id.clone(),
                 uid.link_id.clone(),
                 request,
             )
             .await?;
 
-        Ok(())
-    }
+        // Update cache
+        let (mut node, _, membership_share_id, _) = metadata_result.clone().result()?.deconstruct();
 
-    pub async fn move_multiple(
-        client: &ProtonDriveClient,
-        uids: Vec<NodeUid>,
-        new_parent_uid: NodeUid,
-    ) -> anyhow::Result<()> {
-        if uids.is_empty() {
-            return Ok(());
+        node.set_parent_uid(Some(new_parent_uid));
+        if let Some(name) = new_name {
+            node.set_name(name);
         }
 
-        let membership_address = Self::get_membership_address(client, &new_parent_uid).await?;
-        let signing_key = client
-            .account()
-            .get_address_primary_private_key(&crate::account::AddressId::new(
-                membership_address.address_id.clone(),
-            ))
-            .await?;
-
-        let destination_folder_secrets =
-            crate::node::folder::FolderOperations::get_secrets(client, new_parent_uid.clone())
-                .await?;
-
-        let mut batch = Vec::new();
-
-        for uid in uids {
-            if uid == new_parent_uid {
-                anyhow::bail!("Node {} cannot be moved onto itself", uid);
-            }
-
-            if uid.volume_id != new_parent_uid.volume_id {
-                anyhow::bail!(
-                    "Node {} cannot have destination node {} as parent as they are not on the same volume",
-                    uid,
-                    new_parent_uid
-                );
-            }
-
-            let metadata_result = Self::get_node_metadata(client, uid.clone()).await?;
-            let (node, node_and_secrets, _, origin_name_hash_digest) =
-                metadata_result.result()?.deconstruct();
-            let secrets = match node_and_secrets {
-                crate::node::NodeAndSecrets::File(_, s) => s.base,
-                crate::node::NodeAndSecrets::Folder(_, s) => s.base,
-            };
-
-            let name = match &node {
-                Node::Folder(f) => f.base.name.clone(),
-                Node::File(f) | Node::Photo(f) => f.base.base.name.clone(),
-                Node::Album(f) => f.base.name.clone(),
-            };
-
-            let name_session_key = crate::crypto::CryptoGenerator::generate_session_key();
-            let encrypted_name = crate::node::crypto::NodeCrypto::encrypt_name(
-                &name,
-                &name_session_key,
-                &destination_folder_secrets.base.key,
-                &PgpPrivateKey(signing_key.clone()),
-            )?;
-
-            let mut hmac = HmacSha256::new_from_slice(&destination_folder_secrets.hash_key)?;
-            hmac.update(name.as_bytes());
-            let name_hash_digest = hmac.finalize().into_bytes().to_vec();
-
-            let passphrase_bytes = secrets
-                .passphrase_for_anonymous_move
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Passphrase for anonymous move missing"))?;
-
-            let (encrypted_passphrase, passphrase_signature, _) =
-                crate::node::crypto::NodeCrypto::encrypt_and_sign_passphrase(
-                    passphrase_bytes,
-                    &destination_folder_secrets.base.key,
-                    &PgpPrivateKey(signing_key.clone()),
-                )?;
-
-            batch.push(crate::api::links::MoveMultipleLinksItem {
-                link_id: uid.link_id.clone(),
-                name: encrypted_name,
-                passphrase: encrypted_passphrase,
-                passphrase_signature,
-                name_hash_digest,
-                original_name_hash_digest: origin_name_hash_digest,
-            });
-        }
-
-        let request = crate::api::links::MoveMultipleLinksRequest {
-            parent_link_id: new_parent_uid.link_id.clone(),
-            batch,
-            name_signature_email_address: membership_address.email_address.clone(),
-            signature_email_address: Some(membership_address.email_address),
-        };
-
-        client
-            .api()
-            .links()
-            .move_multiple(new_parent_uid.volume_id.clone(), request)
-            .await?;
+        client.cache().entities().set_node(
+            uid,
+            PotentialObject::Node(node),
+            membership_share_id,
+            name_hash_digest,
+        ).await?;
 
         Ok(())
     }
@@ -366,9 +426,11 @@ impl NodeOperations {
         new_name: String,
         new_media_type: Option<String>,
     ) -> anyhow::Result<()> {
-        let metadata_result = Self::get_node_metadata(client, uid.clone()).await?;
+        let metadata_result =
+            crate::node::DtoToMetadataConverter::get_fresh_node_metadata(client, uid.clone(), None)
+                .await?;
         let (node, node_and_secrets, _, original_name_hash_digest) =
-            metadata_result.result()?.deconstruct();
+            metadata_result.clone().result()?.deconstruct();
         let _secrets = match node_and_secrets {
             crate::node::NodeAndSecrets::File(_, s) => s.base,
             crate::node::NodeAndSecrets::Folder(_, s) => s.base,
@@ -405,7 +467,7 @@ impl NodeOperations {
 
         let request = crate::api::links::RenameLinkRequest {
             name: encrypted_name,
-            name_hash_digest,
+            name_hash_digest: name_hash_digest.clone(),
             name_signature_email_address: membership_address.email_address,
             media_type: new_media_type,
             original_name_hash_digest,
@@ -416,6 +478,19 @@ impl NodeOperations {
             .links()
             .rename(uid.volume_id.clone(), uid.link_id.clone(), request)
             .await?;
+
+        // Update cache
+        if let Some(mut cached_info) = client.cache().entities().try_get_node(uid.clone()).await? {
+            if let PotentialObject::Node(ref mut node) = cached_info.node_provision_result {
+                node.set_name(new_name);
+            }
+            client.cache().entities().set_node(
+                uid,
+                cached_info.node_provision_result,
+                cached_info.membership_share_id,
+                name_hash_digest,
+            ).await?;
+        }
 
         Ok(())
     }
@@ -664,25 +739,44 @@ impl NodeOperations {
         client: &ProtonDriveClient,
         uid: &NodeUid,
     ) -> anyhow::Result<Address> {
-        let response = client
-            .api()
-            .links()
-            .get_context_share(uid.volume_id.clone(), uid.link_id.clone())
-            .await?;
+        let mut current_uid = uid.clone();
+        let mut visited = std::collections::HashSet::new();
 
-        let share = client
-            .api()
-            .shares()
-            .get_share(response.context_share_id)
-            .await?;
+        loop {
+            if !visited.insert(current_uid.clone()) {
+                anyhow::bail!("Folder structure loop detected");
+            }
 
-        let default_address = client.account().get_default_address().await?;
-        for membership in &share.memberships {
-            if membership.address_id.raw() == default_address.address_id {
-                return Ok(default_address);
+            let metadata = Self::get_node_metadata(client, current_uid.clone()).await?;
+            let result = metadata.result().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+            if let Some(share_id) = &result.membership_share_id {
+                let share_and_key = ShareOperations::get_share(client, share_id.clone()).await?;
+                let membership_address_id = share_and_key.share.membership_address_id.clone();
+                return client.account().get_address(&membership_address_id).await;
+            }
+
+            match result.inner.parent_uid() {
+                Some(parent_uid) => {
+                    current_uid = parent_uid.clone();
+                }
+                None => {
+                    // Fallback to API if we reached the root and still no share_id
+                    let response = client
+                        .api()
+                        .links()
+                        .get_context_share(uid.volume_id.clone(), uid.link_id.clone())
+                        .await?;
+
+                    let share = client
+                        .api()
+                        .shares()
+                        .get_share(response.context_share_id)
+                        .await?;
+
+                    return client.account().get_address(&share.address_id).await;
+                }
             }
         }
-
-        Ok(default_address)
     }
 }

@@ -2860,7 +2860,7 @@ dependencies = [
  "hex",
  "log",
  "parking_lot",
- "proton-drive",
+ "proton-drive-sdk",
  "proton-rpgp",
  "proton-sdk-rs2",
  "ron",
@@ -2980,7 +2980,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "proton-drive"
+name = "proton-drive-sdk"
 version = "0.1.0"
 dependencies = [
  "anyhow",

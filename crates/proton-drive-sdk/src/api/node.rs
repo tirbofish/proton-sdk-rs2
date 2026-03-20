@@ -5,8 +5,8 @@ use crate::pgp::{PgpArmoredMessage, PgpArmoredPrivateKey, PgpArmoredSignature};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
 pub struct NodeCreationRequest {
+    #[serde(rename = "Name")]
     pub name: PgpArmoredMessage,
 
     #[serde(rename = "Hash")]

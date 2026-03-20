@@ -6,7 +6,6 @@ use crate::api::share::{ContextShareResponse, ShareMembershipSummaryDto};
 use crate::api::{AggregateApiResponse, ApiResponse};
 use crate::links::LinkId;
 use crate::pgp::{PgpArmoredMessage, PgpArmoredPrivateKey, PgpArmoredSignature};
-use crate::revision::RevisionId;
 use crate::share::ShareId;
 use crate::volume::VolumeId;
 use async_trait::async_trait;
@@ -125,7 +124,6 @@ impl LinksApiClient for DefaultLinksApiClient {
         Ok(result)
     }
 
-    // FIXME: use recursive lookup instead, remove this
     async fn get_context_share(
         &self,
         volume_id: VolumeId,
@@ -152,9 +150,19 @@ impl LinksApiClient for DefaultLinksApiClient {
             volume_id.raw(),
             link_id.raw()
         ))?;
+
+        let request_json = serde_json::to_string(&request)?;
+        tracing::debug!(url = %url, body = %request_json, "Sending move_link request");
+
         let builder = self.client.put(url).json(&request);
         let builder = self.add_auth_headers(builder).await?;
-        Ok(builder.send().await?.json::<ApiResponse>().await?)
+        let response = builder.send().await?;
+        let text = response.text().await?;
+        tracing::debug!(body = %text, "move_link response received");
+
+        let api_response = serde_json::from_str::<ApiResponse>(&text)?;
+        api_response.to_result()?;
+        Ok(api_response)
     }
 
     async fn move_multiple(
@@ -165,9 +173,19 @@ impl LinksApiClient for DefaultLinksApiClient {
         let url = self
             .base_url
             .join(&format!("volumes/{}/links/move-multiple", volume_id.raw()))?;
+        
+        let request_json = serde_json::to_string(&request)?;
+        tracing::debug!(url = %url, body = %request_json, "Sending move_multiple request");
+
         let builder = self.client.put(url).json(&request);
         let builder = self.add_auth_headers(builder).await?;
-        Ok(builder.send().await?.json::<ApiResponse>().await?)
+        let response = builder.send().await?;
+        let text = response.text().await?;
+        tracing::debug!(body = %text, "move_multiple response received");
+        
+        let api_response = serde_json::from_str::<ApiResponse>(&text)?;
+        api_response.to_result()?;
+        Ok(api_response)
     }
 
     async fn rename(
@@ -379,6 +397,9 @@ pub struct LinkDto {
     #[serde(rename = "NameSignatureEmail")]
     pub name_signature_email_address: Option<String>,
 
+    #[serde(rename = "MIMEType")]
+    pub media_type: Option<String>,
+
     #[serde(rename = "OwnedBy")]
     pub owned_by: Option<OwnedByDto>,
 }
@@ -398,12 +419,12 @@ pub struct LinkSharingDto {
     pub share_id: ShareId,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
+#[derive(Debug, Serialize, Clone)]
 pub struct MoveMultipleLinksItem {
     #[serde(rename = "LinkID")]
     pub link_id: LinkId,
 
+    #[serde(rename = "Name")]
     pub name: PgpArmoredMessage,
 
     #[serde(rename = "NodePassphrase")]
@@ -422,7 +443,7 @@ pub struct MoveMultipleLinksItem {
     pub passphrase_signature: Option<PgpArmoredSignature>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct MoveMultipleLinksRequest {
     #[serde(rename = "ParentLinkID")]
     pub parent_link_id: LinkId,
@@ -444,7 +465,7 @@ pub struct NameHashDigestUnavailabilityDto {
     pub name_hash_digest: String,
 
     #[serde(rename = "RevisionID")]
-    pub revision_id: RevisionId,
+    pub revision_id: crate::revision::RevisionId,
 
     #[serde(rename = "LinkID")]
     pub link_id: LinkId,
@@ -453,9 +474,9 @@ pub struct NameHashDigestUnavailabilityDto {
     pub client_uid: String,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
+#[derive(Debug, Serialize, Clone)]
 pub struct MoveSingleLinkRequest {
+    #[serde(rename = "Name")]
     pub name: PgpArmoredMessage,
 
     #[serde(rename = "NodePassphrase")]
@@ -475,6 +496,9 @@ pub struct MoveSingleLinkRequest {
     #[serde(rename = "NameSignatureEmail")]
     pub name_signature_email_address: String,
 
+    #[serde(rename = "ContentHash")]
+    pub content_hash: Option<String>,
+
     #[serde(rename = "NodePassphraseSignature")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub passphrase_signature: Option<PgpArmoredSignature>,
@@ -491,8 +515,8 @@ pub struct MultipleLinksNullaryRequest {
 }
 
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
 pub struct RenameLinkRequest {
+    #[serde(rename = "Name")]
     pub name: PgpArmoredMessage,
 
     #[serde(rename = "Hash")]

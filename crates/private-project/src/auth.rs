@@ -42,17 +42,16 @@ pub(crate) async fn authenticate() -> anyhow::Result<(ProtonAPISession, Arc<File
             secret_cache_repository.clone(),
         );
 
-        if let Ok((access_token, _)) = resumed.token_credential.get_tokens().await {
-            let _ = resumed
-                .token_credential
-                .get_refreshed_access_token(access_token)
-                .await;
-        }
-
         println!("Session resumed from cred.ron");
         let mut resumed = resumed;
-        resumed.ensure_authenticated().await?;
-        resumed
+        match resumed.ensure_authenticated().await {
+            Ok(()) => resumed,
+            Err(e) => {
+                println!("Session expired or invalid ({}), starting fresh login...", e);
+                std::fs::remove_file(&cred_path).ok();
+                begin_new_session(app_version.clone(), secret_cache_repository.clone()).await?
+            }
+        }
     } else {
         println!("No cred.ron found, creating a new session");
         begin_new_session(app_version.clone(), secret_cache_repository.clone()).await?

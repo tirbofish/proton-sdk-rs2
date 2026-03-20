@@ -63,6 +63,20 @@ impl DegradedNode {
     pub fn tree_event_scope_id(&self) -> String {
         self.uid().volume_id.raw().to_string()
     }
+
+    pub fn set_parent_uid(&mut self, parent_uid: Option<NodeUid>) {
+        match self {
+            Self::Folder(n) | Self::Album(n) => n.base.parent_uid = parent_uid,
+            Self::File(n) | Self::Photo(n) => n.base.parent_uid = parent_uid,
+        }
+    }
+
+    pub fn set_name(&mut self, name: String) {
+        match self {
+            Self::Folder(n) | Self::Album(n) => n.base.name = PotentialObject::Node(name),
+            Self::File(n) | Self::Photo(n) => n.base.name = PotentialObject::Node(name),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -247,6 +261,20 @@ impl Node {
             Node::Album(_) => NodeType::Album,
         }
     }
+
+    pub fn set_parent_uid(&mut self, parent_uid: Option<NodeUid>) {
+        match self {
+            Node::Folder(n) | Node::Album(n) => n.base.parent_uid = parent_uid,
+            Node::File(n) | Node::Photo(n) => n.base.base.parent_uid = parent_uid,
+        }
+    }
+
+    pub fn set_name(&mut self, name: String) {
+        match self {
+            Node::Folder(n) | Node::Album(n) => n.base.name = name,
+            Node::File(n) | Node::Photo(n) => n.base.base.name = name,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -290,6 +318,13 @@ impl NodeAndSecrets {
         match self {
             Self::File(n, s) => Ok((n, s)),
             Self::Folder(n, s) => Err((n, s)),
+        }
+    }
+
+    pub fn parent_uid(&self) -> Option<&NodeUid> {
+        match self {
+            Self::File(n, _) => n.base.base.parent_uid.as_ref(),
+            Self::Folder(n, _) => n.base.parent_uid.as_ref(),
         }
     }
 }
@@ -802,29 +837,32 @@ impl DtoToMetadataConverter {
                         }),
                     };
 
+                    let passphrase_session_key = decryption
+                        .link
+                        .passphrase
+                        .as_ref()
+                        .map(|p| p.data.clone())
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to decrypt folder passphrase: {}", e)
+                        })?;
+
+                    let is_anonymous = link_dto.signature_email_address.is_none();
                     let secrets = FolderSecrets {
                         base: NodeSecrets {
                             key: node_key.clone(),
-                            passphrase_session_key: decryption
-                                .link
-                                .passphrase
-                                .as_ref()
-                                .map(|p| p.data.clone())
-                                .map_err(|e| {
-                                    anyhow::anyhow!("Failed to decrypt folder passphrase: {}", e)
-                                })?,
+                            passphrase_session_key: passphrase_session_key.clone(),
                             name_session_key: name.session_key.as_ref().map(|sk| PgpSessionKey {
                                 algorithm: u8::from(sk.algorithm().unwrap_or(proton_rpgp::pgp::crypto::sym::SymmetricKeyAlgorithm::AES128)),
                                 key: sk.as_ref().to_vec(),
                             }).unwrap_or_else(|| PgpSessionKey { algorithm: 9, key: vec![0; 32] }),
-                            passphrase_for_anonymous_move: None,
+                            passphrase_for_anonymous_move: if is_anonymous { Some(passphrase_session_key.key) } else { None },
                         },
                         hash_key: _hash_key.data.clone(),
                     };
 
                     Ok(PotentialObject::Node(NodeMetadata {
                         inner: NodeAndSecrets::Folder(FolderNode { base: node_base }, secrets),
-                        membership_share_id: None,
+                        membership_share_id: link_details.sharing.as_ref().map(|s| s.share_id.clone()),
                         name_hash_digest: link_dto.name_hash_digest,
                     }))
                 } else {
@@ -870,22 +908,25 @@ impl DtoToMetadataConverter {
                         }),
                     };
 
+                    let passphrase_session_key = decryption
+                        .link
+                        .passphrase
+                        .as_ref()
+                        .map(|p| p.data.clone())
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to decrypt file passphrase: {}", e)
+                        })?;
+
+                    let is_anonymous = link_dto.signature_email_address.is_none();
                     let secrets = FileSecrets {
                         base: NodeSecrets {
                             key: node_key.clone(),
-                            passphrase_session_key: decryption
-                                .link
-                                .passphrase
-                                .as_ref()
-                                .map(|p| p.data.clone())
-                                .map_err(|e| {
-                                    anyhow::anyhow!("Failed to decrypt file passphrase: {}", e)
-                                })?,
+                            passphrase_session_key: passphrase_session_key.clone(),
                             name_session_key: name.session_key.as_ref().map(|sk| PgpSessionKey {
                                 algorithm: u8::from(sk.algorithm().unwrap_or(proton_rpgp::pgp::crypto::sym::SymmetricKeyAlgorithm::AES128)),
                                 key: sk.as_ref().to_vec(),
                             }).unwrap_or_else(|| PgpSessionKey { algorithm: 9, key: vec![0; 32] }),
-                            passphrase_for_anonymous_move: None,
+                            passphrase_for_anonymous_move: if is_anonymous { Some(passphrase_session_key.key) } else { None },
                         },
                         content_key: _content_key.data,
                     };
@@ -935,13 +976,13 @@ impl DtoToMetadataConverter {
                                     ),
                                     thumbnails: vec![],
                                     additional_claimed_metadata: None,
-                                    content_author: None, // FIXME
+                                    content_author: Some(decryption.content_authorship_claim.to_potential_author()),
                                 },
                                 total_size_on_cloud_storage: file_dto.total_size_on_storage,
                             },
                             secrets,
                         ),
-                        membership_share_id: None,
+                        membership_share_id: link_details.sharing.as_ref().map(|s| s.share_id.clone()),
                         name_hash_digest: link_dto.name_hash_digest,
                     }))
                 } else {

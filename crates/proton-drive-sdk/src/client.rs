@@ -543,7 +543,10 @@ impl ProtonDriveClient {
         uids: Vec<NodeUid>,
         new_parent_folder_uid: NodeUid,
     ) -> anyhow::Result<()> {
-        NodeOperations::move_multiple(self, uids, new_parent_folder_uid).await
+        for uid in uids {
+            NodeOperations::move_single(self, uid, new_parent_folder_uid.clone(), None).await?;
+        }
+        Ok(())
     }
 
     pub async fn rename_node(

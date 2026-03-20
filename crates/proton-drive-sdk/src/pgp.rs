@@ -1,5 +1,5 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
-use proton_rpgp::{DataEncoding, Decryptor, PrivateKey, Profile, PublicKey};
+use proton_rpgp::{AsPublicKeyRef, DataEncoding, Decryptor, PrivateKey, Profile, PublicKey};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Debug, Clone)]
@@ -45,6 +45,13 @@ impl PgpPrivateKey {
             }),
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    pub fn encrypt_session_key(&self, session_key: &PgpSessionKey) -> anyhow::Result<Vec<u8>> {
+        let sk = session_key.to_rpgp_sk()?;
+        let encryptor = proton_rpgp::Encryptor::default()
+            .with_encryption_key(self.0.as_public_key());
+        Ok(encryptor.encrypt_session_key(&sk)?)
     }
 
     pub fn to_armored_private_key(

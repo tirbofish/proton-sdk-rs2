@@ -94,6 +94,7 @@ impl ProtonAPISession {
         let mut default_headers = HeaderMap::new();
 
         let app_version = ProtonClientConfiguration::build_pm_app_version(config);
+        log::debug!("Generated x-pm-appversion header for session: {}", app_version);
         default_headers.insert("x-pm-appversion", HeaderValue::from_str(&app_version)?);
 
         if let Some((session_id, access_token)) = auth {
@@ -376,18 +377,41 @@ impl ProtonAPISession {
             .send()
             .await?;
 
-        if probe_response.status() != StatusCode::UNAUTHORIZED {
+        // Proton API may return HTTP 200 with Code 401 in JSON body for expired tokens
+        let probe_status = probe_response.status();
+        log::debug!("ensure_authenticated probe status: {}", probe_status);
+        let needs_refresh = if probe_status == StatusCode::UNAUTHORIZED {
+            true
+        } else if probe_status.is_success() {
+            let body_text = probe_response.text().await.unwrap_or_default();
+            log::debug!("ensure_authenticated probe body: {}", body_text);
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_text) {
+                let code = json.get("Code").and_then(|c| c.as_u64()).unwrap_or(1000);
+                code == 401
+            } else {
+                false
+            }
+        } else {
             return probe_response
                 .error_for_status()
                 .map(|_| ())
                 .map_err(Into::into);
+        };
+
+        if !needs_refresh {
+            return Ok(());
         }
 
+        log::debug!("ensure_authenticated: token needs refresh");
         let (access_token, _) = self.token_credential.get_tokens().await?;
         let refreshed_access_token = self
             .token_credential
-            .get_refreshed_access_token(access_token)
+            .get_refreshed_access_token(access_token.clone())
             .await?;
+
+        if refreshed_access_token == access_token {
+            anyhow::bail!("Session expired: access token could not be refreshed. Please re-authenticate.");
+        }
 
         self.http_client = Self::create_http_client(
             &self.client_config,

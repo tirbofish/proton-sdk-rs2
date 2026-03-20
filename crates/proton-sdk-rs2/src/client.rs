@@ -96,27 +96,19 @@ impl ProtonClientConfiguration {
             reqwest::Url::parse(&self.base_url.to_string())?.join(base_route_path.as_str())?;
 
         let mut default_headers = HeaderMap::new();
+        let app_version_header = Self::build_pm_app_version(self);
+        log::debug!("Generated x-pm-appversion header: {}", app_version_header);
         default_headers.insert(
             "x-pm-appversion",
-            HeaderValue::from_str(Self::build_pm_app_version(self).as_str())?,
-        );
-
-        let bindings_suffix = self
-            .bindings_language
-            .as_ref()
-            .map(|x| format!("-{}", x.to_ascii_lowercase()))
-            .unwrap_or_default();
-        let sdk_technical_stack = format!("dotnet{}", bindings_suffix);
-        let sdk_version = env!("CARGO_PKG_VERSION");
-        default_headers.insert(
-            "x-pm-drive-sdk-version",
-            HeaderValue::from_str(format!("{}@{}", sdk_technical_stack, sdk_version).as_str())?,
+            HeaderValue::from_str(app_version_header.as_str())?,
         );
 
         let mut builder = reqwest::Client::builder().default_headers(default_headers);
 
         if !self.user_agent.is_empty() {
             builder = builder.user_agent(self.user_agent.clone());
+        } else {
+            builder = builder.user_agent(ProtonApiDefaults::user_agent());
         }
 
         let _base_address =
@@ -143,7 +135,7 @@ impl ProtonClientConfiguration {
         let binding_segment = config
             .bindings_language
             .as_deref()
-            .unwrap_or("proton_rs")
+            .unwrap_or("rust")
             .chars()
             .map(|c| {
                 if c.is_ascii_alphabetic() {
@@ -157,7 +149,7 @@ impl ProtonClientConfiguration {
             .to_string();
 
         let binding_segment = if binding_segment.is_empty() {
-            "proton_rs".to_string()
+            "rust".to_string()
         } else {
             binding_segment
         };
@@ -167,17 +159,17 @@ impl ProtonClientConfiguration {
         let pre_lower = pre.to_ascii_lowercase();
 
         let (channel, suffix) = if pre_lower.starts_with("alpha") {
-            ("alpha", &pre[5..])
+            (Some("alpha"), &pre[5..])
         } else if pre_lower.starts_with("beta") {
-            ("beta", &pre[4..])
+            (Some("beta"), &pre[4..])
         } else if pre_lower.starts_with("rc") {
-            ("RC", &pre[2..])
+            (Some("RC"), &pre[2..])
         } else if pre_lower.starts_with("stable") {
-            ("stable", &pre[6..])
+            (Some("stable"), &pre[6..])
         } else if pre.is_empty() {
-            ("stable", "")
+            (None, "")
         } else {
-            ("alpha", pre)
+            (Some("alpha"), pre)
         };
 
         let numeric_suffix: String = suffix
@@ -191,15 +183,17 @@ impl ProtonClientConfiguration {
         };
 
         let mut value = format!(
-            "{}@{}.{}.{}-{}{}{}",
-            platform,
-            config.app_version.major,
-            config.app_version.minor,
-            config.app_version.patch,
-            channel,
-            numeric_suffix,
-            dev_suffix,
+            "{}@{}.{}.{}",
+            platform, config.app_version.major, config.app_version.minor, config.app_version.patch,
         );
+
+        if let Some(ch) = channel {
+            value.push('-');
+            value.push_str(ch);
+            value.push_str(&numeric_suffix);
+        }
+
+        value.push_str(dev_suffix);
 
         if !config.app_version.build.is_empty() {
             value.push('+');
@@ -214,6 +208,14 @@ pub struct ProtonApiDefaults;
 
 impl ProtonApiDefaults {
     pub const DEFAULT_TIMEOUT_SECONDS: u32 = 30;
+
+    pub fn user_agent() -> String {
+        format!(
+            "ProtonDriveSDK/{} (Rust; {})",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS
+        )
+    }
 
     pub fn base_url() -> http::Uri {
         "https://drive-api.proton.me/"

@@ -1,12 +1,12 @@
 mod auth;
 mod file;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::StreamExt;
-use proton_drive::client::ProtonDriveClient;
-use proton_drive::utils::PotentialObject::Node;
+use proton_drive_sdk::client::ProtonDriveClient;
+use proton_drive_sdk::node;
+use proton_drive_sdk::utils::PotentialObject::Node;
 use proton_sdk_rs2::session::ProtonAPISession;
 
 use crate::file::FileCacheRepository;
@@ -38,6 +38,7 @@ async fn main() -> anyhow::Result<()> {
     let my_files = client.get_my_files_folder().await?;
     println!("Got My Files folder: {:?}", my_files.base.uid);
 
+    // Create the destination folder
     let folder_name = format!(
         "test-folder-{}",
         std::time::SystemTime::now()
@@ -50,44 +51,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     println!("Created folder: {:?}", test_folder.base.uid);
 
-    let new_name = format!("{}-renamed", folder_name);
-    println!("Renaming folder to: {}", new_name);
-    client
-        .rename_node(test_folder.base.uid.clone(), new_name.clone(), None)
-        .await?;
-    println!("Renamed folder successfully");
-
-    println!("Enumerating children of My Files:");
-    let mut children_stream = client
-        .enumerate_folder_children(my_files.base.uid.clone())
-        .await?;
-
-    let mut found = false;
-    while let Some(child_result) = children_stream.next().await {
-        let child = child_result?;
-        if let Node(node) = child {
-            println!("{} - {}", node.ty(), node.base().name);
-            if node.base().name == new_name {
-                println!("Found renamed folder: {:?}", node.base().uid);
-                found = true;
-            }
-        }
-    }
-    if !found {
-        println!("Error: Renamed folder not found in children listing!");
-    }
-
-    println!("Trashing folder: {:?}", test_folder.base.uid);
-    let trash_results = client
-        .trash_nodes(vec![test_folder.base.uid.clone()])
-        .await?;
-    for (uid, result) in trash_results {
-        match result {
-            Ok(_) => println!("Successfully trashed node: {:?}", uid),
-            Err(e) => println!("Failed to trash node: {:?}, error: {}", uid, e),
-        }
-    }
-
+    // Find a Screenshot file
     println!("Looking for a file containing 'Screenshot'...");
     let mut children_stream = client
         .enumerate_folder_children(my_files.base.uid.clone())
@@ -97,71 +61,35 @@ async fn main() -> anyhow::Result<()> {
     while let Some(child_result) = children_stream.next().await {
         let child = child_result?;
         if let Node(node) = child {
-            if let proton_drive::node::Node::File(file) = node {
+            if let node::Node::File(file) = node {
                 if file.base.base.name.contains("Screenshot") {
                     println!(
                         "Found target file: {} ({:?})",
                         file.base.base.name, file.base.base.uid
                     );
-                    target_file = Some(file.clone());
+                    target_file = Some(file);
                     break;
-                } else {
-                    println!("Miss! [{:?}]", file.base.base.name);
                 }
             }
         }
     }
 
     if let Some(file) = target_file {
-        println!("Downloading file: {}", file.base.base.name);
-
-        let file_name = PathBuf::from(file.base.base.name);
-        println!("Downloading content to local file: {}", file_name.display());
-
-        client
-            .download_to_file(
-                file.base.base.uid.clone(),
-                &file_name,
-                Box::new(|current, total| {
-                    println!("Downloaded {}/{} bytes", current, total);
-                }),
-            )
-            .await?;
-
-        println!("Downloaded successfully");
-
-        println!("Reading from file: {}", file_name.display());
-        let read_content = std::fs::read(&file_name)?;
-        println!("Read {} bytes from file", read_content.len());
-
-        println!("file media type: {}", file.base.media_type);
-
-        let upload_name = format!(
-            "uploaded-file-{}.png",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs()
+        println!(
+            "Moving {} to {:?}",
+            file.base.base.name, test_folder.base.uid
         );
-        let upload_path = std::path::PathBuf::from(&upload_name);
-        std::fs::copy(&file_name, &upload_path)?;
-
-        println!("Uploading file: {} to root", upload_name);
         client
-            .upload_file(
-                &upload_path,
-                my_files.base.uid.clone(),
-                false,
-                Box::new(|current, total| {
-                    println!("Uploaded {}/{} bytes", current, total);
-                }),
+            .move_nodes(
+                vec![file.base.base.uid.clone()],
+                test_folder.base.uid.clone(),
             )
             .await?;
-        println!("Uploaded successfully to root as {}", upload_name);
+        println!("Moved successfully!");
     } else {
-        println!("No file containing 'Screenshot' found to test download/upload.");
+        println!("No file containing 'Screenshot' found.");
     }
 
-    println!("All tests completed!");
-
+    println!("Done!");
     Ok(())
 }

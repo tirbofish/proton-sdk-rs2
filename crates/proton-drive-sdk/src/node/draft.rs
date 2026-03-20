@@ -186,7 +186,7 @@ impl RevisionDraftProvider for NewRevisionDraftProvider {
             file_key: node_secrets.base.key,
             content_key,
             signing_key: PgpPrivateKey(signing_key),
-            hash_key: None, // FIXME
+            hash_key: None,
             membership_address,
             block_verifier,
         })

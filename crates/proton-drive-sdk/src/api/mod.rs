@@ -189,8 +189,8 @@ impl ResponseCode {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "PascalCase")]
 pub struct ApiResponse {
+    #[serde(rename = "Code")]
     pub code: ResponseCode,
 
     #[serde(rename = "Error")]
@@ -200,6 +200,26 @@ pub struct ApiResponse {
 impl ApiResponse {
     pub fn is_success(&self) -> bool {
         self.code.is_success()
+    }
+
+    pub fn to_result(&self) -> anyhow::Result<()> {
+        if self.is_success() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "API error: code {}, message: {:?}",
+                self.code.0,
+                self.error_message
+            )
+        }
+    }
+
+    pub async fn from_response(response: reqwest::Response) -> anyhow::Result<Self> {
+        let text = response.text().await?;
+        let res: Self = serde_json::from_str(&text).map_err(|e| {
+            anyhow::anyhow!("Failed to decode response body: {}. Body: {}", e, text)
+        })?;
+        Ok(res)
     }
 }
 

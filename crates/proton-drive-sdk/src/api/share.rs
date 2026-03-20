@@ -75,9 +75,20 @@ impl SharesApiClient for DefaultSharesApiClient {
         let response = request.send().await?;
         let text = response.text().await?;
         tracing::debug!(body = %text, "get_my_files_share raw response");
-        let response = serde_json::from_str::<ShareResponseV2>(&text)?;
+        
+        let res: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+            anyhow::anyhow!("Failed to decode response body: {}. Body: {}", e, text)
+        })?;
 
-        Ok(response)
+        if let Some(code) = res.get("Code").and_then(|c| c.as_u64()) {
+            if code != 1000 {
+                let error = res.get("Error").and_then(|e| e.as_str()).unwrap_or("Unknown error");
+                anyhow::bail!("API error: code {}, message: {}", code, error);
+            }
+        }
+
+        let share_response: ShareResponseV2 = serde_json::from_value(res)?;
+        Ok(share_response)
     }
 
     async fn get_share(&self, id: ShareId) -> anyhow::Result<ShareResponse> {

@@ -122,7 +122,13 @@ impl ProtonClientConfiguration {
             builder = builder.timeout(total_request_timeout);
         }
 
+        #[cfg(feature = "danger-disable-tls-validation")]
         if !matches!(self.tls_policy, ProtonClientTlsPolicy::Strict) {
+            log::warn!(
+                "TLS certificate validation is disabled (policy: {:?}). \
+                 This is unsafe for production use.",
+                self.tls_policy
+            );
             builder = builder.danger_accept_invalid_certs(true);
         }
 

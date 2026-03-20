@@ -37,14 +37,18 @@ pub struct ProtonAPISession {
 
 impl Display for ProtonAPISession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sid = self.session_id.raw();
+        let redacted_sid = if sid.len() > 4 {
+            format!("{}...", &sid[..4])
+        } else {
+            "***".to_string()
+        };
         write!(
             f,
-            "ProtonAPISession {{ session_id: {}, username: {}, user_id: {}, scopes: {:?}, is_waiting_for_second_factor_code: {}, password_mode: {:?}, is_ended: {} }}",
-            self.session_id.raw(),
+            "ProtonAPISession {{ session_id: {}, username: {}, scopes: {:?}, password_mode: {:?}, is_ended: {} }}",
+            redacted_sid,
             self.username,
-            self.user_id.raw(),
             self.scopes,
-            self.is_waiting_for_second_factor_code,
             self.password_mode,
             self.is_ended,
         )

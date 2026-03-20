@@ -7,6 +7,12 @@ repository.workspace = true
 readme.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+# Enables the non-Strict TLS policies that accept invalid certificates.
+# Do NOT enable in production — intended only for local development/testing.
+danger-disable-tls-validation = []
+
 [dependencies]
 semver.workspace = true
 prost.workspace = true

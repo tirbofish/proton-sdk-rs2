@@ -204,7 +204,7 @@ impl ProtonAccountClient {
                 continue;
             };
 
-            log::debug!("Passphrase: {:?}", String::from_utf8(passphrase.to_vec()));
+            log::debug!("Passphrase found for user key {:?}", key.id);
 
             let unlocked_user_key =
                 PrivateKey::import(key.private_key.as_bytes(), &passphrase, DataEncoding::Auto)?;

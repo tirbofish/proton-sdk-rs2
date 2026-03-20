@@ -28,7 +28,7 @@ http = "1.4"
 async-trait = "0.1"
 base64 = "0.22"
 futures = "0.3"
-proton-crypto = { version = "*", registry = "proton" }
+proton-crypto = { version = "0.8", registry = "proton" }
 ron = "0.12"
 chrono = { version = "0.4", features = ["serde"]}
 proton-rpgp = { git = "https://github.com/ProtonMail/proton-crypto-rs" }

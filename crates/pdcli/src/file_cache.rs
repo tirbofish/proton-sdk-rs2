@@ -40,7 +40,8 @@ impl FileCacheRepository {
     fn persist(&self) -> anyhow::Result<()> {
         let inner = self.inner.read();
         let content = serde_json::to_string(&*inner)?;
-        std::fs::write(&self.path, content)?;
+        std::fs::write(&self.path, &content)?;
+        crate::fs_permissions::set_restricted_permissions(&self.path)?;
         Ok(())
     }
 }

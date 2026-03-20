@@ -2,6 +2,7 @@ mod app_paths;
 mod auth;
 mod commands;
 mod file_cache;
+mod fs_permissions;
 mod state;
 
 use anyhow::Result;

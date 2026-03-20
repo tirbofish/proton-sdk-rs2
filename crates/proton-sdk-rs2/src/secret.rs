@@ -57,14 +57,9 @@ impl SessionSecretCache for DefaultSecretCache {
         log::debug!("Locating cache key {:?}", cache_key);
         let serialized_value = self.repository.try_get(&cache_key).await?;
 
-        if serialized_value.is_none() {
-            log::debug!("No serialized value");
-        }
-        log::debug!("Serialized value: {:?}", serialized_value);
-
         match serialized_value {
             Some(value) => {
-                log::debug!("Serialized value: {:?}", value);
+                log::debug!("Cache hit for key {:?}", cache_key);
                 let decoded = general_purpose::STANDARD.decode(value)?;
                 Ok(Some(decoded))
             }

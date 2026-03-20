@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use crate::app_paths::resolve_paths;
 use crate::file_cache::FileCacheRepository;
+use crate::fs_permissions::set_restricted_permissions;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct StoredCredentials {
@@ -76,6 +77,7 @@ async fn persist_credentials(path: &Path, session: &ProtonAPISession) -> Result<
 
     let writer = to_string_pretty(&stored, PrettyConfig::default())?;
     fs::write(path, writer)?;
+    set_restricted_permissions(path)?;
     Ok(())
 }
 

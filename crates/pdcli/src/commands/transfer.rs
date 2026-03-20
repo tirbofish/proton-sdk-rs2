@@ -38,8 +38,8 @@ fn download_folder_recursive<'a>(
             match &node {
                 Node::File(_) | Node::Photo(_) => {
                     let out_path = local_path.join(&node_name);
-                    let pb = progress_bar_for(&node_name);
                     println!("  Downloading '{}' → '{}'", node_name, out_path.display());
+                    let pb = progress_bar_for(&node_name, 0);
                     client
                         .download_to_file(
                             node_uid,
@@ -136,13 +136,13 @@ pub async fn download_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> R
 
         match &node {
             Node::File(_) | Node::Photo(_) => {
-                let pb = progress_bar_for(&node_name);
                 println!("Downloading '{}' → '{}'", node_name, local_path.display());
+                let pb = progress_bar_for(&node_name, 0);
                 client
                     .download_to_file(node_uid, &local_path, progress_callback(pb.clone()))
                     .await?;
                 pb.finish_and_clear();
-                println!("\nSaved to: {}", local_path.display());
+                println!("Saved to: {}", local_path.display());
             }
             Node::Folder(_) | Node::Album(_) => {
                 if recursive {
@@ -205,13 +205,13 @@ pub async fn download_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> R
         match &node {
             Node::File(_) | Node::Photo(_) => {
                 let out_path = destination.join(&node_name);
-                let pb = progress_bar_for(&node_name);
                 println!("Downloading '{}' → '{}'", node_name, out_path.display());
+                let pb = progress_bar_for(&node_name, 0);
                 client
                     .download_to_file(node_uid, &out_path, progress_callback(pb.clone()))
                     .await?;
                 pb.finish_and_clear();
-                println!("\nSaved to: {}", out_path.display());
+                println!("Saved to: {}", out_path.display());
                 total_count += 1;
             }
             Node::Folder(_) | Node::Album(_) => {
@@ -331,9 +331,10 @@ pub async fn upload_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Res
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("upload");
-        let pb = progress_bar_for(filename);
+        let file_size = local_path.metadata().map(|m| m.len()).unwrap_or(0);
         let display_dest = remote_leaf_name.as_deref().unwrap_or(filename);
         println!("Uploading '{}' → '{}'", local_path.display(), display_dest);
+        let pb = progress_bar_for(filename, file_size);
         client
             .upload_file(local_path, upload_folder_uid.clone(), false, progress_callback(pb.clone()))
             .await?;

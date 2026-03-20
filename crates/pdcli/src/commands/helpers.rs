@@ -128,8 +128,8 @@ pub fn get_available_name(existing_nodes: &[Node], base_name: &str) -> Result<St
     Err(anyhow!("Could not find available name"))
 }
 
-pub fn progress_bar_for(label: &str) -> Arc<ProgressBar> {
-    let pb = ProgressBar::new(0);
+pub fn progress_bar_for(label: &str, total: u64) -> Arc<ProgressBar> {
+    let pb = ProgressBar::new(total);
     let style = ProgressStyle::with_template(
         "{spinner:.cyan} {msg:20.20} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({percent}%)",
     )

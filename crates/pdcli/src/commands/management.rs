@@ -158,7 +158,22 @@ pub async fn move_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Resul
         return Ok(());
     }
 
-    let node = find_child_by_name(&client, current_uid.clone(), src).await?;
+    // Resolve the source — it may be a relative path like "tests/BrainStem.glb"
+    let (src_parent, src_leaf) = split_parent_and_leaf(src);
+    let src_folder_uid = if src_parent == "." {
+        current_uid.clone()
+    } else {
+        resolve_folder_path(
+            &client,
+            current_uid.clone(),
+            current_path.clone(),
+            root_uid.clone(),
+            src_parent,
+        )
+        .await?
+        .0
+    };
+    let node = find_child_by_name(&client, src_folder_uid.clone(), src_leaf).await?;
 
     if dst.contains('/') {
         let (folder_part, maybe_name) = match dst.rsplit_once('/') {
@@ -308,6 +323,13 @@ pub async fn move_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Resul
             println!("Moved '{}' → '{}/'", src, dst);
             return Ok(());
         }
+    }
+
+    // If the source was in a subdirectory, bring it into the current directory first
+    if src_folder_uid != current_uid {
+        client
+            .move_nodes(vec![node.uid().clone()], current_uid.clone())
+            .await?;
     }
 
     let target_children = list_children(&client, current_uid.clone()).await?;

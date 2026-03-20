@@ -130,17 +130,33 @@ impl NodeCrypto {
         ))
     }
 
-    /// Encrypts passphrase bytes for a new parent key WITHOUT signing (for regular, non-anonymous moves).
+    /// Re-encrypts passphrase bytes for a new parent key, preserving the original PGP session key
+    /// and adding an inline signature. This matches the JS SDK's `encryptPassphrase` which always
+    /// signs and always reuses the `passphraseSessionKey`.
+    ///
+    /// Reusing the original session key is critical for compatibility with web clients that use
+    /// the PKESK session key directly as the node passphrase (legacy v1 format). Without reuse,
+    /// the web client receives a different session key from PKESK decryption and uses it as the
+    /// passphrase, failing to unlock the node key and producing "File has no active revision".
     pub fn reencrypt_passphrase(
         passphrase: &[u8],
+        original_pgp_session_key: Option<&PgpSessionKey>,
         new_parent_key: &PgpPrivateKey,
+        signing_key: &PgpPrivateKey,
     ) -> anyhow::Result<PgpArmoredMessage> {
-        let session_key = crate::crypto::CryptoGenerator::generate_session_key();
+        // Reuse the original session key when available so both legacy (v1) clients that use the
+        // PKESK session key as the passphrase and modern (v2) clients that use the literal data
+        // payload both arrive at the same passphrase bytes.
+        let session_key = match original_pgp_session_key {
+            Some(sk) if !sk.key.is_empty() && sk.key.len() == 32 => sk.clone(),
+            _ => crate::crypto::CryptoGenerator::generate_session_key(),
+        };
         let sk = session_key.to_rpgp_sk()?;
 
         let encryptor = Encryptor::default()
             .with_session_key(sk)
-            .with_encryption_key(new_parent_key.0.as_public_key());
+            .with_encryption_key(new_parent_key.0.as_public_key())
+            .with_signing_key(&signing_key.0);
 
         let result = encryptor.encrypt(passphrase)?;
         let armored_bytes = result.armor()?;
@@ -202,7 +218,7 @@ impl NodeCrypto {
     pub async fn decrypt_folder(
         account_client: Arc<dyn crate::account::AccountClient>,
         link: &crate::api::links::LinkDto,
-        folder_hash_key: &PgpArmoredMessage,
+        folder_hash_key: Option<&PgpArmoredMessage>,
         parent_keys_result: Result<Vec<PgpPrivateKey>, String>,
     ) -> FolderDecryptionResult {
         let link_decryption_result =
@@ -210,7 +226,7 @@ impl NodeCrypto {
 
         let node_key = link_decryption_result.node_key.as_ref().ok();
         let hash_key_result = Self::decrypt_hash_key(
-            Some(folder_hash_key),
+            folder_hash_key,
             node_key,
             &link_decryption_result.node_authorship_claim,
         );

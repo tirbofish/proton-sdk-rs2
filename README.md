@@ -19,15 +19,17 @@ You can check it out [here](https://github.com/tirbofish/proton-sdk-rs)
 - [x] authentication
 - caching
     - [x] in memory
-    - [x] file cache (as .json)
+    - [x] file cache (as .json) [note: this is to be implemented by the user. there is a .ron cache available]
     - [ ] sql cache
 - [x] iterating through each file
-- [ ] photos + albums (partial implementation right now)
 - [x] downloads
 - [x] uploads
 - [x] thumbnails
+- [ ] photos + albums (partial implementation right now)
 - [ ] some good documentation
 - [ ] events (doable, not in c# library but available in js lib)
+- repl
+    - [ ] use sql cache and events to make fetching files faster
 
 
 <!-- if anyone is reading the comment of this repository:
@@ -35,10 +37,21 @@ yeah hi i previously had done a lot of commits but my dumbass decided to commit 
 tests so now it only looks like i have done one commit. fuck my fat chungus life... -->
 
 # usage
+
+## the normal joe
+anyone wanting to use the client will have to clone this repository and compile with cargo (if no release has been made, or you just want cutting edge)
+
+```bash
+git clone https://github.com/tirbofish/proton-sdk-rs2
+cd proton-sdk-rs2
+cargo run
+```
+
+## sdk
 proton-srp and other proton based cryptography libraries do not use crates.io, you will have to use this git repository as the latest kind. 
 
 ```toml
-proton-drive = { git = "https://github.com/tirbofish/proton-sdk-rs2" }
+proton-drive-sdk = { git = "https://github.com/tirbofish/proton-sdk-rs2" }
 ```
 
 i *might* consider uploading the proton-crypto based libraries up to crates.io if proton permits me to (or they can do themself idk). 

@@ -60,7 +60,7 @@ impl FolderCreationResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FolderDto {
     #[serde(rename = "NodeHashKey")]
-    pub hash_key: PgpArmoredMessage,
+    pub hash_key: Option<PgpArmoredMessage>,
 
     #[serde(rename = "XAttr")]
     pub extended_attributes: Option<PgpArmoredMessage>,

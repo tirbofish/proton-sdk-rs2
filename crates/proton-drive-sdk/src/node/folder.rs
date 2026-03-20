@@ -42,6 +42,7 @@ impl FolderOperations {
             base: NodeSecrets {
                 key: folder_key,
                 passphrase_session_key: crate::crypto::CryptoGenerator::generate_session_key(),
+                passphrase_pgp_session_key: None,
                 name_session_key: crate::crypto::CryptoGenerator::generate_session_key(),
                 passphrase_for_anonymous_move: None,
             },

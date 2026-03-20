@@ -134,7 +134,10 @@ pub(crate) mod forgiving_hex_bytes {
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-        let s = String::deserialize(d)?;
+        let s = Option::<String>::deserialize(d)?;
+        let Some(s) = s else {
+            return Ok(Vec::new());
+        };
 
         if let Ok(bytes) = hex::decode(&s) {
             return Ok(bytes);

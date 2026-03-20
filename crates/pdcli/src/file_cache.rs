@@ -14,13 +14,12 @@ struct FileCacheInner {
 }
 
 pub struct FileCacheRepository {
-    pub(crate) path: PathBuf,
+    path: PathBuf,
     inner: RwLock<FileCacheInner>,
 }
 
 impl FileCacheRepository {
     pub fn load(path: PathBuf) -> anyhow::Result<Self> {
-        println!("Loading cache from {}", path.display());
         let inner = if path.exists() {
             let content = std::fs::read_to_string(&path)?;
             serde_json::from_str(&content)?
@@ -31,13 +30,14 @@ impl FileCacheRepository {
                 tag_to_keys: Default::default(),
             }
         };
+
         Ok(Self {
             path,
             inner: RwLock::new(inner),
         })
     }
 
-    pub fn persist(&self) -> anyhow::Result<()> {
+    fn persist(&self) -> anyhow::Result<()> {
         let inner = self.inner.read();
         let content = serde_json::to_string(&*inner)?;
         std::fs::write(&self.path, content)?;
@@ -100,9 +100,11 @@ impl CacheRepository for FileCacheRepository {
                 .map(|k| k.into_iter().collect())
                 .unwrap_or_default()
         };
+
         for key in keys {
             self.remove(&key).await?;
         }
+
         Ok(())
     }
 
@@ -123,7 +125,7 @@ impl CacheRepository for FileCacheRepository {
     fn get_by_tags(&self, tags: Vec<String>) -> BoxStream<'_, anyhow::Result<(String, String)>> {
         use futures::stream::{self, StreamExt};
 
-        let results = futures::executor::block_on(async {
+        let results = {
             let inner = self.inner.read();
             let mut keys_set = HashSet::new();
             for tag in &tags {
@@ -131,6 +133,7 @@ impl CacheRepository for FileCacheRepository {
                     keys_set.extend(keys.iter().cloned());
                 }
             }
+
             keys_set
                 .into_iter()
                 .filter_map(|key| {
@@ -140,7 +143,7 @@ impl CacheRepository for FileCacheRepository {
                         .map(|value| Ok((key.clone(), value.clone())))
                 })
                 .collect::<Vec<_>>()
-        });
+        };
 
         stream::iter(results).boxed()
     }

@@ -298,7 +298,12 @@ impl NodeBase {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSecrets {
     pub key: PgpPrivateKey,
+    /// The decrypted passphrase bytes (plaintext of the NodePassphrase PGP message).
     pub passphrase_session_key: PgpSessionKey,
+    /// The actual AES session key from the NodePassphrase PKESK packet, preserved for
+    /// reuse during move operations (matches `passphraseSessionKey` in the JS SDK).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passphrase_pgp_session_key: Option<PgpSessionKey>,
     pub name_session_key: PgpSessionKey,
     #[serde(rename = "passphrase")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -804,7 +809,7 @@ impl DtoToMetadataConverter {
                 let decryption = crate::node::crypto::NodeCrypto::decrypt_folder(
                     account_client,
                     &link_dto,
-                    &folder_dto.hash_key,
+                    folder_dto.hash_key.as_ref(),
                     parent_key_result,
                 )
                 .await;
@@ -837,20 +842,24 @@ impl DtoToMetadataConverter {
                         }),
                     };
 
-                    let passphrase_session_key = decryption
+                    let passphrase_decryption_output = decryption
                         .link
                         .passphrase
-                        .as_ref()
-                        .map(|p| p.data.clone())
                         .map_err(|e| {
                             anyhow::anyhow!("Failed to decrypt folder passphrase: {}", e)
                         })?;
+                    let passphrase_session_key = passphrase_decryption_output.data.clone();
+                    let passphrase_pgp_session_key = passphrase_decryption_output.session_key.map(|sk| PgpSessionKey {
+                        algorithm: u8::from(sk.algorithm().unwrap_or(proton_rpgp::pgp::crypto::sym::SymmetricKeyAlgorithm::AES256)),
+                        key: sk.as_ref().to_vec(),
+                    });
 
                     let is_anonymous = link_dto.signature_email_address.is_none();
                     let secrets = FolderSecrets {
                         base: NodeSecrets {
                             key: node_key.clone(),
                             passphrase_session_key: passphrase_session_key.clone(),
+                            passphrase_pgp_session_key: passphrase_pgp_session_key.clone(),
                             name_session_key: name.session_key.as_ref().map(|sk| PgpSessionKey {
                                 algorithm: u8::from(sk.algorithm().unwrap_or(proton_rpgp::pgp::crypto::sym::SymmetricKeyAlgorithm::AES128)),
                                 key: sk.as_ref().to_vec(),
@@ -908,20 +917,24 @@ impl DtoToMetadataConverter {
                         }),
                     };
 
-                    let passphrase_session_key = decryption
+                    let passphrase_decryption_output = decryption
                         .link
                         .passphrase
-                        .as_ref()
-                        .map(|p| p.data.clone())
                         .map_err(|e| {
                             anyhow::anyhow!("Failed to decrypt file passphrase: {}", e)
                         })?;
+                    let passphrase_session_key = passphrase_decryption_output.data.clone();
+                    let passphrase_pgp_session_key = passphrase_decryption_output.session_key.map(|sk| PgpSessionKey {
+                        algorithm: u8::from(sk.algorithm().unwrap_or(proton_rpgp::pgp::crypto::sym::SymmetricKeyAlgorithm::AES256)),
+                        key: sk.as_ref().to_vec(),
+                    });
 
                     let is_anonymous = link_dto.signature_email_address.is_none();
                     let secrets = FileSecrets {
                         base: NodeSecrets {
                             key: node_key.clone(),
                             passphrase_session_key: passphrase_session_key.clone(),
+                            passphrase_pgp_session_key: passphrase_pgp_session_key.clone(),
                             name_session_key: name.session_key.as_ref().map(|sk| PgpSessionKey {
                                 algorithm: u8::from(sk.algorithm().unwrap_or(proton_rpgp::pgp::crypto::sym::SymmetricKeyAlgorithm::AES128)),
                                 key: sk.as_ref().to_vec(),

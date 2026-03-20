@@ -41,6 +41,9 @@ impl ProtonDriveDefaults {
 #[derive(Debug, Clone, Default)]
 pub struct ProtonDriveClientOptions {
     pub uid: Option<String>,
+    /// The language of the bindings. Can be used as a potential spoof for something.
+    ///
+    /// By default, it is `None`, but when constructed in the x-pm-appversion, it is considered as `rust`.
     pub bindings_language: Option<String>,
     pub api_call_timeout: Option<u32>,
     pub storage_call_timeout: Option<u32>,
@@ -63,6 +66,7 @@ pub struct ProtonDriveClient {
     thumbnail_block_downloader: BlockDownloader,
 }
 
+// initialisers
 impl ProtonDriveClient {
     const MIN_DEGREE_OF_BLOCK_TRANSFER_PARALLELISM: usize = 2;
     const MAX_DEGREE_OF_BLOCK_TRANSFER_PARALLELISM: usize = 6;
@@ -295,6 +299,7 @@ impl ProtonDriveClient {
     }
 }
 
+// getters
 impl ProtonDriveClient {
     pub fn uid(&self) -> &str {
         &self.uid
@@ -352,7 +357,10 @@ impl ProtonDriveClient {
     pub fn thumbnail_block_downloader(&self) -> &BlockDownloader {
         &self.thumbnail_block_downloader
     }
+}
 
+// the meat
+impl ProtonDriveClient {
     pub async fn get_my_files_folder(&self) -> anyhow::Result<FolderNode> {
         NodeOperations::get_my_files_folder(self).await
     }
@@ -570,6 +578,13 @@ impl ProtonDriveClient {
         uids: Vec<NodeUid>,
     ) -> anyhow::Result<HashMap<NodeUid, Result<(), anyhow::Error>>> {
         NodeOperations::delete(self, uids).await
+    }
+
+    pub async fn delete_nodes_from_trash(
+        &self,
+        uids: Vec<NodeUid>,
+    ) -> anyhow::Result<HashMap<NodeUid, Result<(), anyhow::Error>>> {
+        NodeOperations::delete_from_trash(self, uids).await
     }
 
     pub async fn restore_nodes(

@@ -245,12 +245,14 @@ impl NodeOperations {
             } else {
                 let passphrase = crate::node::crypto::NodeCrypto::reencrypt_passphrase(
                     &secrets.passphrase_session_key.key,
+                    secrets.passphrase_pgp_session_key.as_ref(),
                     &destination_folder_secrets.base.key,
+                    &PgpPrivateKey(signing_key.clone()),
                 )?;
                 (passphrase, None)
             };
 
-            let media_type = match &node {
+            let _media_type = match &node {
                 Node::File(f) | Node::Photo(f) => Some(f.base.media_type.clone()),
                 _ => None,
             };
@@ -375,7 +377,9 @@ impl NodeOperations {
         } else {
             let passphrase = crate::node::crypto::NodeCrypto::reencrypt_passphrase(
                 &secrets.passphrase_session_key.key,
+                secrets.passphrase_pgp_session_key.as_ref(),
                 &destination_folder_secrets.base.key,
+                &PgpPrivateKey(signing_key.clone()),
             )?;
             (passphrase, None, None)
         };
@@ -566,6 +570,58 @@ impl NodeOperations {
                 .api()
                 .links()
                 .delete_multiple(volume_id.clone(), link_ids.clone())
+                .await
+            {
+                Ok(resp) => {
+                    for pair in resp.responses {
+                        let uid = NodeUid::new(volume_id.clone(), pair.link_id);
+                        if pair.response.is_success() {
+                            results.insert(uid, Ok(()));
+                        } else {
+                            results.insert(
+                                uid,
+                                Err(anyhow::anyhow!(
+                                    pair.response.error_message.unwrap_or_default()
+                                )),
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    for link_id in link_ids {
+                        results.insert(
+                            NodeUid::new(volume_id.clone(), link_id),
+                            Err(anyhow::anyhow!(e.to_string())),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    pub async fn delete_from_trash(
+        client: &ProtonDriveClient,
+        uids: Vec<NodeUid>,
+    ) -> anyhow::Result<HashMap<NodeUid, Result<(), anyhow::Error>>> {
+        let mut results = HashMap::new();
+        let mut volume_groups: HashMap<crate::volume::VolumeId, Vec<crate::links::LinkId>> =
+            HashMap::new();
+        for uid in uids {
+            volume_groups
+                .entry(uid.volume_id.clone())
+                .or_default()
+                .push(uid.link_id.clone());
+        }
+
+        for (volume_id, link_ids) in volume_groups {
+            let request = crate::api::links::MultipleLinksNullaryRequest {
+                link_ids: link_ids.clone(),
+            };
+            match client
+                .api()
+                .trash()
+                .delete_multiple(volume_id.clone(), request)
                 .await
             {
                 Ok(resp) => {

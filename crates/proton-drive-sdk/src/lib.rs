@@ -20,6 +20,8 @@ pub mod share_ops;
 pub mod utils;
 pub mod volume;
 pub mod volume_operations;
+pub mod photo;
+
 pub use proton_sdk_rs2;
 
 pub mod protobuf {

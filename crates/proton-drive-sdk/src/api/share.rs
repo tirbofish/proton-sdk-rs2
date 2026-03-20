@@ -87,7 +87,13 @@ impl SharesApiClient for DefaultSharesApiClient {
             }
         }
 
-        let share_response: ShareResponseV2 = serde_json::from_value(res)?;
+        let share_response: ShareResponseV2 = serde_json::from_value(res).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse my-files share response: {}. Body: {}",
+                e,
+                text
+            )
+        })?;
         Ok(share_response)
     }
 

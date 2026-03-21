@@ -24,16 +24,17 @@ impl VolumeOperations {
                 .get_trash(volume_id.clone(), page_size, page)
                 .await?;
 
-            must_try_more_results = response
-                .trash_by_share
-                .iter()
-                .map(|s| s.link_ids.len())
-                .sum::<usize>()
-                == page_size as usize;
+            must_try_more_results = response.trash.iter().map(|x| x.link_ids.len()).sum::<usize>() == page_size as usize;
 
-            for share_trash in response.trash_by_share {
-                let share_and_key =
-                    ShareOperations::get_share(client, share_trash.share_id.clone()).await?;
+            for share_trash in response.trash {
+                let share_and_key = match ShareOperations::get_share(client, share_trash.share_id).await {
+                    Ok(sk) => sk,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to get share for trash batch — skipping");
+                        continue;
+                    }
+                };
+                
                 let mut batch_loader = VolumeTrashBatchLoader::new(
                     Arc::new(client.clone()),
                     volume_id.clone(),

@@ -1,7 +1,10 @@
+use crate::rusqlite_cache::RusqliteCache;
 use proton_drive_sdk::client::ProtonDriveClient;
 use proton_drive_sdk::node::NodeUid;
 use proton_sdk_rs2::session::ProtonAPISession;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Represents the state of the REPL session
 pub struct ReplState {
@@ -9,6 +12,8 @@ pub struct ReplState {
     session: Option<ProtonAPISession>,
     /// Drive client (requires session)
     client: Option<ProtonDriveClient>,
+    /// SQLite cache
+    cache: Option<Arc<RusqliteCache>>,
     /// Current working directory path
     current_path: Vec<String>,
     /// Current node UID
@@ -17,8 +22,12 @@ pub struct ReplState {
     root_node_uid: Option<NodeUid>,
     /// Username of authenticated user
     username: Option<String>,
+    /// Current sync status message
+    sync_status: Arc<parking_lot::RwLock<Option<String>>>,
     /// Cancellation flag for current operation
     cancelled: AtomicBool,
+    /// Active FUSE mount point (for auto-unmount on exit)
+    mount_point: Option<PathBuf>,
 }
 
 impl ReplState {
@@ -26,12 +35,31 @@ impl ReplState {
         Self {
             session: None,
             client: None,
+            cache: None,
             current_path: vec!["MyFiles".to_string()],
             current_node_uid: None,
             root_node_uid: None,
             username: None,
+            sync_status: Arc::new(parking_lot::RwLock::new(None)),
             cancelled: AtomicBool::new(false),
+            mount_point: None,
         }
+    }
+
+    pub fn set_sync_status(&self, status: Option<String>) {
+        *self.sync_status.write() = status;
+    }
+
+    pub fn get_sync_status(&self) -> Option<String> {
+        self.sync_status.read().clone()
+    }
+
+    pub fn set_cache(&mut self, cache: Arc<RusqliteCache>) {
+        self.cache = Some(cache);
+    }
+
+    pub fn get_cache(&self) -> Option<Arc<RusqliteCache>> {
+        self.cache.clone()
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -103,15 +131,15 @@ impl ReplState {
         self.root_node_uid = None;
     }
 
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
-    }
-
-    pub fn set_cancelled(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
-    }
-
     pub fn clear_cancelled(&self) {
         self.cancelled.store(false, Ordering::Relaxed);
+    }
+
+    pub fn set_mount_point(&mut self, path: Option<PathBuf>) {
+        self.mount_point = path;
+    }
+
+    pub fn get_mount_point(&self) -> Option<&PathBuf> {
+        self.mount_point.as_ref()
     }
 }

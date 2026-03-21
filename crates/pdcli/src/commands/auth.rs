@@ -3,7 +3,9 @@ use crate::state::ReplState;
 use anyhow::Result;
 use proton_drive_sdk::client::ProtonDriveClient;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use parking_lot::Mutex;
+
+use super::helpers::new_spinner;
 
 pub async fn auth_command_with_options(
     state: &Arc<Mutex<ReplState>>,
@@ -20,10 +22,14 @@ pub async fn apply_authenticated_session_with_options(
     announce: bool,
 ) -> Result<()> {
     let drive_client = ProtonDriveClient::new(&session, None)?;
+
+    let sp = new_spinner("Connecting to Proton Drive...");
     let my_files = drive_client.get_my_files_folder().await?;
+    sp.finish_and_clear();
+
     let root_uid = my_files.base.uid.clone();
 
-    let mut s = state.lock().await;
+    let mut s = state.lock();
     s.set_session(session);
     s.set_client(drive_client);
     s.set_username(username.clone());
@@ -39,7 +45,7 @@ pub async fn apply_authenticated_session_with_options(
 
 /// whoami
 pub async fn whoami_command(state: &Arc<Mutex<ReplState>>) -> Result<()> {
-    let s = state.lock().await;
+    let s = state.lock();
     match s.get_username() {
         Some(u) => {
             println!("Logged in as: {}", u);
@@ -52,7 +58,7 @@ pub async fn whoami_command(state: &Arc<Mutex<ReplState>>) -> Result<()> {
 
 /// logout
 pub async fn logout_command(state: &Arc<Mutex<ReplState>>) -> Result<()> {
-    let mut s = state.lock().await;
+    let mut s = state.lock();
     s.clear_session();
     auth::clear_persisted_session();
 

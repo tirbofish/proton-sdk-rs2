@@ -46,7 +46,7 @@ smallvec = "1.15.1"
 thiserror = "2.0.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-parking_lot = "0.12.5"
+parking_lot = { version = "0.12.5", features = ["deadlock_detection"] }
 mime_guess = "2.0.5"
 image = { version = "0.25.5", features = ["png", "jpeg", "webp"] }
 rpassword = "7.4.0"

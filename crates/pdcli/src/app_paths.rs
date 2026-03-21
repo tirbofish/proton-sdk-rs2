@@ -7,6 +7,7 @@ pub struct AppDataPaths {
     pub credentials_path: PathBuf,
     pub secrets_cache_path: PathBuf,
     pub history_path: PathBuf,
+    pub cache_dir: PathBuf,
 }
 
 pub fn resolve_paths() -> Result<AppDataPaths> {
@@ -15,10 +16,12 @@ pub fn resolve_paths() -> Result<AppDataPaths> {
 
     std::fs::create_dir_all(&app_dirs.config_dir)?;
     std::fs::create_dir_all(&app_dirs.data_dir)?;
+    std::fs::create_dir_all(&app_dirs.cache_dir)?;
 
     Ok(AppDataPaths {
         credentials_path: app_dirs.config_dir.join("cred.ron"),
         secrets_cache_path: app_dirs.data_dir.join("cache.json"),
         history_path: app_dirs.data_dir.join("history.txt"),
+        cache_dir: app_dirs.cache_dir,
     })
 }

@@ -3,9 +3,12 @@ use futures::stream::StreamExt;
 use glob::Pattern;
 use indicatif::{ProgressBar, ProgressStyle};
 use proton_drive_sdk::client::ProtonDriveClient;
+use proton_drive_sdk::links::LinkId;
 use proton_drive_sdk::node::{DegradedNode, Node, NodeUid};
 use proton_drive_sdk::utils::PotentialObject;
+use proton_drive_sdk::volume::VolumeId;
 use std::sync::Arc;
+use crate::rusqlite_cache::RusqliteCache;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Area {
@@ -27,7 +30,7 @@ pub fn area_from_path(path: &[String]) -> Area {
 macro_rules! auth_snapshot {
     ($state:expr => $client:ident, $uid:ident) => {
         let ($client, $uid) = {
-            let s = $state.lock().await;
+            let s = $state.lock();
             let c = s
                 .get_client()
                 .ok_or_else(|| anyhow::anyhow!("Not authenticated. Use 'login' first."))?
@@ -56,12 +59,29 @@ pub async fn list_children(
     Ok(nodes)
 }
 
-/// Find a child by name in the current directory; returns its uid and the node.
+/// Find a child by name. Checks the local SQLite cache first; fetches from the
+/// network (enumerate + decrypt all children) only on a cache miss.
 pub async fn find_child_by_name(
     client: &ProtonDriveClient,
     folder_uid: NodeUid,
     name: &str,
+    cache: Option<&RusqliteCache>,
 ) -> Result<Node> {
+    // Fast path: SQLite lookup — O(1) indexed query, no network.
+    if let Some(c) = cache {
+        if let Ok(Some(cached)) = c.get_child_by_name(&folder_uid.volume_id, Some(&folder_uid.link_id), name) {
+            let uid = NodeUid::new(
+                VolumeId::new(cached.volume_id),
+                LinkId::new(cached.link_id),
+            );
+            // Fetch just this one node from the network to get the full decrypted Node.
+            if let Ok(proton_drive_sdk::utils::PotentialObject::Node(node)) = client.get_node(uid).await {
+                return Ok(node);
+            }
+            // Cache hit but network fetch failed — fall through to full enumeration.
+        }
+    }
+    // Slow path: enumerate and decrypt all children, then scan by name.
     let children = list_children(client, folder_uid).await?;
     children
         .into_iter()
@@ -107,25 +127,16 @@ pub fn split_parent_and_leaf(input: &str) -> (&str, &str) {
     }
 }
 
-pub fn get_available_name(existing_nodes: &[Node], base_name: &str) -> Result<String> {
-    if !existing_nodes.iter().any(|n| n.base().name == base_name) {
-        return Ok(base_name.to_string());
-    }
-
-    let (name, ext) = if let Some(dot_pos) = base_name.rfind('.') {
-        (&base_name[..dot_pos], &base_name[dot_pos..])
-    } else {
-        (base_name, "")
-    };
-
-    for i in 1..1000 {
-        let candidate = format!("{}({}){}", name, i, ext);
-        if !existing_nodes.iter().any(|n| n.base().name == candidate) {
-            return Ok(candidate);
-        }
-    }
-
-    Err(anyhow!("Could not find available name"))
+pub fn new_spinner(msg: impl Into<String>) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("  {spinner:.cyan} {msg}")
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    pb.set_message(msg.into());
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    pb
 }
 
 pub fn progress_bar_for(label: &str, total: u64) -> Arc<ProgressBar> {
@@ -152,21 +163,6 @@ pub fn progress_callback(pb: Arc<ProgressBar>) -> Box<dyn Fn(i64, i64) + Send + 
     })
 }
 
-pub fn expand_local_path(path: &str) -> std::path::PathBuf {
-    if path == "~" {
-        if let Some(home) = std::env::var_os("HOME") {
-            return std::path::PathBuf::from(home);
-        }
-    }
-
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return std::path::PathBuf::from(home).join(rest);
-        }
-    }
-
-    std::path::PathBuf::from(path)
-}
 
 pub async fn resolve_folder_path(
     client: &ProtonDriveClient,
@@ -174,6 +170,7 @@ pub async fn resolve_folder_path(
     current_path: Vec<String>,
     root_uid: NodeUid,
     path: &str,
+    cache: Option<&RusqliteCache>,
 ) -> Result<(NodeUid, Vec<String>)> {
     if path.is_empty() || path == "." {
         return Ok((current_uid, current_path));
@@ -215,7 +212,7 @@ pub async fn resolve_folder_path(
             continue;
         }
 
-        let child = find_child_by_name(client, uid.clone(), seg).await?;
+        let child = find_child_by_name(client, uid.clone(), seg, cache).await?;
         if !matches!(child, Node::Folder(_) | Node::Album(_)) {
             return Err(anyhow!("'{}' is not a directory", seg));
         }

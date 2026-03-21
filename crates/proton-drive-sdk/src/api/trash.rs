@@ -86,7 +86,16 @@ impl TrashApiClient for DefaultTrashApiClient {
         ))?;
         let builder = self.client.get(url);
         let builder = self.add_auth_headers(builder).await?;
-        Ok(builder.send().await?.json::<VolumeTrashResponse>().await?)
+        let response = builder.send().await?;
+        let text = response.text().await?;
+        match serde_json::from_str::<VolumeTrashResponse>(&text) {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                tracing::error!(error = %e, "get_trash failed to deserialize");
+                tracing::debug!(body = %text, "Full response");
+                Err(anyhow::anyhow!("Failed to decode Trash response: {}. Body: {}", e, text))
+            }
+        }
     }
 
     async fn trash_multiple(

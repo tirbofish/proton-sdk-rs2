@@ -21,6 +21,8 @@ use crate::node::operations::NodeOperations;
 use crate::node::revision::{REVISION_WRITER_DEFAULT_BLOCK_SIZE, RevisionUid};
 use crate::node::thumbnail::ThumbnailType;
 use crate::node::{DegradedNode, Node, NodeUid};
+use crate::volume::VolumeId;
+use crate::links::LinkId;
 use crate::utils::PotentialObject;
 use crate::utils::semaphore::FifoFlexibleSemaphore;
 use crate::volume_operations::VolumeOperations;
@@ -318,8 +320,28 @@ impl ProtonDriveClient {
     }
 
     // this should always be pub(crate), not pub. reduce the visibility.
-    pub(crate) fn api(&self) -> &Arc<dyn DriveApiClients> {
+    pub fn api(&self) -> &Arc<dyn DriveApiClients> {
         &self.api
+    }
+
+    pub async fn list_children(
+        &self,
+        volume_id: VolumeId,
+        parent_link_id: Option<LinkId>,
+    ) -> anyhow::Result<Vec<PotentialObject<Node, DegradedNode>>> {
+        let parent_uid = parent_link_id.map(|id| NodeUid::new(volume_id.clone(), id));
+        let mut stream = match parent_uid {
+            Some(uid) => self.enumerate_folder_children(uid).await?,
+            None => {
+                let root = self.get_my_files_folder().await?;
+                self.enumerate_folder_children(root.base.uid).await?
+            }
+        };
+        let mut results = Vec::new();
+        while let Some(item) = futures::StreamExt::next(&mut stream).await {
+            results.push(item?);
+        }
+        Ok(results)
     }
 
     pub(crate) fn cache(&self) -> &Arc<dyn DriveClientCache> {
@@ -551,10 +573,7 @@ impl ProtonDriveClient {
         uids: Vec<NodeUid>,
         new_parent_folder_uid: NodeUid,
     ) -> anyhow::Result<()> {
-        for uid in uids {
-            NodeOperations::move_single(self, uid, new_parent_folder_uid.clone(), None).await?;
-        }
-        Ok(())
+        NodeOperations::move_multiple(self, uids, new_parent_folder_uid).await
     }
 
     pub async fn rename_node(

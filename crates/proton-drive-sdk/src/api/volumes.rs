@@ -89,6 +89,7 @@ impl VolumesApiClient for DefaultVolumesApiClient {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
 pub struct ShareTrashDto {
     #[serde(rename = "ShareID")]
     pub share_id: ShareId,
@@ -97,7 +98,7 @@ pub struct ShareTrashDto {
     pub link_ids: Vec<LinkId>,
 
     #[serde(rename = "ParentIDs")]
-    pub parent_ids: Vec<LinkId>,
+    pub parent_ids: Option<Vec<LinkId>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -194,12 +195,13 @@ pub struct VolumeShareDto {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
 pub struct VolumeTrashResponse {
     #[serde(flatten)]
     pub base: ApiResponse,
 
-    #[serde(rename = "Trash")]
-    pub trash_by_share: Vec<ShareTrashDto>,
+    #[serde(rename = "Trash", default)]
+    pub trash: Vec<ShareTrashDto>,
 }
 
 impl VolumeTrashResponse {

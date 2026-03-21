@@ -6,12 +6,12 @@ use proton_drive_sdk::node::{Node, NodeUid};
 use proton_drive_sdk::utils::PotentialObject;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use parking_lot::Mutex;
 
 use super::helpers::{
-    area_from_path, degraded_name, find_child_by_name, format_size, get_available_name,
-    has_wildcards, list_children, resolve_folder_path, selector_matches, split_parent_and_leaf,
-    Area,
+    area_from_path, degraded_name, find_child_by_name, format_size,
+    has_wildcards, list_children, new_spinner, resolve_folder_path, selector_matches,
+    split_parent_and_leaf, Area,
 };
 
 pub async fn mkdir_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Result<()> {
@@ -21,7 +21,7 @@ pub async fn mkdir_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Resu
     let name = args[0].to_string();
     
     let (client, parent_uid) = {
-        let s = state.lock().await;
+        let s = state.lock();
         let c = s
             .get_client()
             .ok_or_else(|| anyhow!("Not authenticated. Use 'login' first."))?
@@ -33,90 +33,35 @@ pub async fn mkdir_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Resu
         (c, u)
     };
 
+    let sp = new_spinner(format!("Creating '{}'...", name));
     let new_folder = client.create_folder(parent_uid, name.clone(), None).await?;
+    sp.finish_and_clear();
     println!("Created: {} ({})", name, new_folder.base.uid);
     Ok(())
 }
 
-/// Check if an error is a 2500 API conflict error
-fn is_conflict_error_2500(error: &anyhow::Error) -> bool {
-    format!("{}", error).contains("2500")
-}
-
-async fn handle_move_conflict(
-    existing: &Node,
-    _moving_is_folder: bool,
-) -> Result<MoveConflictAction> {
-    let _existing_is_folder = matches!(existing, Node::Folder(_) | Node::Album(_));
-    let existing_name = existing.base().name.clone();
-    let existing_size = match existing {
-        Node::File(f) => format_size(f.active_revision.size_on_cloud_storage.max(0) as u64),
-        Node::Photo(f) => format_size(f.active_revision.size_on_cloud_storage.max(0) as u64),
-        Node::Folder(_) | Node::Album(_) => "[DIR]".to_string(),
-    };
-
-    loop {
-        println!("\nConflict: Destination '{}' already exists", existing_name);
-        println!("\n  Options:");
-        println!("    0 - Replace the file");
-        println!("    1 - Compare file stats");
-        println!("    2 - Change name and move");
-        println!("    3 - Skip");
-        println!("\n  Enter choice (0-3): ");
-
-        let mut input = String::new();
-        if std::io::stdin().read_line(&mut input).is_err() {
-            return Ok(MoveConflictAction::Skip);
-        }
-
-        match input.trim() {
-            "0" => return Ok(MoveConflictAction::Replace),
-            "1" => {
-                println!("\n  Existing: {}  {}", existing_size, existing_name);
-                return Ok(MoveConflictAction::CompareStats);
-            }
-            "2" => return Ok(MoveConflictAction::Rename),
-            "3" => return Ok(MoveConflictAction::Skip),
-            _ => println!("Invalid choice. Please enter 0-3."),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum MoveConflictAction {
-    Replace,
-    CompareStats,
-    Rename,
-    Skip,
-}
-
 pub async fn move_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Result<()> {
     if args.len() < 2 {
-        return Err(anyhow!("Usage: mv [--force] <src> <dst>"));
+        return Err(anyhow!("Usage: mv <src> <dst>"));
     }
 
-    let mut force = false;
     let mut arg_start = 0;
-
     for (i, arg) in args.iter().enumerate() {
         match *arg {
-            "-f" | "--force" => force = true,
-            _ => {
-                arg_start = i;
-                break;
-            }
+            "-f" | "--force" => {}
+            _ => { arg_start = i; break; }
         }
     }
 
     if args.len() - arg_start < 2 {
-        return Err(anyhow!("Usage: mv [--force] <src> <dst>"));
+        return Err(anyhow!("Usage: mv <src> <dst>"));
     }
 
     let src = args[arg_start];
     let dst = args[arg_start + 1];
 
-    let (client, current_uid, root_uid, current_path) = {
-        let s = state.lock().await;
+    let (client, current_uid, root_uid, current_path, cache) = {
+        let s = state.lock();
         let client = s
             .get_client()
             .ok_or_else(|| anyhow!("Not authenticated. Use 'login' first."))?
@@ -129,8 +74,13 @@ pub async fn move_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Resul
             .get_root_node_uid()
             .ok_or_else(|| anyhow!("Root unknown; please re-login"))?
             .clone();
-        (client, uid, root_uid, s.get_current_path().to_vec())
+        let cache = s.get_cache();
+        (client, uid, root_uid, s.get_current_path().to_vec(), cache)
     };
+
+    // Show the spinner immediately — before any network work — so there is no
+    // visible gap between entering the command and seeing feedback.
+    let sp = new_spinner(format!("Moving '{}' → '{}'...", src, dst));
 
     if has_wildcards(src) {
         let pattern = Pattern::new(src)?;
@@ -140,6 +90,7 @@ pub async fn move_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Resul
             .filter(|n| pattern.matches(&n.base().name))
             .collect();
         if matches.is_empty() {
+            sp.finish_and_clear();
             return Err(anyhow!("No files matched pattern '{}'", src));
         }
 
@@ -149,12 +100,16 @@ pub async fn move_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Resul
             current_path,
             root_uid,
             dst,
+            cache.as_deref(),
         )
         .await?;
 
+        let count = matches.len();
+        sp.set_message(format!("Moving {} item(s) to '{}'...", count, dst));
         let uids = matches.iter().map(|n| n.uid().clone()).collect::<Vec<_>>();
         client.move_nodes(uids, dst_uid).await?;
-        println!("Moved {} item(s) to '{}'", matches.len(), dst);
+        sp.finish_and_clear();
+        println!("Moved {} item(s) to '{}'", count, dst);
         return Ok(());
     }
 
@@ -169,243 +124,87 @@ pub async fn move_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Resul
             current_path.clone(),
             root_uid.clone(),
             src_parent,
+            cache.as_deref(),
         )
         .await?
         .0
     };
-    let node = find_child_by_name(&client, src_folder_uid.clone(), src_leaf).await?;
 
-    if dst.contains('/') {
+    let node = find_child_by_name(&client, src_folder_uid.clone(), src_leaf, cache.as_deref()).await?;
+    let node_uid = node.uid().clone();
+
+    let (target_folder_uid, final_name) = if dst.contains('/') {
         let (folder_part, maybe_name) = match dst.rsplit_once('/') {
             Some((f, n)) => (f, n),
             None => ("", dst),
         };
         let target_folder_path = if folder_part.is_empty() { "." } else { folder_part };
-        let (target_folder_uid, _) = resolve_folder_path(
+        let (t_uid, _) = resolve_folder_path(
             &client,
             current_uid.clone(),
             current_path.clone(),
             root_uid.clone(),
             target_folder_path,
+            cache.as_deref(),
         )
         .await?;
-
-        if target_folder_uid != *node.base().parent_uid.as_ref().unwrap_or(&target_folder_uid) {
-            match client
-                .move_nodes(vec![node.uid().clone()], target_folder_uid.clone())
-                .await
-            {
-                Ok(_) => {}
-                Err(e) if is_conflict_error_2500(&e) => {
-                    // File exists in destination, show conflict dialog
-                    let target_children = list_children(&client, target_folder_uid.clone()).await?;
-                    if let Some(existing) = target_children.iter().find(|n| n.base().name == node.base().name) {
-                        println!("\n(Conflict detected: destination already has '{}')", node.base().name);
-                        match handle_move_conflict(existing, matches!(node, Node::Folder(_) | Node::Album(_))).await? {
-                            MoveConflictAction::Replace => {
-                                // continue with the move as-is
-                            }
-                            MoveConflictAction::CompareStats => {
-                                let existing_size = match existing {
-                                    Node::File(f) => format_size(f.active_revision.size_on_cloud_storage.max(0) as u64),
-                                    Node::Photo(f) => format_size(f.active_revision.size_on_cloud_storage.max(0) as u64),
-                                    Node::Folder(_) | Node::Album(_) => "[DIR]".to_string(),
-                                };
-                                let moving_size = match &node {
-                                    Node::File(f) => format_size(f.active_revision.size_on_cloud_storage.max(0) as u64),
-                                    Node::Photo(f) => format_size(f.active_revision.size_on_cloud_storage.max(0) as u64),
-                                    Node::Folder(_) | Node::Album(_) => "[DIR]".to_string(),
-                                };
-                                println!("\n  Existing:  {}  {}", existing_size, existing.base().name);
-                                println!("  Moving:    {}  {}", moving_size, node.base().name);
-                                println!("  Use 'mv --force' to replace or pick a different destination.");
-                                return Ok(());
-                            }
-                            MoveConflictAction::Rename => {
-                                let new_name = get_available_name(&target_children, &node.base().name)?;
-                                client
-                                    .rename_node(node.uid().clone(), new_name.clone(), None)
-                                    .await?;
-                                client
-                                    .move_nodes(vec![node.uid().clone()], target_folder_uid.clone())
-                                    .await?;
-                                println!("Moved '{}' → '{}/{}' (conflict resolved)", src, target_folder_path, new_name);
-                                return Ok(());
-                            }
-                            MoveConflictAction::Skip => return Ok(()),
-                        }
-                    } else {
-                        return Err(e);
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        if !maybe_name.is_empty() {
-            let mut final_name = maybe_name.to_string();
-            let mut target_children = list_children(&client, target_folder_uid.clone()).await?;
-            if let Some(existing) = target_children.iter().find(|n| n.base().name == maybe_name) {
-                if force {
-                    // fall through to rename below
-                } else {
-                    match handle_move_conflict(existing, matches!(node, Node::Folder(_) | Node::Album(_))).await? {
-                        MoveConflictAction::Replace => {}
-                        MoveConflictAction::CompareStats => {
-                            let moving_size = match &node {
-                                Node::File(f) => format_size(f.active_revision.size_on_cloud_storage.max(0) as u64),
-                                Node::Photo(f) => format_size(f.active_revision.size_on_cloud_storage.max(0) as u64),
-                                Node::Folder(_) | Node::Album(_) => "[DIR]".to_string(),
-                            };
-                            println!("\n  Moving:   {}  {}", moving_size, node.base().name);
-                            println!("  Use 'mv --force' to replace or pick a different destination.");
-                            return Ok(());
-                        }
-                        MoveConflictAction::Rename => {
-                            final_name = get_available_name(&target_children, maybe_name)?;
-                        }
-                        MoveConflictAction::Skip => return Ok(()),
-                    }
-                }
-            }
-
-            // Try to rename; if we get a 2500 error, handle it
-            match client
-                .rename_node(node.uid().clone(), final_name.clone(), None)
-                .await
-            {
-                Ok(_) => {}
-                Err(e) if is_conflict_error_2500(&e) => {
-                    // Conflict detected by API, refresh children and show dialog
-                    target_children = list_children(&client, target_folder_uid.clone()).await?;
-                    if let Some(existing) = target_children.iter().find(|n| n.base().name == final_name) {
-                        println!("\n(Conflict detected during move)");
-                        match handle_move_conflict(existing, matches!(node, Node::Folder(_) | Node::Album(_))).await? {
-                            MoveConflictAction::Replace => {
-                                client
-                                    .rename_node(node.uid().clone(), final_name.clone(), None)
-                                    .await?;
-                            }
-                            MoveConflictAction::CompareStats => {
-                                let moving_size = match &node {
-                                    Node::File(f) => format_size(f.active_revision.size_on_cloud_storage.max(0) as u64),
-                                    Node::Photo(f) => format_size(f.active_revision.size_on_cloud_storage.max(0) as u64),
-                                    Node::Folder(_) | Node::Album(_) => "[DIR]".to_string(),
-                                };
-                                println!("\n  Moving:   {}  {}", moving_size, node.base().name);
-                                println!("  Use 'mv --force' to replace or pick a different destination.");
-                                return Ok(());
-                            }
-                            MoveConflictAction::Rename => {
-                                let new_name = get_available_name(&target_children, &maybe_name)?;
-                                client
-                                    .rename_node(node.uid().clone(), new_name.clone(), None)
-                                    .await?;
-                            }
-                            MoveConflictAction::Skip => return Ok(()),
-                        }
-                    } else {
-                        return Err(e);
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        println!("Moved '{}' → '{}'", src, dst);
-        return Ok(());
-    }
-
-    if let Ok(folder) = find_child_by_name(&client, current_uid.clone(), dst).await {
-        if matches!(folder, Node::Folder(_) | Node::Album(_)) {
-            client
-                .move_nodes(vec![node.uid().clone()], folder.uid().clone())
-                .await?;
-            println!("Moved '{}' → '{}/'", src, dst);
-            return Ok(());
-        }
-    }
-
-    // If the source was in a subdirectory, bring it into the current directory first
-    if src_folder_uid != current_uid {
-        client
-            .move_nodes(vec![node.uid().clone()], current_uid.clone())
-            .await?;
-    }
-
-    let target_children = list_children(&client, current_uid.clone()).await?;
-    let mut final_name = dst.to_string();
-    if let Some(existing) = target_children.iter().find(|n| n.base().name == dst) {
-        if force {
-            // fall through to rename below
-        } else {
-            match handle_move_conflict(existing, matches!(node, Node::Folder(_) | Node::Album(_))).await? {
-                MoveConflictAction::Replace => {}
-                MoveConflictAction::CompareStats => {
-                    let moving_size = match &node {
-                        Node::File(f) => format_size(f.active_revision.size_on_cloud_storage.max(0) as u64),
-                        Node::Photo(f) => format_size(f.active_revision.size_on_cloud_storage.max(0) as u64),
-                        Node::Folder(_) | Node::Album(_) => "[DIR]".to_string(),
-                    };
-                    println!("\n  Moving:   {}  {}", moving_size, node.base().name);
-                    println!("  Use 'mv --force' to replace or pick a different destination.");
-                    return Ok(());
-                }
-                MoveConflictAction::Rename => {
-                    final_name = get_available_name(&target_children, dst)?;
-                }
-                MoveConflictAction::Skip => return Ok(()),
-            }
-        }
-    }
-
-    // Try to rename; if we get a 2500 error, handle it
-    match client
-        .rename_node(node.uid().clone(), final_name.clone(), None)
-        .await
-    {
-        Ok(_) => {}
-        Err(e) if is_conflict_error_2500(&e) => {
-            // Conflict detected by API, refresh children and show dialog
-            let refreshed_children = list_children(&client, current_uid.clone()).await?;
-            if let Some(existing) = refreshed_children.iter().find(|n| n.base().name == final_name) {
-                println!("\n(Conflict detected during rename)");
-                match handle_move_conflict(existing, matches!(node, Node::Folder(_) | Node::Album(_))).await? {
-                    MoveConflictAction::Replace => {
-                        client
-                            .rename_node(node.uid().clone(), final_name.clone(), None)
-                            .await?;
-                    }
-                    MoveConflictAction::CompareStats => {
-                        let moving_size = match &node {
-                            Node::File(f) => format_size(f.active_revision.size_on_cloud_storage.max(0) as u64),
-                            Node::Photo(f) => format_size(f.active_revision.size_on_cloud_storage.max(0) as u64),
-                            Node::Folder(_) | Node::Album(_) => "[DIR]".to_string(),
-                        };
-                        println!("\n  Moving:   {}  {}", moving_size, node.base().name);
-                        println!("  Use 'mv --force' to replace or pick a different destination.");
-                        return Ok(());
-                    }
-                    MoveConflictAction::Rename => {
-                        let new_name = get_available_name(&refreshed_children, &dst)?;
-                        client
-                            .rename_node(node.uid().clone(), new_name.clone(), None)
-                            .await?;
-                        final_name = new_name;
-                    }
-                    MoveConflictAction::Skip => return Ok(()),
-                }
-            } else {
-                return Err(e);
-            }
-        }
-        Err(e) => return Err(e),
-    }
-
-    if final_name == dst {
-        println!("Renamed '{}' → '{}'", src, dst);
+        (t_uid, if maybe_name.is_empty() { node.base().name.clone() } else { maybe_name.to_string() })
     } else {
-        println!("Renamed '{}' → '{}' (conflict resolved)", src, final_name);
+        // Check whether dst names an existing folder: consult the cache first to
+        // avoid an extra network round-trip in the common rename-in-place case.
+        let dst_is_folder = if let Some(ref c) = cache {
+            match c.get_child_by_name(&current_uid.volume_id, Some(&current_uid.link_id), dst) {
+                Ok(Some(cached)) => cached.node_type == "Folder" || cached.node_type == "Album",
+                // Cache miss — fall back to network only if needed
+                _ => {
+                    matches!(
+                        find_child_by_name(&client, current_uid.clone(), dst, cache.as_deref()).await,
+                        Ok(Node::Folder(_) | Node::Album(_))
+                    )
+                }
+            }
+        } else {
+            matches!(
+                find_child_by_name(&client, current_uid.clone(), dst, cache.as_deref()).await,
+                Ok(Node::Folder(_) | Node::Album(_))
+            )
+        };
+
+        if dst_is_folder {
+            // dst is a directory — move src into it keeping the original name.
+            let (t_uid, _) = resolve_folder_path(
+                &client,
+                current_uid.clone(),
+                current_path.clone(),
+                root_uid.clone(),
+                dst,
+                cache.as_deref(),
+            ).await?;
+            (t_uid, node.base().name.clone())
+        } else {
+            (current_uid.clone(), dst.to_string())
+        }
+    };
+
+    if target_folder_uid != *node.base().parent_uid.as_ref().unwrap_or(&target_folder_uid) {
+        client.move_nodes(vec![node_uid.clone()], target_folder_uid.clone()).await?;
     }
+
+    if final_name != node.base().name {
+        client.rename_node(node_uid.clone(), final_name.clone(), None).await?;
+    }
+
+    // Targeted cache update: delete the stale entry then fetch just the moved/renamed
+    // node — avoids a full list_children round-trip that re-fetches the whole folder.
+    if let Some(c) = cache {
+        let _ = c.delete_node(&node_uid.volume_id, &node_uid.link_id);
+        if let Ok(PotentialObject::Node(fresh)) = client.get_node(node_uid.clone()).await {
+            let _ = c.upsert_node(&fresh, false);
+        }
+    }
+
+    sp.finish_and_clear();
+    println!("Moved '{}' → '{}'", src, dst);
     Ok(())
 }
 
@@ -414,15 +213,13 @@ pub async fn remove_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Res
         return Err(anyhow!("Usage: rm <path|pattern> ..."));
     }
 
-    let mut recursive = false;
     let mut force = false;
     let mut targets: Vec<&str> = Vec::new();
     for arg in args {
         match *arg {
-            "-r" => recursive = true,
+            "-r" => {} // Proton Drive trashes recursively by default
             "-f" => force = true,
             "-rf" | "-fr" => {
-                recursive = true;
                 force = true;
             }
             _ => targets.push(arg),
@@ -433,8 +230,8 @@ pub async fn remove_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Res
         return Err(anyhow!("Usage: rm <path|pattern> ..."));
     }
 
-    let (client, current_uid, current_path, root_uid) = {
-        let s = state.lock().await;
+    let (client, current_uid, current_path, root_uid, cache) = {
+        let s = state.lock();
         let client = s
             .get_client()
             .ok_or_else(|| anyhow!("Not authenticated. Use 'login' first."))?
@@ -443,11 +240,13 @@ pub async fn remove_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Res
             .get_root_node_uid()
             .ok_or_else(|| anyhow!("Root unknown; please re-login"))?
             .clone();
+        let cache = s.get_cache();
         (
             client,
             s.get_current_node_uid().cloned(),
             s.get_current_path().to_vec(),
             root_uid,
+            cache,
         )
     };
 
@@ -474,27 +273,45 @@ pub async fn remove_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Res
                 current_path.clone(),
                 root_uid.clone(),
                 parent_selector,
+                cache.as_deref(),
             )
             .await?
             .0
         };
-        let children = list_children(&client, target_uid.clone()).await?;
 
         if has_wildcards(leaf_selector) {
-            for node in children
-                .iter()
-                .filter(|n| selector_matches(leaf_selector, &n.base().name).unwrap_or(false))
-            {
-                let _ = recursive;
-                to_trash.push(node.uid().clone());
-            }
+            // Wildcard: use cache list for quick in-memory match.
+            let children = if let Some(ref c) = cache {
+                let cached = c.list_children(&target_uid.volume_id, Some(&target_uid.link_id))?;
+                if !cached.is_empty() {
+                    // Turn CachedNodes directly into UIDs — no network needed.
+                    cached.into_iter()
+                        .filter(|n| selector_matches(leaf_selector, &n.name).unwrap_or(false))
+                        .map(|n| NodeUid::new(target_uid.volume_id.clone(), proton_drive_sdk::links::LinkId::new(n.link_id)))
+                        .collect::<Vec<_>>()
+                } else {
+                    list_children(&client, target_uid.clone()).await?
+                        .into_iter()
+                        .filter(|n| selector_matches(leaf_selector, &n.base().name).unwrap_or(false))
+                        .map(|n| n.uid().clone())
+                        .collect()
+                }
+            } else {
+                list_children(&client, target_uid.clone()).await?
+                    .into_iter()
+                    .filter(|n| selector_matches(leaf_selector, &n.base().name).unwrap_or(false))
+                    .map(|n| n.uid().clone())
+                    .collect()
+            };
+            to_trash.extend(children);
             continue;
         }
 
-        match children.into_iter().find(|n| n.base().name == leaf_selector) {
-            Some(node) => to_trash.push(node.uid().clone()),
-            None if force => {}
-            None => {
+        // Exact name: find_child_by_name already does cache-first.
+        match find_child_by_name(&client, target_uid, leaf_selector, cache.as_deref()).await {
+            Ok(node) => to_trash.push(node.uid().clone()),
+            Err(_) if force => {}
+            Err(_) => {
                 return Err(anyhow!(
                     "'{}' not found in '{}'",
                     leaf_selector,
@@ -514,7 +331,9 @@ pub async fn remove_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Res
     let mut seen = HashSet::new();
     to_trash.retain(|uid| seen.insert(uid.clone()));
 
+    let sp = new_spinner(format!("Trashing {} item(s)...", to_trash.len()));
     let result = client.trash_nodes(to_trash.clone()).await?;
+    sp.finish_and_clear();
     let mut failed = 0usize;
     for uid in &to_trash {
         if let Some(Err(err)) = result.get(uid) {
@@ -549,7 +368,7 @@ pub async fn drop_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Resul
     }
 
     let (client, area) = {
-        let s = state.lock().await;
+        let s = state.lock();
         let client = s
             .get_client()
             .ok_or_else(|| anyhow!("Not authenticated. Use 'login' first."))?
@@ -562,7 +381,9 @@ pub async fn drop_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Resul
         return Err(anyhow!("drop is only available in Trash"));
     }
 
+    let sp = new_spinner("Loading Trash...");
     let items = client.enumerate_trash().await?;
+    sp.finish_and_clear();
     let mut to_delete = Vec::new();
     let mut names_by_uid: HashMap<NodeUid, String> = HashMap::new();
 
@@ -618,7 +439,9 @@ pub async fn drop_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Resul
         return Ok(());
     }
 
+    let sp = new_spinner(format!("Permanently deleting {} item(s)...", to_delete.len()));
     let result = client.delete_nodes_from_trash(to_delete.clone()).await?;
+    sp.finish_and_clear();
     let mut failed = 0usize;
     for uid in &to_delete {
         if let Some(Err(err)) = result.get(uid) {
@@ -639,14 +462,103 @@ pub async fn drop_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Resul
     Ok(())
 }
 
+/// `restore <name|pattern>` — restore nodes from Trash back to their original location
+pub async fn restore_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Result<()> {
+    if args.is_empty() {
+        return Err(anyhow!("Usage: restore <name|pattern> ..."));
+    }
+
+    let (client, area) = {
+        let s = state.lock();
+        let client = s
+            .get_client()
+            .ok_or_else(|| anyhow!("Not authenticated. Use 'login' first."))?
+            .clone();
+        let area = area_from_path(s.get_current_path());
+        (client, area)
+    };
+
+    if area != Area::Trash {
+        return Err(anyhow!("restore is only available in Trash. Navigate with: cd /Trash"));
+    }
+
+    let sp = new_spinner("Loading Trash...");
+    let items = client.enumerate_trash().await?;
+    sp.finish_and_clear();
+    let mut to_restore = Vec::new();
+    let mut names_by_uid: HashMap<NodeUid, String> = HashMap::new();
+
+    for selector in args {
+        let (parent_selector, leaf_selector) = split_parent_and_leaf(selector);
+        if parent_selector != "." && parent_selector != "/" && parent_selector != "Trash" {
+            return Err(anyhow!(
+                "Invalid Trash selector '{}': only current Trash scope is supported",
+                selector
+            ));
+        }
+
+        for item in &items {
+            match item {
+                Ok(node) => {
+                    if selector_matches(leaf_selector, &node.base().name)? {
+                        let uid = node.uid().clone();
+                        to_restore.push(uid.clone());
+                        names_by_uid.entry(uid).or_insert_with(|| node.base().name.clone());
+                    }
+                }
+                Err(d) => {
+                    let name = degraded_name(d);
+                    if selector_matches(leaf_selector, &name)? {
+                        let uid = d.uid().clone();
+                        to_restore.push(uid.clone());
+                        names_by_uid.entry(uid).or_insert(name);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut seen = HashSet::new();
+    to_restore.retain(|uid| seen.insert(uid.clone()));
+    if to_restore.is_empty() {
+        return Err(anyhow!("Nothing matched"));
+    }
+
+    let sp = new_spinner(format!("Restoring {} item(s)...", to_restore.len()));
+    let result = client.restore_nodes(to_restore.clone()).await?;
+    sp.finish_and_clear();
+    let mut failed = 0usize;
+    for uid in &to_restore {
+        if let Some(Err(err)) = result.get(uid) {
+            failed += 1;
+            let name = names_by_uid.get(uid).map(String::as_str).unwrap_or("<unknown>");
+            eprintln!("Failed to restore '{}' (uid={}): {}", name, uid, err);
+        }
+    }
+
+    if failed > 0 {
+        return Err(anyhow!("{} item(s) failed to restore", failed));
+    }
+
+    // Evict restored nodes from trash in local cache
+    if let Some(cache) = state.lock().get_cache() {
+        for uid in &to_restore {
+            let _ = cache.delete_node(&uid.volume_id, &uid.link_id);
+        }
+    }
+
+    println!("Restored {} item(s)", to_restore.len());
+    Ok(())
+}
+
 /// `stat <name>` — display metadata for a node in the current directory
 pub async fn stat_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Result<()> {
     if args.is_empty() {
         return Err(anyhow!("Usage: stat <name|pattern> ..."));
     }
     
-    let (client, current_uid) = {
-        let s = state.lock().await;
+    let (client, current_uid, current_path, root_uid, cache) = {
+        let s = state.lock();
         let c = s
             .get_client()
             .ok_or_else(|| anyhow!("Not authenticated. Use 'login' first."))?
@@ -655,32 +567,28 @@ pub async fn stat_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Resul
             .get_current_node_uid()
             .ok_or_else(|| anyhow!("No current directory"))?
             .clone();
-        (c, u)
+        let p = s.get_current_path().to_vec();
+        let r = s.get_root_node_uid().ok_or_else(|| anyhow!("Root unknown"))?.clone();
+        let cache = s.get_cache();
+        (c, u, p, r, cache)
     };
 
+    let sp = new_spinner("Loading...");
     let children = list_children(&client, current_uid.clone()).await?;
+    sp.finish_and_clear();
     let mut matched: Vec<Node> = Vec::new();
     for selector in args {
         let (parent_selector, leaf_selector) = split_parent_and_leaf(selector);
         let target_uid = if parent_selector == "." {
             current_uid.clone()
         } else {
-            let s = state.lock().await;
-            let root_uid = s
-                .get_root_node_uid()
-                .ok_or_else(|| anyhow!("Root unknown; please re-login"))?
-                .clone();
-            drop(s);
-            let (_, current_path) = {
-                let s = state.lock().await;
-                (s.get_current_node_uid().cloned(), s.get_current_path().to_vec())
-            };
             let (uid, _) = resolve_folder_path(
                 &client,
                 current_uid.clone(),
-                current_path,
-                root_uid,
+                current_path.clone(),
+                root_uid.clone(),
                 parent_selector,
+                cache.as_deref(),
             )
             .await?;
             uid

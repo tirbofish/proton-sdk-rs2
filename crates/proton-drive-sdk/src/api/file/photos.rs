@@ -1,4 +1,5 @@
 use crate::account::{AddressId, AddressKeyId};
+use crate::api::events::{DefaultEventsApiClient, EventsApiClient};
 use crate::api::file::{DefaultFilesApiClient, FileDto, FilesApiClient};
 use crate::api::folder::{DefaultFoldersApiClient, FoldersApiClient};
 use crate::api::links::{
@@ -157,7 +158,6 @@ pub struct PhotoAlbumInclusionDto {
     pub creation_time: DateTime<Utc>,
 }
 
-/// Mirrors C# `PhotoDto : FileDto` via flatten.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct PhotoDto {
@@ -396,7 +396,6 @@ impl LinksApiClient for PhotosLinksApiClient {
 }
 
 /// Concrete implementation of `DriveApiClients` for the Photos context.
-/// Mirrors C# `PhotosApiClients`.
 pub struct PhotosApiClients {
     volumes: Arc<DefaultVolumesApiClient>,
     shares: Arc<DefaultSharesApiClient>,
@@ -405,6 +404,7 @@ pub struct PhotosApiClients {
     files: Arc<DefaultFilesApiClient>,
     storage: Arc<DefaultStorageApiClient>,
     trash: Arc<DefaultTrashApiClient>,
+    events: Arc<DefaultEventsApiClient>,
 }
 
 impl PhotosApiClients {
@@ -449,6 +449,11 @@ impl PhotosApiClients {
                 token_credential.clone(),
             )),
             trash: Arc::new(DefaultTrashApiClient::new(
+                default_client.clone(),
+                default_api_base_url.clone(),
+                token_credential.clone(),
+            )),
+            events: Arc::new(DefaultEventsApiClient::new(
                 default_client,
                 default_api_base_url,
                 token_credential,
@@ -478,5 +483,8 @@ impl DriveApiClients for PhotosApiClients {
     }
     fn trash(&self) -> Arc<dyn TrashApiClient> {
         self.trash.clone()
+    }
+    fn events(&self) -> Arc<dyn EventsApiClient> {
+        self.events.clone()
     }
 }

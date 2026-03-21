@@ -15,12 +15,16 @@ pub enum Area {
     Top,
     MyFiles,
     Trash,
+    Photos,
+    Computers,
 }
 
 pub fn area_from_path(path: &[String]) -> Area {
     match path.first().map(String::as_str) {
         Some("MyFiles") => Area::MyFiles,
         Some("Trash") => Area::Trash,
+        Some("Photos") => Area::Photos,
+        Some("Computers") => Area::Computers,
         _ => Area::Top,
     }
 }

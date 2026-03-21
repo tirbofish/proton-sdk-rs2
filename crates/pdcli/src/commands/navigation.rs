@@ -2,232 +2,85 @@ use crate::state::ReplState;
 use anyhow::{anyhow, Result};
 use proton_drive_sdk::node::{Node, NodeUid};
 use proton_drive_sdk::links::LinkId;
+use proton_drive_sdk::photo::ProtonPhotosClient;
 use std::sync::Arc;
 use parking_lot::Mutex;
-use std::time::Duration;
 use proton_drive_sdk::client::ProtonDriveClient;
-use proton_drive_sdk::utils::PotentialObject;
 
 use super::helpers::{
     area_from_path, format_size,
-    has_wildcards, list_children, resolve_folder_path, selector_matches, Area,
+    has_wildcards, list_children, new_spinner, resolve_folder_path, selector_matches, Area,
 };
-
-async fn enter_trash_loop(
-    client: &ProtonDriveClient,
-    root_uid: &NodeUid,
-    cache: &Arc<crate::rusqlite_cache::RusqliteCache>,
-) -> Result<()> {
-    use crossterm::{
-        cursor,
-        event::{self, Event, KeyCode, KeyEvent},
-        execute,
-        style::{Color, Stylize},
-        terminal::{self, ClearType},
-    };
-    use proton_drive_sdk::node::VolumeTrashBatchLoader;
-    use proton_drive_sdk::share_ops::ShareOperations;
-    use std::io::stdout;
-
-    let volume_id = root_uid.volume_id.clone();
-
-    let page_size = 50;
-    let mut selected_idx: usize = 0;
-
-    // Pre-seed from the local SQLite cache so names appear immediately.
-    let cached_trash = cache.list_trash(&volume_id).unwrap_or_default();
-    let initial: Vec<(LinkId, Option<Node>, Option<String>)> = cached_trash
-        .into_iter()
-        .map(|n| {
-            let lid = proton_drive_sdk::links::LinkId::new(n.link_id.clone());
-            let cached_name = Some(n.name.clone());
-            (lid, None, cached_name)
-        })
-        .collect();
-
-    let items = Arc::new(parking_lot::RwLock::new(initial));
-
-    let items_clone = items.clone();
-    let client_clone = client.clone();
-    let volume_id_clone = volume_id.clone();
-    
-    let decrypt_handle = tokio::spawn(async move {
-        let mut page = 0;
-        
-        loop {
-            let response = match client_clone.api().trash().get_trash(volume_id_clone.clone(), page_size, page).await {
-                Ok(r) => r,
-                Err(_) => break,
-            };
-
-            if response.trash.is_empty() { break; }
-
-            for share_trash in response.trash {
-                let share_and_key = match ShareOperations::get_share(&client_clone, share_trash.share_id).await {
-                    Ok(sk) => sk,
-                    Err(_) => continue,
-                };
-
-                let mut batch_loader = VolumeTrashBatchLoader::new(
-                    Arc::new(client_clone.clone()),
-                    volume_id_clone.clone(),
-                    share_and_key.key,
-                );
-
-                {
-                    // Add any link IDs not yet in the list (from server but not in cache).
-                    let mut lock = items_clone.write();
-                    for id in &share_trash.link_ids {
-                        if !lock.iter().any(|(lid, _, _)| lid.raw() == id.raw()) {
-                            lock.push((id.clone(), None, None));
-                        }
-                    }
-                }
-
-                for id in share_trash.link_ids {
-                    if let Ok(res) = batch_loader.queue_and_try_load_batch(id).await {
-                        for node_obj in res {
-                            if let PotentialObject::Node(n) = node_obj {
-                                let mut lock = items_clone.write();
-                                if let Some(item) = lock.iter_mut().find(|(lid, _, _)| lid.raw() == n.uid().link_id.raw()) {
-                                    item.1 = Some(n);
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                if let Ok(remaining) = batch_loader.load_remaining().await {
-                    for node_obj in remaining {
-                        if let PotentialObject::Node(n) = node_obj {
-                            let mut lock = items_clone.write();
-                            if let Some(item) = lock.iter_mut().find(|(lid, _, _)| lid.raw() == n.uid().link_id.raw()) {
-                                item.1 = Some(n);
-                            }
-                        }
-                    }
-                }
-            }
-            page += 1;
-        }
-    });
-
-    terminal::enable_raw_mode()?;
-    let mut stdout = stdout();
-    execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
-
-    let res = loop {
-        let current_items = items.read().clone();
-        if current_items.is_empty() {
-            execute!(stdout, terminal::Clear(ClearType::All), cursor::MoveTo(0, 0))?;
-            println!(" Loading Trash...");
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if decrypt_handle.is_finished() && items.read().is_empty() {
-                println!(" Trash is empty.");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                break Ok(());
-            }
-            continue;
-        }
-
-        let (term_width, term_height) = terminal::size()?;
-        let visible_height = (term_height as usize).saturating_sub(6);
-        let start_render = selected_idx.saturating_sub(visible_height / 2);
-
-        execute!(stdout, terminal::Clear(ClearType::All), cursor::MoveTo(0, 0))?;
-        println!("{}", " ProtonDrive Trash Browser ".bold().on_blue());
-        println!(" (↑/↓: Navigate | d: Delete Permanently | q: Exit)");
-        println!(" Items: {} | Terminal: {}x{}", current_items.len(), term_width, term_height);
-        println!("{}", "─".repeat(term_width as usize).dark_grey());
-
-        for i in 0..visible_height {
-            let idx = start_render + i;
-            if idx >= current_items.len() { break; }
-
-            let (link_id, node_opt, cached_name) = &current_items[idx];
-            let is_selected = idx == selected_idx;
-            let prefix = if is_selected { " > " } else { "   " };
-
-            let (display_name, size_str, is_loading) = match node_opt {
-                Some(n) => (
-                    n.base().name.clone(),
-                    format_size(match n {
-                        Node::File(f) | Node::Photo(f) => f.active_revision.size_on_cloud_storage.max(0) as u64,
-                        _ => 0,
-                    }),
-                    false,
-                ),
-                None => {
-                    // Use cached SQLite name if available, otherwise abbreviated link ID
-                    let name = cached_name.clone().unwrap_or_else(|| {
-                        let raw = link_id.raw();
-                        format!("{}…", &raw[..raw.len().min(20)])
-                    });
-                    (name, "…".to_string(), true)
-                }
-            };
-
-            let name_width = (term_width as usize).saturating_sub(25);
-            let truncated_name = if display_name.len() > name_width {
-                format!("{}...", &display_name[..name_width.saturating_sub(3)])
-            } else {
-                format!("{:<width$}", display_name, width=name_width)
-            };
-
-            let loading_tag = if is_loading { " *" } else { "  " };
-            let line = format!("{}{} {} {:>12}", prefix, loading_tag, truncated_name, size_str);
-            if is_selected {
-                println!("{}", line.with(Color::Cyan).bold());
-            } else if is_loading {
-                println!("{}", line.dark_grey());
-            } else {
-                println!("{}", line);
-            }
-        }
-
-        execute!(stdout, cursor::MoveTo(0, term_height - 1))?;
-        if let Some((_, Some(n), _)) = current_items.get(selected_idx) {
-            let size = match n {
-                Node::File(f) | Node::Photo(f) => f.active_revision.size_on_cloud_storage,
-                _ => 0,
-            };
-            print!(" Name: {} | Size: {}", n.base().name, format_size(size.max(0) as u64));
-        } else if let Some((_, None, Some(name))) = current_items.get(selected_idx) {
-            print!(" Name: {} (loading…)", name);
-        } else {
-            print!(" ID: {}", current_items[selected_idx].0.raw());
-        }
-
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(KeyEvent { code, .. }) = event::read()? {
-                match code {
-                    KeyCode::Up => selected_idx = selected_idx.saturating_sub(1),
-                    KeyCode::Down => if selected_idx + 1 < current_items.len() { selected_idx += 1; },
-                    KeyCode::Char('d') => {
-                        let lid = current_items[selected_idx].0.clone();
-                        let uid = NodeUid::new(volume_id.clone(), lid.clone());
-                        client.delete_nodes_from_trash(vec![uid]).await?;
-                        items.write().retain(|(id, _, _)| id.raw() != lid.raw());
-                        if selected_idx >= items.read().len() && !items.read().is_empty() {
-                            selected_idx = items.read().len() - 1;
-                        }
-                    }
-                    KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => break Ok(()),
-                    _ => {}
-                }
-            }
-        }
-    };
-
-    decrypt_handle.abort();
-    execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show)?;
-    terminal::disable_raw_mode()?;
-    res
-}
 
 pub async fn pwd_command(state: &Arc<Mutex<ReplState>>) -> Result<()> {
     let s = state.lock();
     println!("{}", s.current_path_display());
+    Ok(())
+}
+
+async fn list_trash_flat(
+    client: &ProtonDriveClient,
+    root_uid: &NodeUid,
+    cache: &Arc<crate::rusqlite_cache::RusqliteCache>,
+    selector: Option<&str>,
+) -> Result<()> {
+    let volume_id = root_uid.volume_id.clone();
+
+    // Use cached items if we have them; otherwise fetch from server.
+    let cached = cache.list_trash(&volume_id).unwrap_or_default();
+    let nodes: Vec<Node>;
+
+    if cached.is_empty() {
+        let sp = new_spinner("Fetching trash...");
+        let raw = client.enumerate_trash().await?;
+        sp.finish_and_clear();
+        nodes = raw.into_iter().filter_map(|r| r.ok()).collect();
+        for n in &nodes { let _ = cache.upsert_node(n, true); }
+    } else {
+        // Resolve full Node objects from cache-backed data where possible,
+        // falling back to cached display for items not yet decrypted.
+        println!("\n  Trash/\n");
+        let mut shown = 0usize;
+        for item in &cached {
+            let name = &item.name;
+            if let Some(sel) = selector {
+                if !selector_matches(sel, name)? { continue; }
+            }
+            shown += 1;
+            let is_dir = item.node_type == "Folder" || item.node_type == "Album";
+            if is_dir {
+                println!("  {:>8}  {}/", "[DIR]", name);
+            } else {
+                let size = format_size(item.size.unwrap_or(0).max(0) as u64);
+                println!("  {:>8}  {}", size, name);
+            }
+        }
+        println!("\n  {} item(s)\n", shown);
+        return Ok(());
+    }
+
+    if nodes.is_empty() {
+        println!("\n  Trash is empty.\n");
+        return Ok(());
+    }
+
+    println!("\n  Trash/\n");
+    let mut shown = 0usize;
+    for node in &nodes {
+        let name = &node.base().name;
+        if let Some(sel) = selector {
+            if !selector_matches(sel, name)? { continue; }
+        }
+        shown += 1;
+        match node {
+            Node::Folder(_) | Node::Album(_) => println!("  {:>8}  {}/", "[DIR]", name),
+            Node::File(f) | Node::Photo(f) => {
+                let size = format_size(f.active_revision.size_on_cloud_storage.max(0) as u64);
+                println!("  {:>8}  {}", size, name);
+            }
+        }
+    }
+    println!("\n  {} item(s)\n", shown);
     Ok(())
 }
 
@@ -249,7 +102,7 @@ pub async fn ls_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Result<
     };
 
     if area == Area::Top {
-        let top_entries = ["MyFiles", "Trash", "Photos"];
+        let top_entries = ["MyFiles", "Trash", "Photos", "Computers"];
         let mut visible = Vec::new();
         for entry in top_entries {
             if selector_matches(selector.unwrap_or("*"), entry)? {
@@ -264,15 +117,23 @@ pub async fn ls_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Result<
         return Ok(());
     }
 
-    if area == Area::Trash && selector.is_none() {
-        return enter_trash_loop(&client, &root_uid, &cache).await;
+    if area == Area::Trash {
+        return list_trash_flat(&client, &root_uid, &cache, selector).await;
+    }
+
+    if area == Area::Photos {
+        return list_photos_flat(&state, selector).await;
+    }
+
+    if area == Area::Computers {
+        return list_computers_flat(&client, selector).await;
     }
 
     let current_uid = current_uid.ok_or_else(|| anyhow!("No current directory"))?;
 
     if let Some(sel) = selector {
         if sel == "Trash" || sel == "/Trash" {
-            return enter_trash_loop(&client, &root_uid, &cache).await;
+            return list_trash_flat(&client, &root_uid, &cache, None).await;
         }
         if has_wildcards(sel) {
             let children = list_children(&client, current_uid.clone()).await?;
@@ -316,8 +177,70 @@ pub async fn ls_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Result<
     Ok(())
 }
 
-fn display_nodes(nodes: &[Node]) {
-    for node in nodes {
+async fn list_photos_flat(
+    state: &Arc<Mutex<ReplState>>,
+    selector: Option<&str>,
+) -> Result<()> {
+    let photos = {
+        let s = state.lock();
+        let session = s
+            .get_session()
+            .ok_or_else(|| anyhow!("Not authenticated"))?;
+        ProtonPhotosClient::new(session, None)?
+    };
+
+    let sp = new_spinner("Fetching photo timeline...");
+    let items = photos.iterate_timeline().await?;
+    sp.finish_and_clear();
+
+    if items.is_empty() {
+        println!("\n  Photos/\n\n  (empty)\n");
+        return Ok(());
+    }
+
+    println!("\n  Photos/\n");
+    let mut shown = 0usize;
+    for item in &items {
+        let name = item.uid.link_id.raw().to_string();
+        if let Some(sel) = selector {
+            if !selector_matches(sel, &name)? { continue; }
+        }
+        shown += 1;
+        let ts = item.capture_time.format("%Y-%m-%d %H:%M").to_string();
+        println!("  {:>8}  {}  [{}]", "[PHOTO]", name, ts);
+    }
+    println!("\n  {} item(s)\n", shown);
+    Ok(())
+}
+
+async fn list_computers_flat(
+    client: &ProtonDriveClient,
+    selector: Option<&str>,
+) -> Result<()> {
+    let sp = new_spinner("Fetching computers...");
+    let devices = client.list_devices().await?;
+    sp.finish_and_clear();
+
+    println!("\n  Computers/\n");
+    if devices.is_empty() {
+        println!("  (no computers registered)\n");
+        return Ok(());
+    }
+
+    let mut shown = 0usize;
+    for device in &devices {
+        let name = &device.name;
+        if let Some(sel) = selector {
+            if !selector_matches(sel, name)? { continue; }
+        }
+        shown += 1;
+        println!("  {:>8}  {}/", "[DIR]", name);
+    }
+    println!("\n  {} item(s)\n", shown);
+    Ok(())
+}
+
+fn display_nodes(nodes: &[Node]) {    for node in nodes {
         match node {
             Node::Folder(_) | Node::Album(_) => println!("  {:>8}  {}/", "[DIR]", node.base().name),
             Node::File(f) | Node::Photo(f) => {
@@ -371,8 +294,11 @@ pub async fn cd_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Result<
                     }
                 }
             }
+            "~" => { new_path = vec!["MyFiles".to_string()]; new_uid = root_uid.clone(); }
             "MyFiles" => { new_path = vec!["MyFiles".to_string()]; new_uid = root_uid.clone(); }
             "Trash" => { new_path = vec!["Trash".to_string()]; new_uid = None; }
+            "Photos" => { new_path = vec!["Photos".to_string()]; new_uid = None; }
+            "Computers" => { new_path = vec!["Computers".to_string()]; new_uid = None; }
             name => {
                 if let Some(uid) = new_uid.clone() {
                     if let Ok(Some(node)) = cache.get_child_by_name(&uid.volume_id, Some(&uid.link_id), name) {

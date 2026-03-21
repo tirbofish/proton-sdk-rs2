@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use fuser::MountOption;
 use super::helpers::new_spinner;
 use super::sync::run_events_loop;
+use proton_drive_sdk::photo::ProtonPhotosClient;
+use proton_drive_sdk::links::LinkId;
 
 pub async fn mount_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Result<()> {
     if args.is_empty() {
@@ -22,19 +24,59 @@ pub async fn mount_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Resu
         anyhow::bail!("Permission denied: cannot access mount point '{}'. Try a path in your home directory like '~/ProtonDrive'.", mount_point.display());
     }
 
-    let (client, volume_id, root_link_id, cache) = {
+    let (client, volume_id, root_link_id, cache, photos_client) = {
         let s = state.lock();
         let client = s.get_client().cloned().ok_or_else(|| anyhow::anyhow!("Not authenticated"))?;
         let root_uid = s.get_root_node_uid().cloned().ok_or_else(|| anyhow::anyhow!("Root node not found"))?;
         let cache = s.get_cache().ok_or_else(|| anyhow::anyhow!("Cache not initialized"))?;
-        (client, root_uid.volume_id, root_uid.link_id, cache)
+        let photos_client = s
+            .get_session()
+            .and_then(|sess| ProtonPhotosClient::new(sess, None).ok());
+        (client, root_uid.volume_id, root_uid.link_id, cache, photos_client)
     };
+
+    // Resolve Photos volume and root folder (best-effort; FUSE still mounts if this fails).
+    let sp_meta = new_spinner("Resolving Photos & Computers metadata...");
+    let (photos_volume_id, photos_root_link_id) = match photos_client {
+        Some(photos) => match photos.get_photos_root_folder().await {
+            Ok(root_folder) => {
+                let vid = root_folder.base.uid.volume_id.clone();
+                let lid = root_folder.base.uid.link_id.clone();
+                (Some(vid), Some(lid))
+            }
+            Err(e) => {
+                eprintln!("  [mount] Photos unavailable: {e}");
+                (None, None)
+            }
+        },
+        None => (None, None),
+    };
+
+    // Resolve Computers list (best-effort).
+    let computers: Vec<(String, String, proton_drive_sdk::volume::VolumeId, LinkId)> =
+        match client.list_devices().await {
+            Ok(devices) => devices
+                .into_iter()
+                .map(|d| {
+                    let root_link = d.root_uid.link_id.clone();
+                    (d.device_id, d.name, d.volume_id, root_link)
+                })
+                .collect(),
+            Err(e) => {
+                eprintln!("  [mount] Computers unavailable: {e}");
+                vec![]
+            }
+        };
+    sp_meta.finish_and_clear();
 
     let fs = ProtonDriveFS {
         client: client.clone(),
         cache: cache.clone(),
         volume_id: volume_id.clone(),
         root_link_id: root_link_id.clone(),
+        photos_volume_id,
+        photos_root_link_id,
+        computers,
         mount_point: mount_point.clone(),
         pending_downloads: Default::default(),
         pending_uploads: Default::default(),

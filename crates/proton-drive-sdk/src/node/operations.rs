@@ -424,6 +424,97 @@ impl NodeOperations {
         Ok(())
     }
 
+    /// Server-side copy: re-encrypts the node's key material under the
+    /// destination parent's key and calls the copy endpoint. No file data
+    /// is transferred — the server creates a new link pointing to the same
+    /// revision.
+    pub async fn copy_single(
+        client: &ProtonDriveClient,
+        uid: NodeUid,
+        new_parent_uid: NodeUid,
+        new_name: Option<String>,
+    ) -> anyhow::Result<crate::links::LinkId> {
+        let membership_address = Self::get_membership_address(client, &new_parent_uid).await?;
+        let signing_key = client
+            .account()
+            .get_address_primary_private_key(&crate::account::AddressId::new(
+                membership_address.address_id.clone(),
+            ))
+            .await?;
+
+        let destination_folder_secrets =
+            crate::node::folder::FolderOperations::get_secrets(client, new_parent_uid.clone())
+                .await?;
+
+        let metadata_result =
+            crate::node::DtoToMetadataConverter::get_fresh_node_metadata(client, uid.clone(), None)
+                .await?;
+        let (node, node_and_secrets, _membership_share_id, _origin_name_hash_digest) =
+            metadata_result.result()?.deconstruct();
+        let secrets = match node_and_secrets {
+            crate::node::NodeAndSecrets::File(_, s) => s.base,
+            crate::node::NodeAndSecrets::Folder(_, s) => s.base,
+        };
+
+        let name_to_use = new_name.unwrap_or_else(|| match &node {
+            Node::Folder(f) => f.base.name.clone(),
+            Node::File(f) | Node::Photo(f) => f.base.base.name.clone(),
+            Node::Album(f) => f.base.name.clone(),
+        });
+
+        let encrypted_name = crate::node::crypto::NodeCrypto::encrypt_name(
+            &name_to_use,
+            &secrets.name_session_key,
+            &destination_folder_secrets.base.key,
+            &PgpPrivateKey(signing_key.clone()),
+        )?;
+
+        let mut hmac = HmacSha256::new_from_slice(&destination_folder_secrets.hash_key)?;
+        Mac::update(&mut hmac, name_to_use.as_bytes());
+        let name_hash_digest = Mac::finalize(hmac).into_bytes().to_vec();
+
+        let is_anonymous = secrets.passphrase_for_anonymous_move.is_some();
+        let (encrypted_passphrase, passphrase_signature, signature_email_address) = if is_anonymous {
+            let (passphrase, sig, _) = crate::node::crypto::NodeCrypto::encrypt_and_sign_passphrase(
+                &secrets.passphrase_session_key.key,
+                &destination_folder_secrets.base.key,
+                &PgpPrivateKey(signing_key.clone()),
+            )?;
+            (passphrase, sig, Some(membership_address.email_address.clone()))
+        } else {
+            let passphrase = crate::node::crypto::NodeCrypto::reencrypt_passphrase(
+                &secrets.passphrase_session_key.key,
+                secrets.passphrase_pgp_session_key.as_ref(),
+                &destination_folder_secrets.base.key,
+                &PgpPrivateKey(signing_key.clone()),
+            )?;
+            (passphrase, None, None)
+        };
+
+        let request = crate::api::links::CopyLinkRequest {
+            target_volume_id: new_parent_uid.volume_id.clone(),
+            target_parent_link_id: new_parent_uid.link_id.clone(),
+            name: encrypted_name,
+            passphrase: encrypted_passphrase,
+            name_hash_digest,
+            name_signature_email_address: membership_address.email_address.clone(),
+            passphrase_signature,
+            signature_email_address,
+        };
+
+        let response = client
+            .api()
+            .links()
+            .copy_link(
+                uid.volume_id.clone(),
+                uid.link_id.clone(),
+                request,
+            )
+            .await?;
+
+        Ok(response.link_id)
+    }
+
     pub async fn rename(
         client: &ProtonDriveClient,
         uid: NodeUid,

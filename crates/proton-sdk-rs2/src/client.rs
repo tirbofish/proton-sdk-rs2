@@ -30,6 +30,7 @@ pub struct ProtonClientOptions {
 }
 
 pub struct ProtonClientConfiguration {
+    /// Base URL used for the drive API. 
     pub base_url: http::Uri,
     pub app_version: semver::Version,
     pub user_agent: String,

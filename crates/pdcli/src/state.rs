@@ -1,4 +1,5 @@
 use crate::rusqlite_cache::RusqliteCache;
+use crate::settings::Settings;
 use proton_drive_sdk::client::ProtonDriveClient;
 use proton_drive_sdk::node::NodeUid;
 use proton_sdk_rs2::session::ProtonAPISession;
@@ -20,6 +21,8 @@ pub struct ReplState {
     current_node_uid: Option<NodeUid>,
     /// My Files root node UID (for '/' navigation)
     root_node_uid: Option<NodeUid>,
+    /// Photos root node UID (photos volume root folder)
+    photos_root_node_uid: Option<NodeUid>,
     /// Username of authenticated user
     username: Option<String>,
     /// Current sync status message
@@ -28,6 +31,8 @@ pub struct ReplState {
     cancelled: AtomicBool,
     /// Active FUSE mount point (for auto-unmount on exit)
     mount_point: Option<PathBuf>,
+    /// Application settings
+    settings: Settings,
 }
 
 impl ReplState {
@@ -39,10 +44,12 @@ impl ReplState {
             current_path: vec!["MyFiles".to_string()],
             current_node_uid: None,
             root_node_uid: None,
+            photos_root_node_uid: None,
             username: None,
             sync_status: Arc::new(parking_lot::RwLock::new(None)),
             cancelled: AtomicBool::new(false),
             mount_point: None,
+            settings: Settings::default(),
         }
     }
 
@@ -68,6 +75,10 @@ impl ReplState {
 
     pub fn set_session(&mut self, session: ProtonAPISession) {
         self.session = Some(session);
+    }
+
+    pub fn get_session(&self) -> Option<&ProtonAPISession> {
+        self.session.as_ref()
     }
 
     pub fn set_client(&mut self, client: ProtonDriveClient) {
@@ -129,6 +140,7 @@ impl ReplState {
         self.current_path = vec!["MyFiles".to_string()];
         self.current_node_uid = None;
         self.root_node_uid = None;
+        self.photos_root_node_uid = None;
     }
 
     pub fn clear_cancelled(&self) {
@@ -141,5 +153,17 @@ impl ReplState {
 
     pub fn get_mount_point(&self) -> Option<&PathBuf> {
         self.mount_point.as_ref()
+    }
+
+    pub fn set_settings(&mut self, settings: Settings) {
+        self.settings = settings;
+    }
+
+    pub fn get_settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    pub fn get_settings_mut(&mut self) -> &mut Settings {
+        &mut self.settings
     }
 }

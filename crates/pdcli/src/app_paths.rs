@@ -8,6 +8,7 @@ pub struct AppDataPaths {
     pub secrets_cache_path: PathBuf,
     pub history_path: PathBuf,
     pub cache_dir: PathBuf,
+    pub settings_path: PathBuf,
 }
 
 pub fn resolve_paths() -> Result<AppDataPaths> {
@@ -22,6 +23,7 @@ pub fn resolve_paths() -> Result<AppDataPaths> {
         credentials_path: app_dirs.config_dir.join("cred.ron"),
         secrets_cache_path: app_dirs.data_dir.join("cache.json"),
         history_path: app_dirs.data_dir.join("history.txt"),
+        settings_path: app_dirs.config_dir.join("settings.toml"),
         cache_dir: app_dirs.cache_dir,
     })
 }

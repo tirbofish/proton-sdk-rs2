@@ -60,6 +60,13 @@ pub trait LinksApiClient: Send + Sync {
         folder_id: LinkId,
         request: NodeNameAvailabilityRequest,
     ) -> anyhow::Result<NodeNameAvailabilityResponse>;
+
+    async fn copy_link(
+        &self,
+        volume_id: VolumeId,
+        link_id: LinkId,
+        request: CopyLinkRequest,
+    ) -> anyhow::Result<CopyLinkResponse>;
 }
 
 use proton_sdk_rs2::auth::TokenCredential;
@@ -242,6 +249,27 @@ impl LinksApiClient for DefaultLinksApiClient {
             .await?
             .json::<NodeNameAvailabilityResponse>()
             .await?)
+    }
+
+    async fn copy_link(
+        &self,
+        volume_id: VolumeId,
+        link_id: LinkId,
+        request: CopyLinkRequest,
+    ) -> anyhow::Result<CopyLinkResponse> {
+        let url = self.base_url.join(&format!(
+            "volumes/{}/links/{}/copy",
+            volume_id.raw(),
+            link_id.raw()
+        ))?;
+        let builder = self.client.post(url).json(&request);
+        let builder = self.add_auth_headers(builder).await?;
+        let response = builder.send().await?;
+        let text = response.text().await?;
+        tracing::debug!(body = %text, "copy_link response received");
+        let api_response = serde_json::from_str::<crate::api::ApiResponse>(&text)?;
+        api_response.to_result()?;
+        Ok(serde_json::from_str::<CopyLinkResponse>(&text)?)
     }
 }
 
@@ -512,6 +540,42 @@ pub struct MoveSingleLinkRequest {
 pub struct MultipleLinksNullaryRequest {
     #[serde(rename = "LinkIDs")]
     pub link_ids: Vec<LinkId>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct CopyLinkRequest {
+    #[serde(rename = "TargetVolumeID")]
+    pub target_volume_id: VolumeId,
+
+    #[serde(rename = "TargetParentLinkID")]
+    pub target_parent_link_id: LinkId,
+
+    #[serde(rename = "Name")]
+    pub name: PgpArmoredMessage,
+
+    #[serde(rename = "NodePassphrase")]
+    pub passphrase: PgpArmoredMessage,
+
+    #[serde(rename = "Hash")]
+    #[serde(with = "crate::utils::serde::forgiving_hex_bytes")]
+    pub name_hash_digest: Vec<u8>,
+
+    #[serde(rename = "NameSignatureEmail")]
+    pub name_signature_email_address: String,
+
+    #[serde(rename = "NodePassphraseSignature")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passphrase_signature: Option<PgpArmoredSignature>,
+
+    #[serde(rename = "SignatureEmail")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature_email_address: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CopyLinkResponse {
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
 }
 
 #[derive(Debug, Serialize)]

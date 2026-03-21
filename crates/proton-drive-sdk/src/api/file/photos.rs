@@ -1,11 +1,12 @@
 use crate::account::{AddressId, AddressKeyId};
+use crate::api::devices::DevicesApiClient;
 use crate::api::events::{DefaultEventsApiClient, EventsApiClient};
 use crate::api::file::{DefaultFilesApiClient, FileDto, FilesApiClient};
 use crate::api::folder::{DefaultFoldersApiClient, FoldersApiClient};
 use crate::api::links::{
-    DefaultLinksApiClient, LinkDetailsDto, LinkDetailsRequest, LinkDetailsResponse,
-    LinkIdResponsePair, LinksApiClient, MoveMultipleLinksRequest, MoveSingleLinkRequest,
-    RenameLinkRequest,
+    CopyLinkRequest, CopyLinkResponse, DefaultLinksApiClient, LinkDetailsDto, LinkDetailsRequest,
+    LinkDetailsResponse, LinkIdResponsePair, LinksApiClient, MoveMultipleLinksRequest,
+    MoveSingleLinkRequest, RenameLinkRequest,
 };
 use crate::api::node::{NodeNameAvailabilityRequest, NodeNameAvailabilityResponse};
 use crate::api::share::{
@@ -393,6 +394,15 @@ impl LinksApiClient for PhotosLinksApiClient {
             .get_available_names(volume_id, folder_id, request)
             .await
     }
+
+    async fn copy_link(
+        &self,
+        volume_id: VolumeId,
+        link_id: LinkId,
+        request: CopyLinkRequest,
+    ) -> anyhow::Result<CopyLinkResponse> {
+        self.drive.copy_link(volume_id, link_id, request).await
+    }
 }
 
 /// Concrete implementation of `DriveApiClients` for the Photos context.
@@ -405,6 +415,7 @@ pub struct PhotosApiClients {
     storage: Arc<DefaultStorageApiClient>,
     trash: Arc<DefaultTrashApiClient>,
     events: Arc<DefaultEventsApiClient>,
+    devices: Arc<crate::api::devices::DefaultDevicesApiClient>,
 }
 
 impl PhotosApiClients {
@@ -454,6 +465,11 @@ impl PhotosApiClients {
                 token_credential.clone(),
             )),
             events: Arc::new(DefaultEventsApiClient::new(
+                default_client.clone(),
+                default_api_base_url.clone(),
+                token_credential.clone(),
+            )),
+            devices: Arc::new(crate::api::devices::DefaultDevicesApiClient::new(
                 default_client,
                 default_api_base_url,
                 token_credential,
@@ -486,5 +502,9 @@ impl DriveApiClients for PhotosApiClients {
     }
     fn events(&self) -> Arc<dyn EventsApiClient> {
         self.events.clone()
+    }
+
+    fn devices(&self) -> Arc<dyn DevicesApiClient> {
+        self.devices.clone()
     }
 }

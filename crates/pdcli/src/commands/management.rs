@@ -20,7 +20,7 @@ pub async fn mkdir_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Resu
     }
     let name = args[0].to_string();
     
-    let (client, parent_uid) = {
+    let (client, parent_uid, cache) = {
         let s = state.lock();
         let c = s
             .get_client()
@@ -30,14 +30,48 @@ pub async fn mkdir_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Resu
             .get_current_node_uid()
             .ok_or_else(|| anyhow!("No current directory"))?
             .clone();
-        (c, u)
+        let cache = s.get_cache();
+        (c, u, cache)
     };
 
+    // Frontend-first: insert a provisional folder in the cache immediately.
+    let provisional_id = format!("pending:{}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0));
+    if let Some(ref c) = cache {
+        let _ = c.insert_provisional_node(
+            &parent_uid.volume_id,
+            &provisional_id,
+            Some(&parent_uid.link_id),
+            &name,
+            "Folder",
+            None,
+        );
+    }
+
     let sp = new_spinner(format!("Creating '{}'...", name));
-    let new_folder = client.create_folder(parent_uid, name.clone(), None).await?;
+    let result = client.create_folder(parent_uid.clone(), name.clone(), None).await;
     sp.finish_and_clear();
-    println!("Created: {} ({})", name, new_folder.base.uid);
-    Ok(())
+
+    match result {
+        Ok(new_folder) => {
+            // Replace provisional with the real node.
+            if let Some(ref c) = cache {
+                let _ = c.delete_node(&parent_uid.volume_id, &proton_drive_sdk::links::LinkId::new(provisional_id));
+                let _ = c.upsert_node(&Node::Folder(new_folder.clone()), false);
+            }
+            println!("Created: {}", name);
+            Ok(())
+        }
+        Err(e) => {
+            // Revert provisional entry.
+            if let Some(ref c) = cache {
+                let _ = c.delete_node(&parent_uid.volume_id, &proton_drive_sdk::links::LinkId::new(provisional_id));
+            }
+            Err(e)
+        }
+    }
 }
 
 pub async fn move_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Result<()> {
@@ -186,18 +220,44 @@ pub async fn move_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Resul
         }
     };
 
-    if target_folder_uid != *node.base().parent_uid.as_ref().unwrap_or(&target_folder_uid) {
-        client.move_nodes(vec![node_uid.clone()], target_folder_uid.clone()).await?;
+    let needs_move = target_folder_uid != *node.base().parent_uid.as_ref().unwrap_or(&target_folder_uid);
+    let needs_rename = final_name != node.base().name;
+
+    // Frontend-first: apply name/parent change to cache optimistically.
+    if let Some(ref c) = cache {
+        let new_parent = if needs_move { Some(&target_folder_uid.link_id) } else { None };
+        let new_name = if needs_rename { Some(final_name.as_str()) } else { None };
+        let _ = c.rename_cached_node(&node_uid.volume_id, &node_uid.link_id, new_name, new_parent);
     }
 
-    if final_name != node.base().name {
-        client.rename_node(node_uid.clone(), final_name.clone(), None).await?;
+    let move_result = if needs_move {
+        Some(client.move_nodes(vec![node_uid.clone()], target_folder_uid.clone()).await)
+    } else { None };
+
+    if let Some(Err(e)) = move_result {
+        // Revert: restore original parent/name in cache.
+        if let Some(ref c) = cache {
+            let orig_parent = node.base().parent_uid.as_ref().map(|p| &p.link_id);
+            let _ = c.rename_cached_node(&node_uid.volume_id, &node_uid.link_id, Some(&node.base().name), orig_parent);
+        }
+        return Err(e);
     }
 
-    // Targeted cache update: delete the stale entry then fetch just the moved/renamed
-    // node — avoids a full list_children round-trip that re-fetches the whole folder.
-    if let Some(c) = cache {
-        let _ = c.delete_node(&node_uid.volume_id, &node_uid.link_id);
+    let rename_result = if needs_rename {
+        Some(client.rename_node(node_uid.clone(), final_name.clone(), None).await)
+    } else { None };
+
+    if let Some(Err(e)) = rename_result {
+        // Revert cache name.
+        if let Some(ref c) = cache {
+            let orig_parent = node.base().parent_uid.as_ref().map(|p| &p.link_id);
+            let _ = c.rename_cached_node(&node_uid.volume_id, &node_uid.link_id, Some(&node.base().name), orig_parent);
+        }
+        return Err(e);
+    }
+
+    // Fetch the authoritative node from the server to replace the optimistic entry.
+    if let Some(ref c) = cache {
         if let Ok(PotentialObject::Node(fresh)) = client.get_node(node_uid.clone()).await {
             let _ = c.upsert_node(&fresh, false);
         }
@@ -331,31 +391,52 @@ pub async fn remove_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Res
     let mut seen = HashSet::new();
     to_trash.retain(|uid| seen.insert(uid.clone()));
 
+    // Frontend-first: mark nodes as trashed in cache immediately so ls reflects
+    // the change without waiting for the network round-trip.
+    if let Some(ref c) = cache {
+        for uid in &to_trash {
+            let _ = c.mark_node_trashed(&uid.volume_id, &uid.link_id);
+        }
+    }
+
     let sp = new_spinner(format!("Trashing {} item(s)...", to_trash.len()));
-    let result = client.trash_nodes(to_trash.clone()).await?;
+    let result = client.trash_nodes(to_trash.clone()).await;
     sp.finish_and_clear();
-    let mut failed = 0usize;
+
+    let result = match result {
+        Ok(r) => r,
+        Err(e) => {
+            // Revert optimistic cache update on full failure.
+            if let Some(ref c) = cache {
+                for uid in &to_trash {
+                    let _ = c.mark_node_untrashed(&uid.volume_id, &uid.link_id);
+                }
+            }
+            return Err(e);
+        }
+    };
+
+    let mut failed_uids = Vec::new();
     for uid in &to_trash {
         if let Some(Err(err)) = result.get(uid) {
-            failed += 1;
+            failed_uids.push(uid.clone());
             match client.get_node(uid.clone()).await {
                 Ok(PotentialObject::Node(node)) => {
-                    eprintln!(
-                        "Failed to trash '{}'(uid={}): {}",
-                        node.base().name,
-                        uid,
-                        err
-                    );
+                    eprintln!("Failed to trash '{}'(uid={}): {}", node.base().name, uid, err);
                 }
-                _ => {
-                    eprintln!("Failed to trash uid={}: {}", uid, err);
-                }
+                _ => eprintln!("Failed to trash uid={}: {}", uid, err),
             }
         }
     }
 
-    if failed > 0 {
-        return Err(anyhow!("{} item(s) failed to trash", failed));
+    // Revert only the nodes that failed.
+    if !failed_uids.is_empty() {
+        if let Some(ref c) = cache {
+            for uid in &failed_uids {
+                let _ = c.mark_node_untrashed(&uid.volume_id, &uid.link_id);
+            }
+        }
+        return Err(anyhow!("{} item(s) failed to trash", failed_uids.len()));
     }
 
     println!("Trashed {} item(s)", to_trash.len());
@@ -439,21 +520,43 @@ pub async fn drop_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Resul
         return Ok(());
     }
 
+    // Frontend-first: remove from cache immediately so ls is up to date.
+    let cache = state.lock().get_cache();
+    if let Some(ref c) = cache {
+        for uid in &to_delete {
+            let _ = c.delete_node(&uid.volume_id, &uid.link_id);
+        }
+    }
+
     let sp = new_spinner(format!("Permanently deleting {} item(s)...", to_delete.len()));
-    let result = client.delete_nodes_from_trash(to_delete.clone()).await?;
+    let result = client.delete_nodes_from_trash(to_delete.clone()).await;
     sp.finish_and_clear();
+
+    let result = match result {
+        Ok(r) => r,
+        Err(e) => {
+            // Revert: re-mark them as trashed so they appear in trash again.
+            if let Some(ref c) = cache {
+                for uid in &to_delete {
+                    if let Ok(Some(cn)) = c.get_node_by_uid(&uid.volume_id, &uid.link_id) {
+                        // Already re-inserted if re-upsert is possible; otherwise just re-mark.
+                        let _ = c.mark_node_trashed(&uid.volume_id, &uid.link_id);
+                        let _ = cn; // suppress warning
+                    }
+                }
+            }
+            return Err(e);
+        }
+    };
+
     let mut failed = 0usize;
     for uid in &to_delete {
         if let Some(Err(err)) = result.get(uid) {
             failed += 1;
-            let name = names_by_uid
-                .get(uid)
-                .map(String::as_str)
-                .unwrap_or("<unknown>");
+            let name = names_by_uid.get(uid).map(String::as_str).unwrap_or("<unknown>");
             eprintln!("Failed to drop '{}'(uid={}): {}", name, uid, err);
         }
     }
-
     if failed > 0 {
         return Err(anyhow!("{} item(s) failed to drop", failed));
     }
@@ -524,27 +627,48 @@ pub async fn restore_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Re
         return Err(anyhow!("Nothing matched"));
     }
 
+    // Frontend-first: mark nodes as untrashed so ls /Trash no longer shows them.
+    let cache = state.lock().get_cache();
+    if let Some(ref c) = cache {
+        for uid in &to_restore {
+            let _ = c.mark_node_untrashed(&uid.volume_id, &uid.link_id);
+        }
+    }
+
     let sp = new_spinner(format!("Restoring {} item(s)...", to_restore.len()));
-    let result = client.restore_nodes(to_restore.clone()).await?;
+    let result = client.restore_nodes(to_restore.clone()).await;
     sp.finish_and_clear();
-    let mut failed = 0usize;
+
+    let result = match result {
+        Ok(r) => r,
+        Err(e) => {
+            // Revert optimistic update.
+            if let Some(ref c) = cache {
+                for uid in &to_restore {
+                    let _ = c.mark_node_trashed(&uid.volume_id, &uid.link_id);
+                }
+            }
+            return Err(e);
+        }
+    };
+
+    let mut failed_uids = Vec::new();
     for uid in &to_restore {
         if let Some(Err(err)) = result.get(uid) {
-            failed += 1;
+            failed_uids.push(uid.clone());
             let name = names_by_uid.get(uid).map(String::as_str).unwrap_or("<unknown>");
             eprintln!("Failed to restore '{}' (uid={}): {}", name, uid, err);
         }
     }
 
-    if failed > 0 {
-        return Err(anyhow!("{} item(s) failed to restore", failed));
-    }
-
-    // Evict restored nodes from trash in local cache
-    if let Some(cache) = state.lock().get_cache() {
-        for uid in &to_restore {
-            let _ = cache.delete_node(&uid.volume_id, &uid.link_id);
+    if !failed_uids.is_empty() {
+        // Revert only the ones that failed.
+        if let Some(ref c) = cache {
+            for uid in &failed_uids {
+                let _ = c.mark_node_trashed(&uid.volume_id, &uid.link_id);
+            }
         }
+        return Err(anyhow!("{} item(s) failed to restore", failed_uids.len()));
     }
 
     println!("Restored {} item(s)", to_restore.len());
@@ -640,5 +764,89 @@ pub async fn stat_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Resul
             }
         }
     }
+    Ok(())
+}
+
+pub async fn cp_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Result<()> {
+    if args.len() < 2 {
+        return Err(anyhow!("Usage: cp <src_name|pattern> <dst_name>"));
+    }
+
+    let src = args[0];
+    let dst = args[1];
+
+    let (client, current_uid, root_uid, current_path, cache) = {
+        let s = state.lock();
+        let client = s
+            .get_client()
+            .ok_or_else(|| anyhow!("Not authenticated. Use 'login' first."))?
+            .clone();
+        let uid = s
+            .get_current_node_uid()
+            .ok_or_else(|| anyhow!("No current directory"))?
+            .clone();
+        let root_uid = s
+            .get_root_node_uid()
+            .ok_or_else(|| anyhow!("Root unknown; please re-login"))?
+            .clone();
+        let cache = s.get_cache();
+        (client, uid, root_uid, s.get_current_path().to_vec(), cache)
+    };
+
+    // Resolve the source node
+    let (src_parent, src_leaf) = split_parent_and_leaf(src);
+    let src_folder_uid = if src_parent == "." {
+        current_uid.clone()
+    } else {
+        resolve_folder_path(
+            &client,
+            current_uid.clone(),
+            current_path.clone(),
+            root_uid.clone(),
+            src_parent,
+            cache.as_deref(),
+        )
+        .await?
+        .0
+    };
+
+    let src_node = find_child_by_name(&client, src_folder_uid, src_leaf, cache.as_deref()).await?;
+    let src_uid = src_node.uid().clone();
+    let src_name = src_node.base().name.clone();
+
+    // Determine the copy name
+    let new_name = if dst.is_empty() || dst == "." {
+        let original_name = &src_name;
+        if let Some(dot_pos) = original_name.rfind('.') {
+            let (name, ext) = original_name.split_at(dot_pos);
+            format!("{} (copy){}", name, ext)
+        } else {
+            format!("{} (copy)", original_name)
+        }
+    } else {
+        dst.to_string()
+    };
+
+    let sp = new_spinner(format!("Copying '{}' → '{}'...", src_name, new_name));
+
+    // Server-side copy: re-encrypts keys and calls the copy endpoint.
+    // No file data is downloaded or uploaded.
+    let new_link_id = client
+        .copy_node(src_uid.clone(), current_uid.clone(), Some(new_name.clone()))
+        .await;
+
+    sp.finish_and_clear();
+
+    let new_link_id = new_link_id?;
+
+    // Fetch the new node and insert it into the cache
+    if let Some(ref c) = cache {
+        let new_uid = proton_drive_sdk::node::NodeUid::new(src_uid.volume_id.clone(), new_link_id);
+        if let Ok(proton_drive_sdk::utils::PotentialObject::Node(fresh)) = client.get_node(new_uid).await {
+            let _ = c.upsert_node(&fresh, false);
+        }
+    }
+
+    println!("Copied '{}' → '{}'", src_name, new_name);
     Ok(())
 }

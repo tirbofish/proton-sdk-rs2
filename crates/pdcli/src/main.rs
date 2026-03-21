@@ -5,6 +5,7 @@ mod file_cache;
 mod rusqlite_cache;
 mod state;
 mod fuse;
+mod settings;
 
 use anyhow::Result;
 use indicatif::ProgressBar;
@@ -90,12 +91,17 @@ async fn main() -> Result<()> {
     println!("ProtonDrive CLI");
 
     let init_spinner = ProgressBar::new_spinner();
-    init_spinner.set_message("Initializing...");
+    init_spinner.set_message("Initialising...");
     init_spinner.enable_steady_tick(Duration::from_millis(100));
     
-    let state = Arc::new(Mutex::new(ReplState::new()));
+    let mut state = ReplState::new();
     let paths = resolve_paths()?;
     
+    // Load settings
+    let settings = commands::settings::load_settings(&paths)?;
+    state.set_settings(settings);
+    
+    let state = Arc::new(Mutex::new(state));
     let cache_path = paths.cache_dir.join("drive_cache.db");
     let cache = Arc::new(rusqlite_cache::RusqliteCache::new(&cache_path)?);
     state.lock().set_cache(cache.clone());
@@ -114,21 +120,33 @@ async fn main() -> Result<()> {
         if let Err(error) = commands::apply_authenticated_session_with_options(&state, session, username, cli_args.is_empty()).await {
             eprintln!("Failed to restore session: {error}");
         } else {
-            let (client, volume_id, cache, local_root) = {
+            let (client, volume_id, cache, local_root, index_mode) = {
                 let s = state.lock();
                 let c = s.get_client().expect("client exists").clone();
                 let root = s.get_root_node_uid().expect("root exists");
                 let ca = s.get_cache().expect("cache exists").clone();
                 let v = root.volume_id.clone();
                 let lr = ca.get_sync_state(&v).ok().flatten().and_then(|(_, r)| r);
-                (c, v, ca, lr)
+                let mode = s.get_settings().indexing.mode;
+                (c, v, ca, lr, mode)
             };
 
-            // Block here until initial indexing is done so the REPL is fully
-            // navigable as soon as it appears.
-            state.lock().set_sync_status(Some("Indexing...".to_string()));
-            if let Err(e) = commands::sync::run_initial_sync(&client, &volume_id, &cache, local_root.clone(), &state).await {
-                eprintln!("Initial sync warning: {e}");
+            use crate::settings::IndexMode;
+            match index_mode {
+                IndexMode::IndexOnInit => {
+                    state.lock().set_sync_status(Some("Indexing...".to_string()));
+                    if let Err(e) = commands::sync::run_initial_sync(&client, &volume_id, &cache, local_root.clone(), &state).await {
+                        eprintln!("Initial sync warning: {e}");
+                    }
+                }
+                IndexMode::IndexOnDemand => {
+                    // Minimal setup: snapshot the event cursor and root children only.
+                    state.lock().set_sync_status(Some("Ready".to_string()));
+                    if let Err(e) = commands::sync::run_minimal_sync(&client, &volume_id, &cache, local_root.clone()).await {
+                        eprintln!("Sync warning: {e}");
+                    }
+                    state.lock().set_sync_status(Some("Up to date (Idle)".to_string()));
+                }
             }
 
             // Spawn the events loop in the background — it runs forever.
@@ -247,6 +265,7 @@ async fn dispatch_command(
         "cd" => { commands::cd_command(&args, state).await?; Ok(false) }
         "mkdir" => { commands::mkdir_command(&args, state).await?; Ok(false) }
         "mv" => { commands::move_command(&args, state).await?; Ok(false) }
+        "cp" => { commands::cp_command(&args, state).await?; Ok(false) }
         "stat" => { commands::stat_command(&args, state).await?; Ok(false) }
         "rm" => { commands::remove_command(&args, state).await?; Ok(false) }
         "drop" => { commands::drop_command(&args, state).await?; Ok(false) }
@@ -254,8 +273,11 @@ async fn dispatch_command(
         "get" => { commands::download_command(&args, state).await?; Ok(false) }
         "put" => { commands::upload_command(&args, state).await?; Ok(false) }
         "hydrate" => { commands::hydrate_command(&args, state).await?; Ok(false) }
-        "sync" => { commands::sync_command(&args, state).await?; Ok(false) }
         "cache" => { commands::cache_command(&args, state).await?; Ok(false) }
+        "computers" => { commands::computers_command(&args, state).await?; Ok(false) }
+        "photos" => { commands::photos_command(&args, state).await?; Ok(false) }
+        "sync" => { commands::sync_command(&args, state).await?; Ok(false) }
+        "settings" => { commands::settings_command(&args, state).await?; Ok(false) }
         "mount" => {
             commands::mount_command(&args, state).await?;
             Ok(false)
@@ -284,10 +306,23 @@ NAVIGATION:
   pwd, ls [path], cd [path]
 
 FILE OPERATIONS:
-  mkdir, mv, rm, drop, stat
+  mkdir, mv, cp, rm, drop, stat, restore
 
 TRANSFER:
-  get, put, hydrate, sync, cache, mount, umount
+  get, put, hydrate, cache, mount, umount
+
+PHOTOS:
+  photos ls                  Show photo library timeline summary
+  photos get <id> <path>     Download a photo by link ID
+
+COMPUTERS:
+  computers ls               List registered computers
+  computers add <name>       Register a new computer
+  computers rename <id> <n>  Rename a computer
+  computers rm <id>          Unregister a computer
+
+SETTINGS:
+  settings
 
 OTHER:
   help [command], clear, exit
@@ -297,8 +332,11 @@ OTHER:
 
 fn show_command_help(cmd: &str) {
     match cmd {
-        "sync" => println!("COMMAND: sync <local_path>\nStart background sync with SQLite caching."),
+        "cp" => println!("COMMAND: cp <src_name> <dst_name>\nCreate a copy of a file or folder."),
         "cache" => println!("COMMAND: cache <get|clear>\nManage local data and SQLite database."),
+        "computers" => println!("COMMAND: computers [ls|add|rename|rm]\nManage registered Computers (backup devices). Run 'computers help' for details."),
+        "photos" => println!("COMMAND: photos [ls|get]\nBrowse and download your Proton Drive photo library. Run 'photos help' for details."),
+        "settings" => println!("COMMAND: settings [display|reset]\nManage application settings (indexing, mounting, etc.). Run without args for interactive menu."),
         "mount" => println!("COMMAND: mount <mount_point>\nMount Drive as a local FUSE filesystem."),
         "hydrate" => println!("COMMAND: hydrate <path>\nDownload a file to the persistent cache for offline FUSE access."),
         _ => println!("Use 'help' to see all commands."),

@@ -27,7 +27,7 @@ You can check it out [here](https://github.com/tirbofish/proton-sdk-rs)
 - [x] thumbnails
 - [ ] photos + albums (partial implementation right now)
 - [ ] some good documentation
-- [ ] events (doable, not in c# library but available in js lib)
+- [x] events (doable, not in c# library but available in js lib)
 - repl
     - [ ] use sql cache and events to make fetching files faster
 

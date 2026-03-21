@@ -19,6 +19,9 @@ const INO_ROOT: u64 = 1;
 const INO_MYFILES: u64 = 2;
 const INO_TRASH: u64 = 3;
 const INO_PHOTOS: u64 = 4;
+const INO_COMPUTERS: u64 = 5;
+/// Synthetic inodes for individual computer root directories (range 50..99).
+const INO_COMP_BASE: u64 = 50;
 const INO_START: u64 = 100;
 
 type DownloadWaiter = Arc<(PLMutex<Option<Result<PathBuf, String>>>, PLCondvar)>;
@@ -34,6 +37,11 @@ pub struct ProtonDriveFS {
     pub cache: Arc<RusqliteCache>,
     pub volume_id: VolumeId,
     pub root_link_id: LinkId,
+    /// Photos volume ID + root folder link (None if photos could not be resolved).
+    pub photos_volume_id: Option<VolumeId>,
+    pub photos_root_link_id: Option<LinkId>,
+    /// Computers: (device_id, display_name, volume_id, root_link_id)
+    pub computers: Vec<(String, String, VolumeId, LinkId)>,
     pub mount_point: PathBuf,
     pub pending_downloads: HashMap<String, DownloadWaiter>,
     pub pending_uploads: HashMap<u64, UploadBuffer>,
@@ -115,6 +123,11 @@ impl ProtonDriveFS {
         match parent {
             INO_MYFILES => Some(Some(self.root_link_id.clone())),
             INO_TRASH => Some(None),
+            p if p >= INO_COMP_BASE && p < INO_START => {
+                // Computer root dir: return the device's root link.
+                let idx = (p - INO_COMP_BASE) as usize;
+                self.computers.get(idx).map(|(_, _, _, root)| Some(root.clone()))
+            }
             _ if parent >= INO_START => {
                 self.cache
                     .get_node_by_inode(parent - INO_START)
@@ -268,7 +281,8 @@ impl Filesystem for ProtonDriveFS {
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         match ino {
-            INO_ROOT | INO_MYFILES | INO_TRASH | INO_PHOTOS => reply.attr(&TTL, &self.vdir_attr(ino)),
+            INO_ROOT | INO_MYFILES | INO_TRASH | INO_PHOTOS | INO_COMPUTERS => reply.attr(&TTL, &self.vdir_attr(ino)),
+            p if p >= INO_COMP_BASE && p < INO_START => reply.attr(&TTL, &self.vdir_attr(p)),
             _ if ino >= INO_START => {
                 match self.cache.get_node_by_inode(ino - INO_START) {
                     Ok(Some(node)) => reply.attr(&TTL, &self.node_to_attr(&node)),
@@ -286,6 +300,7 @@ impl Filesystem for ProtonDriveFS {
                 "MyFiles" => reply.entry(&TTL, &self.vdir_attr(INO_MYFILES), 0),
                 "Trash" => reply.entry(&TTL, &self.vdir_attr(INO_TRASH), 0),
                 "Photos" => reply.entry(&TTL, &self.vdir_attr(INO_PHOTOS), 0),
+                "Computers" => reply.entry(&TTL, &self.vdir_attr(INO_COMPUTERS), 0),
                 _ => reply.error(ENOENT),
             },
             INO_MYFILES => match self.cache.get_child_by_name(&self.volume_id, Some(&self.root_link_id), &name_str) {
@@ -296,6 +311,38 @@ impl Filesystem for ProtonDriveFS {
                 Ok(Some(node)) if node.is_trashed => reply.entry(&TTL, &self.node_to_attr(&node), 0),
                 _ => reply.error(ENOENT),
             },
+            INO_PHOTOS => {
+                // Look up a photo root folder child by name in the photos volume.
+                if let (Some(vid), Some(root)) = (&self.photos_volume_id, &self.photos_root_link_id) {
+                    match self.cache.get_child_by_name(vid, Some(root), &name_str) {
+                        Ok(Some(node)) => reply.entry(&TTL, &self.node_to_attr(&node), 0),
+                        _ => reply.error(ENOENT),
+                    }
+                } else {
+                    reply.error(ENOENT);
+                }
+            }
+            INO_COMPUTERS => {
+                // Each computer is a virtual subdirectory named after the device.
+                if let Some(idx) = self.computers.iter().position(|(_, name, _, _)| name == name_str.as_ref()) {
+                    let comp_ino = INO_COMP_BASE + idx as u64;
+                    reply.entry(&TTL, &self.vdir_attr(comp_ino), 0);
+                } else {
+                    reply.error(ENOENT);
+                }
+            }
+            p if p >= INO_COMP_BASE && p < INO_START => {
+                // Inside a specific computer's root folder.
+                let idx = (p - INO_COMP_BASE) as usize;
+                if let Some((_, _, vid, root)) = self.computers.get(idx) {
+                    match self.cache.get_child_by_name(vid, Some(root), &name_str) {
+                        Ok(Some(node)) => reply.entry(&TTL, &self.node_to_attr(&node), 0),
+                        _ => reply.error(ENOENT),
+                    }
+                } else {
+                    reply.error(ENOENT);
+                }
+            }
             _ if parent >= INO_START => {
                 if let Ok(Some(p_node)) = self.cache.get_node_by_inode(parent - INO_START) {
                     match self.cache.get_child_by_name(&self.volume_id, Some(&LinkId::new(p_node.link_id)), &name_str) {
@@ -326,6 +373,7 @@ impl Filesystem for ProtonDriveFS {
                 entries.push((INO_MYFILES, FileType::Directory, "MyFiles".to_string()));
                 entries.push((INO_TRASH, FileType::Directory, "Trash".to_string()));
                 entries.push((INO_PHOTOS, FileType::Directory, "Photos".to_string()));
+                entries.push((INO_COMPUTERS, FileType::Directory, "Computers".to_string()));
             }
             INO_MYFILES => {
                 if let Ok(nodes) = self.cache.list_children(&self.volume_id, Some(&self.root_link_id)) {
@@ -340,6 +388,33 @@ impl Filesystem for ProtonDriveFS {
                     for node in nodes {
                         let kind = if node.node_type == "Folder" || node.node_type == "Album" { FileType::Directory } else { FileType::RegularFile };
                         entries.push((node.inode.unwrap_or(0) + INO_START, kind, node.name));
+                    }
+                }
+            }
+            INO_PHOTOS => {
+                if let (Some(vid), Some(root)) = (&self.photos_volume_id.clone(), &self.photos_root_link_id.clone()) {
+                    if let Ok(nodes) = self.cache.list_children(vid, Some(root)) {
+                        for node in nodes {
+                            let kind = if node.node_type == "Folder" || node.node_type == "Album" { FileType::Directory } else { FileType::RegularFile };
+                            entries.push((node.inode.unwrap_or(0) + INO_START, kind, node.name));
+                        }
+                    }
+                }
+            }
+            INO_COMPUTERS => {
+                for (idx, (_, name, _, _)) in self.computers.iter().enumerate() {
+                    entries.push((INO_COMP_BASE + idx as u64, FileType::Directory, name.clone()));
+                }
+            }
+            p if p >= INO_COMP_BASE && p < INO_START => {
+                // List the root folder of a specific computer.
+                let idx = (p - INO_COMP_BASE) as usize;
+                if let Some((_, _, vid, root)) = self.computers.get(idx).cloned() {
+                    if let Ok(nodes) = self.cache.list_children(&vid, Some(&root)) {
+                        for node in nodes {
+                            let kind = if node.node_type == "Folder" || node.node_type == "Album" { FileType::Directory } else { FileType::RegularFile };
+                            entries.push((node.inode.unwrap_or(0) + INO_START, kind, node.name));
+                        }
                     }
                 }
             }

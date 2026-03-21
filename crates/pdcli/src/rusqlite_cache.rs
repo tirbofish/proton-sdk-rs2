@@ -398,6 +398,15 @@ impl RusqliteCache {
         Ok(())
     }
 
+    pub fn mark_node_untrashed(&self, volume_id: &VolumeId, link_id: &LinkId) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE nodes SET is_trashed = 0 WHERE volume_id = ?1 AND link_id = ?2",
+            params![volume_id.raw(), link_id.raw()],
+        )?;
+        Ok(())
+    }
+
     pub fn rename_cached_node(
         &self,
         volume_id: &VolumeId,

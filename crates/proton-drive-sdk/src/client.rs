@@ -21,6 +21,9 @@ use crate::node::operations::NodeOperations;
 use crate::node::revision::{REVISION_WRITER_DEFAULT_BLOCK_SIZE, RevisionUid};
 use crate::node::thumbnail::ThumbnailType;
 use crate::node::{DegradedNode, Node, NodeUid};
+use crate::api::events::{CoreEventsResponse, VolumeEventsResponse};
+use crate::device_ops::{Device, DeviceOperations};
+use crate::api::devices::DeviceType;
 use crate::volume::VolumeId;
 use crate::links::LinkId;
 use crate::utils::PotentialObject;
@@ -72,6 +75,7 @@ pub struct ProtonDriveClient {
 impl ProtonDriveClient {
     const MIN_DEGREE_OF_BLOCK_TRANSFER_PARALLELISM: usize = 2;
     const MAX_DEGREE_OF_BLOCK_TRANSFER_PARALLELISM: usize = 6;
+
 
     pub fn new(session: &ProtonAPISession, uid: Option<String>) -> anyhow::Result<Self> {
         Self::from_session_with_drive_api_clients_factory(
@@ -319,7 +323,6 @@ impl ProtonDriveClient {
         &self.account
     }
 
-    // this should always be pub(crate), not pub. reduce the visibility.
     pub fn api(&self) -> &Arc<dyn DriveApiClients> {
         &self.api
     }
@@ -576,6 +579,16 @@ impl ProtonDriveClient {
         NodeOperations::move_multiple(self, uids, new_parent_folder_uid).await
     }
 
+
+    pub async fn copy_node(
+        &self,
+        uid: NodeUid,
+        new_parent_folder_uid: NodeUid,
+        new_name: Option<String>,
+    ) -> anyhow::Result<crate::links::LinkId> {
+        NodeOperations::copy_single(self, uid, new_parent_folder_uid, new_name).await
+    }
+
     pub async fn rename_node(
         &self,
         uid: NodeUid,
@@ -621,8 +634,72 @@ impl ProtonDriveClient {
         VolumeOperations::empty_trash(self).await
     }
 
-    async fn get_file_uploader_from_draft_provider(
+    // ── Events ────────────────────────────────────────────────────────────────
+
+    /// Returns the latest known event-ID for the given volume. Use this cursor
+    /// to start polling with [`poll_volume_events`].
+    pub async fn get_volume_latest_event_id(
         &self,
+        volume_id: VolumeId,
+    ) -> anyhow::Result<String> {
+        self.api().events().get_volume_latest_event_id(volume_id).await
+    }
+
+    /// Polls for volume events since `event_id`. The [`VolumeEventsResponse`]
+    /// contains the next cursor (`event_id`), whether there are more pages
+    /// (`more`), whether a full refresh is required (`refresh`), and the list
+    /// of raw [`VolumeEventDto`] items.
+    pub async fn poll_volume_events(
+        &self,
+        volume_id: VolumeId,
+        event_id: &str,
+    ) -> anyhow::Result<VolumeEventsResponse> {
+        self.api().events().get_volume_events(volume_id, event_id).await
+    }
+
+    /// Returns the latest known global core event-ID.
+    pub async fn get_core_latest_event_id(&self) -> anyhow::Result<String> {
+        self.api().events().get_core_latest_event_id().await
+    }
+
+    /// Polls for core-level events since `event_id`.
+    pub async fn poll_core_events(
+        &self,
+        event_id: &str,
+    ) -> anyhow::Result<CoreEventsResponse> {
+        self.api().events().get_core_events(event_id).await
+    }
+
+    /// Returns all Computers (backup devices) registered for this account.
+    pub async fn list_devices(&self) -> anyhow::Result<Vec<Device>> {
+        DeviceOperations::list_devices(self).await
+    }
+
+    /// Returns a single Computer by its device ID, decrypting its name.
+    pub async fn get_device(&self, device_id: &str) -> anyhow::Result<Device> {
+        DeviceOperations::get_device(self, device_id).await
+    }
+
+    /// Creates a new Computer entry with the given display name and device type.
+    pub async fn create_device(
+        &self,
+        name: String,
+        device_type: DeviceType,
+    ) -> anyhow::Result<Device> {
+        DeviceOperations::create_device(self, name, device_type).await
+    }
+
+    /// Renames an existing Computer.
+    pub async fn rename_device(&self, device_id: &str, new_name: String) -> anyhow::Result<Device> {
+        DeviceOperations::rename_device(self, device_id, new_name).await
+    }
+
+    /// Unregisters a Computer, removing it from the account.
+    pub async fn delete_device(&self, device_id: &str) -> anyhow::Result<()> {
+        DeviceOperations::delete_device(self, device_id).await
+    }
+
+    async fn get_file_uploader_from_draft_provider(        &self,
         revision_draft_provider: Box<dyn RevisionDraftProvider>,
         size: i64,
         last_modification_time: Option<std::time::SystemTime>,

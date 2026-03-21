@@ -49,6 +49,39 @@ pub async fn sync_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Resul
     Ok(())
 }
 
+/// Minimal startup sync for IndexOnDemand: snapshot the event cursor and
+/// populate root children, but skip BFS folder indexing entirely.
+pub async fn run_minimal_sync(
+    client: &ProtonDriveClient,
+    volume_id: &VolumeId,
+    cache: &Arc<RusqliteCache>,
+    local_root: Option<PathBuf>,
+) -> Result<()> {
+    let initial_event_id = match cache.get_sync_state(volume_id)? {
+        Some((id, _)) => id,
+        None => {
+            let sp = crate::commands::helpers::new_spinner("Fetching latest event cursor...");
+            let id = client.get_volume_latest_event_id(volume_id.clone()).await?;
+            sp.finish_and_clear();
+            id
+        }
+    };
+
+    if cache.list_children(volume_id, None)?.is_empty() {
+        let sp = crate::commands::helpers::new_spinner("Fetching root folder contents...");
+        let root = client.list_children(volume_id.clone(), None).await?;
+        let batch: Vec<_> = root
+            .into_iter()
+            .filter_map(|res| res.result().ok().map(|n| (n, false)))
+            .collect();
+        sp.finish_and_clear();
+        cache.upsert_nodes_batch(&batch)?;
+    }
+
+    cache.set_sync_state(volume_id, &initial_event_id, local_root.as_deref())?;
+    Ok(())
+}
+
 /// One-shot initial sync: snapshot the event cursor, populate root children,
 /// BFS-index all folders, and index trash. Awaiting this before showing the
 /// REPL ensures the user's filesystem is immediately navigable.
@@ -67,7 +100,7 @@ pub async fn run_initial_sync(
         }
         None => {
             let sp = crate::commands::helpers::new_spinner("Fetching latest event cursor...");
-            let id = client.api().events().get_volume_latest_event_id(volume_id.clone()).await?;
+            let id = client.get_volume_latest_event_id(volume_id.clone()).await?;
             sp.finish_and_clear();
             tracing::info!(volume_id = %volume_id.raw(), event_id = %id, "No saved cursor — using latest event");
             id
@@ -186,14 +219,14 @@ pub async fn run_events_loop(
 ) -> Result<()> {
     let mut current_event_id = match cache.get_sync_state(&volume_id)? {
         Some((id, _)) => id,
-        None => client.api().events().get_volume_latest_event_id(volume_id.clone()).await?,
+        None => client.get_volume_latest_event_id(volume_id.clone()).await?,
     };
 
     tracing::info!(volume_id = %volume_id.raw(), event_id = %current_event_id, "Events loop started");
     state.lock().set_sync_status(Some("Up to date (Idle)".to_string()));
 
     loop {
-        match client.api().events().get_volume_events(volume_id.clone(), &current_event_id).await {
+        match client.poll_volume_events(volume_id.clone(), &current_event_id).await {
             Ok(resp) => {
                 let event_count = resp.events.len();
 
@@ -207,7 +240,9 @@ pub async fn run_events_loop(
                         refresh = resp.refresh,
                         "Volume events received"
                     );
-                    eprintln!("  [events] {} new event(s) (more={}, refresh={})", event_count, resp.more, resp.refresh);
+                    if notifier.is_some() {
+                        eprintln!("  [events] {} new event(s) (more={}, refresh={})", event_count, resp.more, resp.refresh);
+                    }
                     state.lock().set_sync_status(Some(format!("Processing {} updates", event_count)));
                 } else {
                     tracing::trace!(volume_id = %volume_id.raw(), event_id = %current_event_id, "Poll: no new events");
@@ -222,11 +257,15 @@ pub async fn run_events_loop(
                 for event in resp.events {
                     match event.event_type {
                         0 => {
-                            eprintln!("  [events] delete link:{}", event.link.link_id.raw());
+                            if notifier.is_some() {
+                                eprintln!("  [events] delete link:{}", event.link.link_id.raw());
+                            }
                             delete_ids.push(event.link.link_id);
                         }
                         t @ 1..=3 => {
-                            eprintln!("  [events] type={} link:{}", t, event.link.link_id.raw());
+                            if notifier.is_some() {
+                                eprintln!("  [events] type={} link:{}", t, event.link.link_id.raw());
+                            }
                             fetch_events.push((event.link.link_id, event.link.is_trashed));
                         }
                         n => tracing::warn!(event_type = n, "Unknown event type — skipping"),
@@ -316,7 +355,7 @@ pub async fn run_events_loop(
 
                 if resp.refresh {
                     tracing::info!(volume_id = %volume_id.raw(), "Refresh requested — resetting to latest event");
-                    let latest = client.api().events().get_volume_latest_event_id(volume_id.clone()).await?;
+                    let latest = client.get_volume_latest_event_id(volume_id.clone()).await?;
                     tracing::info!(volume_id = %volume_id.raw(), latest_event_id = %latest, "Cursor reset");
                     current_event_id = latest;
                 } else if !resp.more {

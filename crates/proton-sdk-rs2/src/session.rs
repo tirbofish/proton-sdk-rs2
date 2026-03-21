@@ -16,15 +16,31 @@ use crate::{
     secret::DefaultSecretCache,
 };
 
+/// Stored the tokens and relavant information related to session management for any Proton-API
+/// based app.
 pub struct ProtonAPISession {
+    /// The session id generated through [`proton_srp`].
     pub session_id: SessionId,
+    /// The username of this authenticated user.
     pub username: String,
+    /// The userid.
     pub user_id: UserId,
+    /// The refresh token and access token required to access any api function
     pub token_credential: TokenCredential,
+    /// Scopes. I'm not sure what they do...
     pub scopes: Vec<String>,
+    /// Checks if the session requires a second factor code.
+    ///
+    /// You can apply the 2FA code with [`Self::apply_second_factor_code`]
     pub is_waiting_for_second_factor_code: bool,
+    /// The password mode
     pub password_mode: PasswordMode,
+    /// The configuration of the client.
     pub client_config: ProtonClientConfiguration,
+    /// States if the session has ended.
+    /// Potentially through:
+    /// - session cancellation from the web client
+    /// - logout through [`Self::end_from_session`]
     pub is_ended: bool,
 
     pub(crate) session_secret_cache: Arc<dyn SessionSecretCache>,

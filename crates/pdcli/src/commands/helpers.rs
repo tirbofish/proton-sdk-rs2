@@ -1,14 +1,23 @@
 use anyhow::{anyhow, Result};
 use futures::stream::StreamExt;
 use glob::Pattern;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use proton_drive_sdk::client::ProtonDriveClient;
 use proton_drive_sdk::links::LinkId;
 use proton_drive_sdk::node::{DegradedNode, Node, NodeUid};
 use proton_drive_sdk::utils::PotentialObject;
 use proton_drive_sdk::volume::VolumeId;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use crate::rusqlite_cache::RusqliteCache;
+
+/// A single shared `MultiProgress` ensures all bars are drawn through one
+/// renderer, preventing them from stomping on each other when concurrent
+/// uploads / downloads are running.
+static MULTI: OnceLock<MultiProgress> = OnceLock::new();
+
+fn mp() -> &'static MultiProgress {
+    MULTI.get_or_init(MultiProgress::new)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Area {
@@ -53,7 +62,8 @@ pub async fn list_children(
     client: &ProtonDriveClient,
     folder_uid: NodeUid,
 ) -> Result<Vec<Node>> {
-    let mut stream = client.enumerate_folder_children(folder_uid).await?;
+    let stream = client.enumerate_folder_children(folder_uid).await?;
+    tokio::pin!(stream);
     let mut nodes = Vec::new();
     while let Some(item) = stream.next().await {
         if let Ok(PotentialObject::Node(node)) = item {
@@ -132,27 +142,48 @@ pub fn split_parent_and_leaf(input: &str) -> (&str, &str) {
 }
 
 pub fn new_spinner(msg: impl Into<String>) -> ProgressBar {
-    let pb = ProgressBar::new_spinner();
+    let pb = mp().add(ProgressBar::new_spinner());
     pb.set_style(
-        ProgressStyle::with_template("  {spinner:.cyan} {msg}")
+        ProgressStyle::with_template("  {spinner:.cyan.bold} {msg:.dim}")
             .unwrap()
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+            .tick_strings(&["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]),
     );
     pb.set_message(msg.into());
-    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    pb.enable_steady_tick(std::time::Duration::from_millis(200));
     pb
 }
 
 pub fn progress_bar_for(label: &str, total: u64) -> Arc<ProgressBar> {
-    let pb = ProgressBar::new(total);
+    upload_progress_bar(label, total)
+}
+
+/// Progress bar styled for uploads: purple progress on white track, ↑ prefix.
+pub fn upload_progress_bar(label: &str, total: u64) -> Arc<ProgressBar> {
+    let pb = mp().add(ProgressBar::new(total));
     let style = ProgressStyle::with_template(
-        "{spinner:.cyan} {msg:20.20} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({percent}%)",
+        "  {spinner:.magenta.bold} ↑ {wide_msg:.dim} {bar:32.magenta/white.dim} {bytes:>9}/{total_bytes:<9} {percent:>3}%  {binary_bytes_per_sec:.cyan}",
     )
     .unwrap_or_else(|_| ProgressStyle::default_bar())
-    .progress_chars("##-");
+    .progress_chars("█▉▊▋▌▍▎▏ ")
+    .tick_strings(&["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]);
     pb.set_style(style);
     pb.set_message(label.to_string());
-    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    pb.enable_steady_tick(std::time::Duration::from_millis(200));
+    Arc::new(pb)
+}
+
+/// Progress bar styled for downloads: white progress on purple track, ↓ prefix.
+pub fn download_progress_bar(label: &str, total: u64) -> Arc<ProgressBar> {
+    let pb = mp().add(ProgressBar::new(total));
+    let style = ProgressStyle::with_template(
+        "  {spinner:.cyan.bold} ↓ {wide_msg:.dim} {bar:32.white/magenta.dim} {bytes:>9}/{total_bytes:<9} {percent:>3}%  {binary_bytes_per_sec:.cyan}",
+    )
+    .unwrap_or_else(|_| ProgressStyle::default_bar())
+    .progress_chars("█▉▊▋▌▍▎▏ ")
+    .tick_strings(&["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]);
+    pb.set_style(style);
+    pb.set_message(label.to_string());
+    pb.enable_steady_tick(std::time::Duration::from_millis(200));
     Arc::new(pb)
 }
 
@@ -165,6 +196,59 @@ pub fn progress_callback(pb: Arc<ProgressBar>) -> Box<dyn Fn(i64, i64) + Send + 
             pb.set_position(done as u64);
         }
     })
+}
+
+/// Get file size from a Node (files/photos), or 0 for folders.
+pub fn node_file_size(node: &proton_drive_sdk::node::Node) -> u64 {
+    match node {
+        proton_drive_sdk::node::Node::File(f) | proton_drive_sdk::node::Node::Photo(f) => {
+            f.total_size_on_cloud_storage.max(0) as u64
+        }
+        _ => 0,
+    }
+}
+
+/// Freeze the progress bar at 100 % and leave it visible on the terminal.
+pub fn finish_progress(pb: &ProgressBar) {
+    let len = pb.length().unwrap_or(0);
+    if len > 0 {
+        pb.set_position(len);
+    }
+    pb.disable_steady_tick();
+    // Swap spinner for a static ✓ so the frozen line looks clean.
+    if let Ok(done_style) = ProgressStyle::with_template(
+        "  ✓  {wide_msg:.dim} {bar:32} {bytes:>9}/{total_bytes:<9} {percent:>3}%  {binary_bytes_per_sec:.cyan}",
+    ) {
+        pb.set_style(done_style.progress_chars("█▉▊▋▌▍▎▏ "));
+    }
+    pb.finish();
+}
+
+/// Finish a foreground spinner with a green ✓ check and a final message.
+pub fn finish_ok(pb: &ProgressBar, msg: &str) {
+    pb.set_style(ProgressStyle::with_template("  ✓  {msg}").unwrap());
+    pb.finish_with_message(msg.to_string());
+}
+
+/// Finish a foreground spinner with a red ✗ and a final message.
+#[allow(dead_code)]
+pub fn finish_err(pb: &ProgressBar, msg: &str) {
+    pb.set_style(ProgressStyle::with_template("  ✗  {msg}").unwrap());
+    pb.finish_with_message(msg.to_string());
+}
+
+/// Finish a background (indented) spinner with a green ✓.
+#[allow(dead_code)]
+pub fn finish_bg_ok(pb: &ProgressBar, msg: &str) {
+    pb.set_style(ProgressStyle::with_template("      ✓  {msg:.dim}").unwrap());
+    pb.finish_with_message(msg.to_string());
+}
+
+/// Finish a background (indented) spinner with a red ✗.
+#[allow(dead_code)]
+pub fn finish_bg_err(pb: &ProgressBar, msg: &str) {
+    pb.set_style(ProgressStyle::with_template("      ✗  {msg:.dim}").unwrap());
+    pb.finish_with_message(msg.to_string());
 }
 
 

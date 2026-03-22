@@ -2,6 +2,8 @@ use crate::auth;
 use crate::state::ReplState;
 use anyhow::Result;
 use proton_drive_sdk::client::ProtonDriveClient;
+use proton_drive_sdk::links::LinkId;
+use proton_drive_sdk::volume::VolumeId;
 use std::sync::Arc;
 use parking_lot::Mutex;
 
@@ -27,6 +29,16 @@ pub async fn apply_authenticated_session_with_options(
     let my_files = drive_client.get_my_files_folder().await?;
     sp.finish_and_clear();
 
+    // Pre-fetch computers list so `cd Computers/DeviceName` works immediately.
+    let computers: Vec<(String, String, VolumeId, LinkId)> =
+        match drive_client.list_devices().await {
+            Ok(devices) => devices
+                .into_iter()
+                .map(|d| (d.device_id, d.name, d.volume_id, d.root_uid.link_id))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+
     let root_uid = my_files.base.uid.clone();
 
     let mut s = state.lock();
@@ -36,6 +48,7 @@ pub async fn apply_authenticated_session_with_options(
     s.set_root_node_uid(root_uid.clone());
     s.set_current_node_uid(root_uid);
     s.set_current_path(vec!["MyFiles".to_string()]);
+    s.set_computers(computers);
 
     if announce {
         println!("Welcome, {}! You are now in My Files.", username);

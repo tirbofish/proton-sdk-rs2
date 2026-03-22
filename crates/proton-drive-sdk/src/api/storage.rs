@@ -104,7 +104,24 @@ impl StorageApiClient for DefaultStorageApiClient {
                         ));
                         continue;
                     }
-                    return Ok(response.json::<ApiResponse>().await?);
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    // Proton's blob storage backend returns an empty body (or
+                    // occasionally plain text) on a successful upload — not JSON.
+                    // Treat any 2xx with a non-JSON body as success.
+                    if body.trim().is_empty() || !body.trim_start().starts_with('{') {
+                        if status.is_success() {
+                            return Ok(ApiResponse { code: crate::api::ResponseCode(1000), error_message: None });
+                        } else {
+                            last_err = Some(anyhow::anyhow!(
+                                "blob upload failed: status {}, body: {}",
+                                status, body
+                            ));
+                            continue;
+                        }
+                    }
+                    return serde_json::from_str::<ApiResponse>(&body)
+                        .map_err(|e| anyhow::anyhow!("error decoding response body: {}. Body: {}", e, body));
                 }
                 Err(e) => {
                     // retry on network errors

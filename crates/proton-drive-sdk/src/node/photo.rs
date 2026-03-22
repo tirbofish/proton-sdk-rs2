@@ -39,6 +39,14 @@ pub struct PhotosTimelineItem {
     pub capture_time: DateTime<Utc>,
 }
 
+/// A single entry from the timeline API page response — includes tags.
+#[derive(Debug, Clone)]
+pub struct TimelineEntry {
+    pub uid: NodeUid,
+    pub capture_time: DateTime<Utc>,
+    pub tags: Vec<PhotoTag>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
 #[repr(u32)]
 pub enum PhotoTag {

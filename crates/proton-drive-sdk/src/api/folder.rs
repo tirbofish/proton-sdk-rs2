@@ -12,12 +12,12 @@ pub struct FolderChildrenResponse {
     #[serde(flatten)]
     pub base: ApiResponse,
 
-    #[serde(rename = "LinkIDs")]
+    #[serde(rename = "LinkIDs", default)]
     pub link_ids: Vec<LinkId>,
 
     pub anchor_id: Option<LinkId>,
 
-    #[serde(rename = "More")]
+    #[serde(rename = "More", default)]
     pub more_results_exist: bool,
 }
 
@@ -147,11 +147,13 @@ impl FoldersApiClient for DefaultFoldersApiClient {
         let builder = self.client.get(url);
         let builder = self.add_auth_headers(builder).await?;
 
-        Ok(builder
+        let resp: FolderChildrenResponse = builder
             .send()
             .await?
-            .json::<FolderChildrenResponse>()
-            .await?)
+            .json()
+            .await?;
+        resp.base.to_result()?;
+        Ok(resp)
     }
 
     async fn create_folder(

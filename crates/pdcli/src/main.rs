@@ -1,15 +1,18 @@
 mod app_paths;
 mod auth;
 mod commands;
+mod daemon;
 mod file_cache;
+mod photos_index;
 mod rusqlite_cache;
 mod state;
 mod fuse;
 mod settings;
 
 use anyhow::Result;
-use indicatif::ProgressBar;
-use reedline::{FileBackedHistory, Reedline, Signal};
+use reedline::{
+    Completer, FileBackedHistory, Reedline, Signal, Span, Suggestion,
+};
 use std::sync::Arc;
 use parking_lot::Mutex;
 use std::time::Duration;
@@ -18,6 +21,171 @@ use crate::app_paths::resolve_paths;
 use crate::state::ReplState;
 use reedline::Prompt;
 use std::borrow::Cow;
+
+// ── Tab completion ─────────────────────────────────────────────────────────── 
+
+const REMOTE_PATH_CMDS: &[&str] = &[
+    "cd", "ls", "get", "hydrate", "mkdir", "mv", "cp", "rm", "stat", "restore", "drop",
+];
+
+const ALL_CMDS: &[&str] = &[
+    "login", "whoami", "logout",
+    "pwd", "ls", "cd",
+    "mkdir", "mv", "cp", "rm", "drop", "stat", "restore",
+    "get", "put", "hydrate",
+    "cache", "computers", "photos", "sync", "settings", "daemon",
+    "mount", "umount",
+    "clear", "help", "exit", "quit",
+];
+
+struct DriveCompleter {
+    state: Arc<Mutex<ReplState>>,
+}
+
+impl DriveCompleter {
+    fn new(state: Arc<Mutex<ReplState>>) -> Self {
+        DriveCompleter { state }
+    }
+
+    fn navigate_path(
+        &self,
+        cache: &crate::rusqlite_cache::RusqliteCache,
+        start_uid: &proton_drive_sdk::node::NodeUid,
+        parts: &[&str],
+    ) -> Option<proton_drive_sdk::node::NodeUid> {
+        use proton_drive_sdk::links::LinkId;
+        let mut uid = start_uid.clone();
+        for seg in parts {
+            if seg.is_empty() || *seg == "." { continue; }
+            let node = cache.get_child_by_name(&uid.volume_id, Some(&uid.link_id), seg).ok()??;
+            uid = proton_drive_sdk::node::NodeUid::new(
+                uid.volume_id.clone(),
+                LinkId::new(node.link_id),
+            );
+        }
+        Some(uid)
+    }
+
+    fn complete_remote(
+        &self,
+        path_prefix: &str,
+    ) -> Vec<(String, bool)> {
+        let s = match self.state.try_lock() {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+        let cache = match s.get_cache() {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        let current_uid = match s.get_current_node_uid() {
+            Some(u) => u.clone(),
+            None => return Vec::new(),
+        };
+
+        // Split into the directory path and the name prefix.
+        let (dir_str, name_prefix) = if let Some(slash) = path_prefix.rfind('/') {
+            (&path_prefix[..slash + 1], &path_prefix[slash + 1..])
+        } else {
+            ("", path_prefix)
+        };
+
+        // Navigate to the directory.
+        let dir_uid = if dir_str.is_empty() {
+            current_uid
+        } else {
+            let segs: Vec<&str> = dir_str.trim_matches('/').split('/').collect();
+            match self.navigate_path(&cache, &current_uid, &segs) {
+                Some(u) => u,
+                None => return Vec::new(),
+            }
+        };
+
+        // List children of that directory.
+        let children = cache
+            .list_children(&dir_uid.volume_id, Some(&dir_uid.link_id))
+            .unwrap_or_default();
+
+        children
+            .into_iter()
+            .filter(|n| n.name.starts_with(name_prefix))
+            .map(|n| {
+                let is_dir = n.node_type == "Folder" || n.node_type == "Album";
+                let full = format!("{}{}", dir_str, quote_for_shell(&n.name));
+                (full, is_dir)
+            })
+            .collect()
+    }
+}
+
+/// Wrap a file/dir name in single quotes if it contains characters that need
+/// quoting in shell-style input (spaces, parens, apostrophes, etc.).
+fn quote_for_shell(name: &str) -> String {
+    let needs_quoting = name.chars().any(|c| matches!(c, ' ' | '\'' | '(' | ')' | '[' | ']' | '&' | '|' | ';' | '<' | '>' | '!' | '?' | '*' | '#' | '~'));
+    if needs_quoting {
+        // Escape any embedded single-quotes: foo'bar → foo'\''bar
+        format!("'{}'", name.replace('\'', r"'\''"))
+    } else {
+        name.to_string()
+    }
+}
+
+impl Completer for DriveCompleter {
+    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+        let input = &line[..pos];
+        let tokens: Vec<&str> = input.split_whitespace().collect();
+        let ends_with_space = input.ends_with(' ');
+        let n_tokens = tokens.len();
+
+        // Complete command names when typing the first token.
+        if n_tokens == 0 || (n_tokens == 1 && !ends_with_space) {
+            let prefix = tokens.first().copied().unwrap_or("");
+            let span = Span::new(0, pos);
+            return ALL_CMDS
+                .iter()
+                .filter(|c| c.starts_with(prefix))
+                .map(|c| Suggestion {
+                    value: c.to_string(),
+                    description: None,
+                    style: None,
+                    extra: None,
+                    span,
+                    append_whitespace: true,
+                })
+                .collect();
+        }
+
+        // Complete remote paths for supported commands.
+        let cmd = tokens[0];
+        if !REMOTE_PATH_CMDS.contains(&cmd) { return Vec::new(); }
+
+        let raw_token = if ends_with_space { "" } else { tokens.last().copied().unwrap_or("") };
+        let (in_quote, path_prefix) = if raw_token.starts_with('\'') {
+            (true, &raw_token[1..])
+        } else {
+            (false, raw_token)
+        };
+        let token_start = pos - raw_token.len();
+        let span = Span::new(token_start, pos);
+
+        self.complete_remote(path_prefix)
+            .into_iter()
+            .map(|(mut name, is_dir)| {
+                if in_quote && !name.starts_with('\'') {
+                    name = format!("'{}'", name);
+                }
+                Suggestion {
+                    value: name,
+                    description: None,
+                    style: None,
+                    extra: None,
+                    span,
+                    append_whitespace: !is_dir,
+                }
+            })
+            .collect()
+    }
+}
 
 struct LivePrompt {
     state: Arc<Mutex<ReplState>>,
@@ -90,9 +258,15 @@ async fn main() -> Result<()> {
 
     println!("ProtonDrive CLI");
 
-    let init_spinner = ProgressBar::new_spinner();
-    init_spinner.set_message("Initialising...");
-    init_spinner.enable_steady_tick(Duration::from_millis(100));
+    // If invoked as the daemon sub-process, run the daemon loop and exit.
+    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    if cli_args.first().map(String::as_str) == Some("--daemon-run")
+        || std::env::var("PDCLI_DAEMON").is_ok()
+    {
+        return daemon::run_daemon_process().await;
+    }
+
+    let init_spinner = commands::helpers::new_spinner("Initialising...");
     
     let mut state = ReplState::new();
     let paths = resolve_paths()?;
@@ -108,8 +282,6 @@ async fn main() -> Result<()> {
     
     let restored = auth::try_resume_session().await?;
     init_spinner.finish_and_clear();
-
-    let cli_args: Vec<String> = std::env::args().skip(1).collect();
 
     if cli_args.len() == 1 && cli_args[0] == "help" {
         show_help();
@@ -138,6 +310,7 @@ async fn main() -> Result<()> {
                     if let Err(e) = commands::sync::run_initial_sync(&client, &volume_id, &cache, local_root.clone(), &state).await {
                         eprintln!("Initial sync warning: {e}");
                     }
+                    state.lock().set_myfiles_indexed(true);
                 }
                 IndexMode::IndexOnDemand => {
                     // Minimal setup: snapshot the event cursor and root children only.
@@ -177,7 +350,9 @@ async fn run_main_loop(state: Arc<Mutex<ReplState>>, cli_args: Vec<String>) -> R
         FileBackedHistory::with_file(1000, history_file)
             .unwrap_or_else(|_| FileBackedHistory::new(1000).expect("history")),
     );
-    let mut editor = Reedline::create().with_history(history);
+    let mut editor = Reedline::create()
+        .with_history(history)
+        .with_completer(Box::new(DriveCompleter::new(state.clone())));
 
     loop {
         if !state.lock().is_authenticated() {
@@ -197,13 +372,21 @@ async fn run_main_loop(state: Arc<Mutex<ReplState>>, cli_args: Vec<String>) -> R
             // but we can use update_prompt if we had access to the editor.
             // For now, the implementation above ensures that every time reedline 
             // decides to draw (e.g. on every keypress), it gets the latest state.
-            
+            let mut ctrl_c_count = 0u32;
             match editor.read_line(&prompt) {
                 Ok(Signal::Success(line)) => {
+                    ctrl_c_count = 0; let _ = ctrl_c_count;
                     let trimmed = line.trim();
                     if trimmed.is_empty() { continue; }
                     state.lock().clear_cancelled();
-                    match handle_command(trimmed, &state).await {
+                    let cmd_result = tokio::select! {
+                        res = handle_command(trimmed, &state) => res,
+                        _ = tokio::signal::ctrl_c() => {
+                            eprintln!("\n  Interrupted.");
+                            continue;
+                        }
+                    };
+                    match cmd_result {
                         Ok(should_exit) => {
                             if should_exit {
                                 // Auto-unmount any active FUSE mount before exiting
@@ -224,10 +407,17 @@ async fn run_main_loop(state: Arc<Mutex<ReplState>>, cli_args: Vec<String>) -> R
                     }
                 }
                 Ok(Signal::CtrlC) => {
-                    // If we were in the middle of a command, this would cancel it.
-                    // But reedline returns CtrlC when the prompt is empty.
-                    println!("Goodbye!");
-                    return Ok(());
+                    ctrl_c_count += 1;
+                    if ctrl_c_count >= 2 {
+                        // Double Ctrl+C = quit immediately.
+                        if let Some(mp) = state.lock().get_mount_point().cloned() {
+                            let _ = std::process::Command::new("fusermount3")
+                                .arg("-u").arg("-z").arg(&mp).output();
+                        }
+                        println!("Goodbye!");
+                        return Ok(());
+                    }
+                    println!("(Press Ctrl+C again to quit, or Ctrl+D)");
                 }
                 Ok(Signal::CtrlD) => {
                     println!("Goodbye!");
@@ -278,8 +468,41 @@ async fn dispatch_command(
         "photos" => { commands::photos_command(&args, state).await?; Ok(false) }
         "sync" => { commands::sync_command(&args, state).await?; Ok(false) }
         "settings" => { commands::settings_command(&args, state).await?; Ok(false) }
+        "daemon" => { commands::daemon_command(&args, state).await?; Ok(false) }
         "mount" => {
-            commands::mount_command(&args, state).await?;
+            let use_daemon = args.iter().any(|a| *a == "--daemon" || *a == "-d");
+            let mp_args: Vec<&str> = args.iter().copied().filter(|a| *a != "--daemon" && *a != "-d").collect();
+            if use_daemon {
+                if mp_args.is_empty() {
+                    eprintln!("Usage: mount <mount_point> [--daemon|-d]");
+                } else {
+                    if !crate::daemon::is_daemon_alive() {
+                        println!("  Starting daemon...");
+                        crate::daemon::daemon_start()?;
+                    }
+                    // Wait up to 10 s for the daemon socket to become available.
+                    let mut ready = false;
+                    for _ in 0..20 {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        if crate::daemon::is_daemon_alive() {
+                            if crate::daemon::send_daemon_command("ping").is_ok() {
+                                ready = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !ready {
+                        eprintln!("  Daemon did not start in time. Try 'daemon start' manually.");
+                    } else {
+                        match crate::daemon::send_daemon_command(&format!("mount {}", mp_args[0])) {
+                            Ok(_) => println!("  Mount request sent. The drive will appear at {} shortly.", mp_args[0]),
+                            Err(e) => eprintln!("  Failed to send mount request: {e}"),
+                        }
+                    }
+                }
+            } else {
+                commands::mount_command(&mp_args, state).await?;
+            }
             Ok(false)
         }
         "umount" => {
@@ -320,6 +543,7 @@ COMPUTERS:
   computers add <name>       Register a new computer
   computers rename <id> <n>  Rename a computer
   computers rm <id>          Unregister a computer
+  computers sync <folder>    Sync a local folder to this computer's backup
 
 SETTINGS:
   settings
@@ -338,7 +562,7 @@ fn show_command_help(cmd: &str) {
         "photos" => println!("COMMAND: photos [ls|get]\nBrowse and download your Proton Drive photo library. Run 'photos help' for details."),
         "settings" => println!("COMMAND: settings [display|reset]\nManage application settings (indexing, mounting, etc.). Run without args for interactive menu."),
         "mount" => println!("COMMAND: mount <mount_point>\nMount Drive as a local FUSE filesystem."),
-        "hydrate" => println!("COMMAND: hydrate <path>\nDownload a file to the persistent cache for offline FUSE access."),
+        "hydrate" => println!("COMMAND: hydrate <path|pattern>\nDownload a file, folder, or wildcard pattern to the persistent cache for offline FUSE access."),
         _ => println!("Use 'help' to see all commands."),
     }
 }

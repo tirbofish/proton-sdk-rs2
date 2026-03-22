@@ -879,8 +879,14 @@ impl DtoToMetadataConverter {
                 }
             }
             crate::api::links::LinkType::File => {
+                // Photo nodes in the Photos volume carry their file metadata in the
+                // `photo` field (PhotoDto) rather than the `file` field (FileDto).
+                // PhotoDto.base IS a FileDto via `#[serde(flatten)]`, so we can
+                // use it directly as a fallback.
+                let photo_dto_base = link_details.photo.map(|p| p.base);
                 let file_dto = link_details
                     .file
+                    .or(photo_dto_base)
                     .ok_or_else(|| anyhow::anyhow!("File DTO missing"))?;
 
                 let decryption = crate::node::crypto::NodeCrypto::decrypt_file(
@@ -987,7 +993,19 @@ impl DtoToMetadataConverter {
                                             .map(|r| r.creation_time)
                                             .unwrap_or_else(|| Utc::now()),
                                     ),
-                                    thumbnails: vec![],
+                                    thumbnails: file_dto
+                                        .active_revision
+                                        .as_ref()
+                                        .map(|r| {
+                                            r.thumbnails
+                                                .iter()
+                                                .map(|t| crate::protobuf::ThumbnailHeader {
+                                                    id: t.id.clone(),
+                                                    r#type: t.r#type as i32,
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default(),
                                     additional_claimed_metadata: None,
                                     content_author: Some(decryption.content_authorship_claim.to_potential_author()),
                                 },

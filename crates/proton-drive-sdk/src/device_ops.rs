@@ -50,6 +50,23 @@ impl DeviceOperations {
             .map(RawDeviceInfo::try_from)
             .collect::<anyhow::Result<_>>()?;
 
+        // Bootstrap each device's share key into the secret cache before
+        // fetching nodes, so decryption finds the key when needed.
+        for raw_info in &raw {
+            if let Err(e) = crate::share_ops::ShareOperations::get_share(
+                client,
+                raw_info.share_id.clone(),
+            )
+            .await
+            {
+                tracing::warn!(
+                    device_id = %raw_info.device_id,
+                    error = %e,
+                    "Failed to bootstrap computer share key — node decryption may fail"
+                );
+            }
+        }
+
         // Batch-fetch the root folder node for each device to decrypt the name.
         let uids: Vec<NodeUid> = raw
             .iter()
@@ -181,6 +198,22 @@ impl DeviceOperations {
 
         let resp = client.api().devices().create_device(request).await?;
         resp.base.to_result()?;
+
+        // Bootstrap the new device's share key into the secret cache immediately
+        // so that subsequent create_folder / get_secrets calls against the device
+        // root can decrypt the node key without a second list_devices round-trip.
+        if let Err(e) = crate::share_ops::ShareOperations::get_share(
+            client,
+            resp.device.share_id.clone(),
+        )
+        .await
+        {
+            tracing::warn!(
+                share_id = %resp.device.share_id.raw(),
+                error = %e,
+                "Failed to bootstrap new device share key — first create_folder may fail"
+            );
+        }
 
         Ok(Device {
             device_id: resp.device.device_id,

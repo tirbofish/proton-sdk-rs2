@@ -109,15 +109,34 @@ impl NodeOperations {
         client: &ProtonDriveClient,
         uids: Vec<NodeUid>,
     ) -> anyhow::Result<Vec<PotentialObject<Node, DegradedNode>>> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        use std::pin::Pin;
+
+        type NodeFuture = Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<PotentialObject<Node, DegradedNode>>> + Send>,
+        >;
+
+        const CONCURRENCY: usize = 8;
+
         let mut results = Vec::with_capacity(uids.len());
-        for uid in uids {
-            match Self::get_node(client, uid).await {
-                Ok(node) => results.push(node),
-                Err(e) => {
-                    return Err(e);
-                }
+        let mut uid_iter = uids.into_iter();
+        let mut in_flight: FuturesUnordered<NodeFuture> = FuturesUnordered::new();
+
+        // Seed the initial concurrent batch.
+        for uid in uid_iter.by_ref().take(CONCURRENCY) {
+            let c = client.clone();
+            in_flight.push(Box::pin(async move { Self::get_node(&c, uid).await }));
+        }
+
+        while let Some(result) = in_flight.next().await {
+            results.push(result?);
+            // Keep the pipeline full while there are more UIDs waiting.
+            if let Some(uid) = uid_iter.next() {
+                let c = client.clone();
+                in_flight.push(Box::pin(async move { Self::get_node(&c, uid).await }));
             }
         }
+
         Ok(results)
     }
 

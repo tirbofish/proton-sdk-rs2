@@ -1,6 +1,6 @@
 use fuser::{FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEntry, ReplyEmpty, ReplyWrite, Request, ReplyOpen};
 use libc::ENOENT;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,18 +9,23 @@ use parking_lot::{Mutex as PLMutex, Condvar as PLCondvar};
 use tokio::runtime::Builder as RuntimeBuilder;
 use crate::rusqlite_cache::{RusqliteCache, CachedNode};
 use proton_drive_sdk::client::ProtonDriveClient;
+use proton_drive_sdk::node::{Node, NodeUid};
 use proton_drive_sdk::volume::VolumeId;
 use proton_drive_sdk::links::LinkId;
-use proton_drive_sdk::node::NodeUid;
+use proton_drive_sdk::utils::PotentialObject;
+use futures::StreamExt;
 
 const TTL: Duration = Duration::from_secs(0);
 
 const INO_ROOT: u64 = 1;
 const INO_MYFILES: u64 = 2;
-const INO_TRASH: u64 = 3;
 const INO_PHOTOS: u64 = 4;
 const INO_COMPUTERS: u64 = 5;
-/// Synthetic inodes for individual computer root directories (range 50..99).
+const INO_PHOTOS_ALBUMS: u64 = 6;
+const INO_PHOTOS_ALL: u64 = 7;
+const INO_PHOTOS_FAVS: u64 = 8;
+const INO_PHOTOS_VIDEOS: u64 = 9;
+const INO_PHOTOS_SCREENSHOTS: u64 = 10;
 const INO_COMP_BASE: u64 = 50;
 const INO_START: u64 = 100;
 
@@ -37,18 +42,15 @@ pub struct ProtonDriveFS {
     pub cache: Arc<RusqliteCache>,
     pub volume_id: VolumeId,
     pub root_link_id: LinkId,
-    /// Photos volume ID + root folder link (None if photos could not be resolved).
     pub photos_volume_id: Option<VolumeId>,
+    #[allow(dead_code)]
     pub photos_root_link_id: Option<LinkId>,
-    /// Computers: (device_id, display_name, volume_id, root_link_id)
     pub computers: Vec<(String, String, VolumeId, LinkId)>,
     pub mount_point: PathBuf,
     pub pending_downloads: HashMap<String, DownloadWaiter>,
     pub pending_uploads: HashMap<u64, UploadBuffer>,
     pub next_fh: u64,
-    pub probe_fhs: HashSet<u64>,
-    pub probe_last_seen: HashMap<String, std::time::Instant>,
-    pub intent_confirmed: HashSet<String>,
+    pub provisional_map: Arc<PLMutex<HashMap<String, String>>>,
 }
 
 impl Drop for ProtonDriveFS {
@@ -76,7 +78,14 @@ impl ProtonDriveFS {
         let is_dir = node.node_type == "Folder" || node.node_type == "Album";
         let ino = node.inode.map(|i| i + INO_START).unwrap_or(INO_START);
         let size = node.size.unwrap_or(0).max(0) as u64;
-        let mtime = Self::dt_to_system_time(node.modification_time);
+        // For Photo nodes, prefer capture_time as mtime so photo apps (Fotema
+        // etc.) see the real shot date rather than the upload/sync time.
+        let effective_time = if node.node_type == "Photo" {
+            node.capture_time.unwrap_or(node.modification_time)
+        } else {
+            node.modification_time
+        };
+        let mtime = Self::dt_to_system_time(effective_time);
         let crtime = Self::dt_to_system_time(node.creation_time);
 
         FileAttr {
@@ -122,9 +131,7 @@ impl ProtonDriveFS {
     fn resolve_parent_link(&self, parent: u64) -> Option<Option<LinkId>> {
         match parent {
             INO_MYFILES => Some(Some(self.root_link_id.clone())),
-            INO_TRASH => Some(None),
             p if p >= INO_COMP_BASE && p < INO_START => {
-                // Computer root dir: return the device's root link.
                 let idx = (p - INO_COMP_BASE) as usize;
                 self.computers.get(idx).map(|(_, _, _, root)| Some(root.clone()))
             }
@@ -141,6 +148,7 @@ impl ProtonDriveFS {
 
     fn start_background_download(
         &self,
+        node_volume_id: &VolumeId,
         link_id: &LinkId,
         name: &str,
         size: Option<i64>,
@@ -154,7 +162,7 @@ impl ProtonDriveFS {
                 {
                     let mut g = waiter.0.lock();
                     *g = Some(Err(e.to_string()));
-                } // drop MutexGuard before moving waiter
+                }
                 waiter.1.notify_all();
                 return waiter;
             }
@@ -164,15 +172,13 @@ impl ProtonDriveFS {
         }
 
         let client = self.client.clone();
-        let volume_id = self.volume_id.clone();
+        let volume_id = node_volume_id.clone();
         let link_id = link_id.clone();
         let cache = self.cache.clone();
         let name = name.to_string();
-        let size_str = size
-            .map(|s| format_size(s.max(0) as u64))
-            .unwrap_or_else(|| "?".to_string());
+        let size_bytes = size.unwrap_or(0).max(0) as u64;
 
-        eprintln!("\n  \x1b[36m↓\x1b[0m Hydrating '{}' ({})...", name, size_str);
+        let pb = crate::commands::helpers::download_progress_bar(&name, size_bytes);
 
         std::thread::spawn(move || {
             let rt = RuntimeBuilder::new_current_thread()
@@ -181,9 +187,13 @@ impl ProtonDriveFS {
                 .expect("tokio rt for download");
 
             let node_uid = NodeUid::new(volume_id.clone(), link_id.clone());
+            let pb_cb = Arc::clone(&pb);
             let result = rt.block_on(async move {
                 client
-                    .download_to_file(node_uid, &dest_path, Box::new(|_, _| {}))
+                    .download_to_file(node_uid, &dest_path, Box::new(move |done, total| {
+                        if total > 0 { pb_cb.set_length(total as u64); }
+                        if done >= 0 { pb_cb.set_position(done as u64); }
+                    }))
                     .await
                     .map(|()| {
                         let _ = cache.register_download(&volume_id, &link_id, &dest_path);
@@ -193,8 +203,15 @@ impl ProtonDriveFS {
             });
 
             match &result {
-                Ok(_) => eprintln!("  \x1b[32m✓\x1b[0m '{}' ready.", name),
-                Err(e) => eprintln!("  \x1b[31m✗\x1b[0m Failed to hydrate '{}': {}", name, e),
+                Ok(_) => {
+                    pb.set_position(pb.length().unwrap_or(size_bytes));
+                    pb.println(format!("  ✓  {} completed", name));
+                    pb.finish_and_clear();
+                }
+                Err(e) => {
+                    pb.println(format!("  ✗  {} failed: {}", name, e));
+                    pb.finish_and_clear();
+                }
             }
             let mut g = waiter_clone.0.lock();
             *g = Some(result);
@@ -208,6 +225,37 @@ impl ProtonDriveFS {
         let mut g = waiter.0.lock();
         waiter.1.wait_while(&mut g, |v| v.is_none());
         g.as_ref().unwrap().clone()
+    }
+
+    /// Synchronously enumerate and cache all children of a folder.
+    /// Forces parent_uid on each node so list_children queries work.
+    #[allow(dead_code)]
+    fn blocking_index_folder(
+        client: &ProtonDriveClient,
+        cache: &Arc<RusqliteCache>,
+        folder_uid: NodeUid,
+        parent_uid: NodeUid,
+        is_trash: bool,
+    ) {
+        let client = client.clone();
+        let cache = cache.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let rt = RuntimeBuilder::new_current_thread().enable_all().build().expect("rt");
+            rt.block_on(async move {
+                if let Ok(stream) = client.enumerate_folder_children(folder_uid).await {
+                    tokio::pin!(stream);
+                    while let Some(item) = stream.next().await {
+                        if let Ok(PotentialObject::Node(mut node)) = item {
+                            node.set_parent_uid(Some(parent_uid.clone()));
+                            let _ = cache.upsert_node(&node, is_trash);
+                        }
+                    }
+                }
+            });
+            let _ = tx.send(());
+        });
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(60));
     }
 
     fn serve_file_range(path: &std::path::Path, offset: i64, size: u32, reply: ReplyData) {
@@ -233,7 +281,6 @@ impl ProtonDriveFS {
 
     fn do_trash_optimistic(&mut self, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name_str = name.to_string_lossy().to_string();
-
         let parent_link_opt = match self.resolve_parent_link(parent) {
             Some(l) => l,
             None => { reply.error(ENOENT); return; }
@@ -242,31 +289,15 @@ impl ProtonDriveFS {
             Ok(Some(n)) => n,
             _ => { reply.error(ENOENT); return; }
         };
-
-        let is_already_trashed = node.is_trashed || parent == INO_TRASH;
         let link_id = LinkId::new(node.link_id.clone());
         let node_uid = NodeUid::new(self.volume_id.clone(), link_id.clone());
-
-        if is_already_trashed {
-            let _ = self.cache.delete_node(&self.volume_id, &link_id);
-        } else {
-            let _ = self.cache.mark_node_trashed(&self.volume_id, &link_id);
-        }
+        let _ = self.cache.mark_node_trashed(&self.volume_id, &link_id);
         reply.ok();
-
         let client = self.client.clone();
         std::thread::spawn(move || {
-            let rt = RuntimeBuilder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tokio rt for trash");
+            let rt = RuntimeBuilder::new_current_thread().enable_all().build().expect("tokio rt for trash");
             rt.block_on(async move {
-                let result = if is_already_trashed {
-                    client.delete_nodes_from_trash(vec![node_uid]).await
-                } else {
-                    client.trash_nodes(vec![node_uid]).await
-                };
-                if let Err(e) = result {
+                if let Err(e) = client.trash_nodes(vec![node_uid]).await {
                     eprintln!("  \x1b[31m✗\x1b[0m Background trash error: {}", e);
                 }
             });
@@ -281,7 +312,9 @@ impl Filesystem for ProtonDriveFS {
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         match ino {
-            INO_ROOT | INO_MYFILES | INO_TRASH | INO_PHOTOS | INO_COMPUTERS => reply.attr(&TTL, &self.vdir_attr(ino)),
+            INO_ROOT | INO_MYFILES | INO_PHOTOS | INO_COMPUTERS
+            | INO_PHOTOS_ALBUMS | INO_PHOTOS_ALL | INO_PHOTOS_FAVS
+            | INO_PHOTOS_VIDEOS | INO_PHOTOS_SCREENSHOTS => reply.attr(&TTL, &self.vdir_attr(ino)),
             p if p >= INO_COMP_BASE && p < INO_START => reply.attr(&TTL, &self.vdir_attr(p)),
             _ if ino >= INO_START => {
                 match self.cache.get_node_by_inode(ino - INO_START) {
@@ -298,29 +331,61 @@ impl Filesystem for ProtonDriveFS {
         match parent {
             INO_ROOT => match name_str.as_ref() {
                 "MyFiles" => reply.entry(&TTL, &self.vdir_attr(INO_MYFILES), 0),
-                "Trash" => reply.entry(&TTL, &self.vdir_attr(INO_TRASH), 0),
                 "Photos" => reply.entry(&TTL, &self.vdir_attr(INO_PHOTOS), 0),
                 "Computers" => reply.entry(&TTL, &self.vdir_attr(INO_COMPUTERS), 0),
                 _ => reply.error(ENOENT),
             },
             INO_MYFILES => match self.cache.get_child_by_name(&self.volume_id, Some(&self.root_link_id), &name_str) {
-                Ok(Some(node)) => reply.entry(&TTL, &self.node_to_attr(&node), 0),
+                Ok(Some(node)) if !node.is_trashed => reply.entry(&TTL, &self.node_to_attr(&node), 0),
                 _ => reply.error(ENOENT),
             },
-            INO_TRASH => match self.cache.get_child_by_name(&self.volume_id, None, &name_str) {
-                Ok(Some(node)) if node.is_trashed => reply.entry(&TTL, &self.node_to_attr(&node), 0),
+            INO_PHOTOS => match name_str.as_ref() {
+                "Albums"      => reply.entry(&TTL, &self.vdir_attr(INO_PHOTOS_ALBUMS), 0),
+                "All"         => reply.entry(&TTL, &self.vdir_attr(INO_PHOTOS_ALL), 0),
+                "Favorites"   => reply.entry(&TTL, &self.vdir_attr(INO_PHOTOS_FAVS), 0),
+                "Videos"      => reply.entry(&TTL, &self.vdir_attr(INO_PHOTOS_VIDEOS), 0),
+                "Screenshots" => reply.entry(&TTL, &self.vdir_attr(INO_PHOTOS_SCREENSHOTS), 0),
                 _ => reply.error(ENOENT),
             },
-            INO_PHOTOS => {
-                // Look up a photo root folder child by name in the photos volume.
-                if let (Some(vid), Some(root)) = (&self.photos_volume_id, &self.photos_root_link_id) {
-                    match self.cache.get_child_by_name(vid, Some(root), &name_str) {
+            INO_PHOTOS_ALBUMS => {
+                if let Some(vid) = &self.photos_volume_id {
+                    match self.cache.get_album_by_name(vid, &name_str) {
                         Ok(Some(node)) => reply.entry(&TTL, &self.node_to_attr(&node), 0),
                         _ => reply.error(ENOENT),
                     }
-                } else {
-                    reply.error(ENOENT);
-                }
+                } else { reply.error(ENOENT); }
+            }
+            INO_PHOTOS_ALL => {
+                if let Some(vid) = &self.photos_volume_id {
+                    match self.cache.get_photo_by_name(vid, &name_str) {
+                        Ok(Some(node)) => reply.entry(&TTL, &self.node_to_attr(&node), 0),
+                        _ => reply.error(ENOENT),
+                    }
+                } else { reply.error(ENOENT); }
+            }
+            INO_PHOTOS_FAVS => {
+                if let Some(vid) = &self.photos_volume_id {
+                    match self.cache.get_photo_by_tag_and_name(vid, 0, &name_str) {
+                        Ok(Some(node)) => reply.entry(&TTL, &self.node_to_attr(&node), 0),
+                        _ => reply.error(ENOENT),
+                    }
+                } else { reply.error(ENOENT); }
+            }
+            INO_PHOTOS_VIDEOS => {
+                if let Some(vid) = &self.photos_volume_id {
+                    match self.cache.get_photo_by_tag_and_name(vid, 2, &name_str) {
+                        Ok(Some(node)) => reply.entry(&TTL, &self.node_to_attr(&node), 0),
+                        _ => reply.error(ENOENT),
+                    }
+                } else { reply.error(ENOENT); }
+            }
+            INO_PHOTOS_SCREENSHOTS => {
+                if let Some(vid) = &self.photos_volume_id {
+                    match self.cache.get_photo_by_tag_and_name(vid, 1, &name_str) {
+                        Ok(Some(node)) => reply.entry(&TTL, &self.node_to_attr(&node), 0),
+                        _ => reply.error(ENOENT),
+                    }
+                } else { reply.error(ENOENT); }
             }
             INO_COMPUTERS => {
                 // Each computer is a virtual subdirectory named after the device.
@@ -336,7 +401,7 @@ impl Filesystem for ProtonDriveFS {
                 let idx = (p - INO_COMP_BASE) as usize;
                 if let Some((_, _, vid, root)) = self.computers.get(idx) {
                     match self.cache.get_child_by_name(vid, Some(root), &name_str) {
-                        Ok(Some(node)) => reply.entry(&TTL, &self.node_to_attr(&node), 0),
+                        Ok(Some(node)) if !node.is_trashed => reply.entry(&TTL, &self.node_to_attr(&node), 0),
                         _ => reply.error(ENOENT),
                     }
                 } else {
@@ -345,8 +410,9 @@ impl Filesystem for ProtonDriveFS {
             }
             _ if parent >= INO_START => {
                 if let Ok(Some(p_node)) = self.cache.get_node_by_inode(parent - INO_START) {
-                    match self.cache.get_child_by_name(&self.volume_id, Some(&LinkId::new(p_node.link_id)), &name_str) {
-                        Ok(Some(node)) => reply.entry(&TTL, &self.node_to_attr(&node), 0),
+                    let vol = VolumeId::new(p_node.volume_id.clone());
+                    match self.cache.get_child_by_name(&vol, Some(&LinkId::new(p_node.link_id)), &name_str) {
+                        Ok(Some(node)) if !node.is_trashed => reply.entry(&TTL, &self.node_to_attr(&node), 0),
                         _ => reply.error(ENOENT),
                     }
                 } else { reply.error(ENOENT) }
@@ -357,6 +423,100 @@ impl Filesystem for ProtonDriveFS {
 
     fn access(&mut self, _req: &Request<'_>, _ino: u64, _mask: i32, reply: fuser::ReplyEmpty) {
         reply.ok();
+    }
+
+    fn mkdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
+        let name_str = name.to_string_lossy().to_string();
+        let effective_parent = if parent == INO_ROOT { INO_MYFILES } else { parent };
+        let parent_link = match self.resolve_parent_link(effective_parent) {
+            Some(Some(link)) => link,
+            _ => { reply.error(libc::EPERM); return; }
+        };
+
+        // If the parent is still a provisional node (i.e. its background
+        // create_folder hasn't finished yet), block until the provisional_map
+        // has the real link_id, then swap it in so the API receives a valid ID.
+        // A "pending:" prefix means a file upload placeholder — mkdir inside a
+        // file is always wrong, so reject immediately.
+        let parent_link = if parent_link.raw().starts_with("pending:") {
+            reply.error(libc::EPERM);
+            return;
+        } else if parent_link.raw().starts_with("provisional-dir-") {
+            let prov_key = parent_link.raw().to_string();
+            let mut real_lid: Option<String> = None;
+            // Poll provisional_map for up to ~10 s (40 × 250 ms).
+            for _ in 0..40 {
+                real_lid = self.provisional_map.lock().get(&prov_key).cloned();
+                if real_lid.is_some() { break; }
+                // Also check that the provisional node still exists in the cache;
+                // if it's gone but provisional_map has no entry, the create failed.
+                if self.cache.get_node_by_uid(&self.volume_id, &parent_link).ok().flatten().is_none() {
+                    if self.provisional_map.lock().get(&prov_key).is_none() {
+                        reply.error(libc::EIO);
+                        return;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            match real_lid {
+                Some(lid) => LinkId::new(lid),
+                None => { reply.error(libc::ETIMEDOUT); return; }
+            }
+        } else {
+            parent_link
+        };
+
+        // For inodes that live in a computer volume the volume_id from the prov-
+        // isional_map is not available here; detect via the computers list.
+        let volume_id = if effective_parent >= INO_COMP_BASE && effective_parent < INO_START {
+            let idx = (effective_parent - INO_COMP_BASE) as usize;
+            self.computers.get(idx).map(|(_, _, vid, _)| vid.clone()).unwrap_or_else(|| self.volume_id.clone())
+        } else if effective_parent >= INO_START {
+            // Look up the cached node's volume_id (computers nodes live in a
+            // different volume than the main drive).
+            self.cache.get_node_by_inode(effective_parent - INO_START)
+                .ok().flatten()
+                .map(|n| VolumeId::new(n.volume_id))
+                .unwrap_or_else(|| self.volume_id.clone())
+        } else {
+            self.volume_id.clone()
+        };
+
+        self.next_fh += 1;
+        let prov_id = format!("provisional-dir-{}", self.next_fh);
+        let prov_link = LinkId::new(prov_id.clone());
+
+        let _ = self.cache.insert_provisional_node(
+            &volume_id, &prov_id, Some(&parent_link), &name_str, "Folder", None,
+        );
+
+        let node = match self.cache.get_node_by_uid(&volume_id, &prov_link) {
+            Ok(Some(n)) => n,
+            _ => { reply.error(libc::EIO); return; }
+        };
+        reply.entry(&TTL, &self.node_to_attr(&node), 0);
+
+        let client = self.client.clone();
+        let cache = self.cache.clone();
+        let prov_map = self.provisional_map.clone();
+        let parent_uid = NodeUid::new(volume_id.clone(), parent_link);
+        std::thread::spawn(move || {
+            let rt = RuntimeBuilder::new_current_thread().enable_all().build().expect("rt");
+            rt.block_on(async move {
+                match client.create_folder(parent_uid, name_str.clone(), None).await {
+                    Ok(folder) => {
+                        let real_lid = folder.base.uid.link_id.raw().to_string();
+                        let _ = cache.upsert_nodes_batch(&[(Node::Folder(folder), false)]);
+                        let _ = cache.delete_node(&volume_id, &prov_link);
+                        prov_map.lock().insert(prov_id, real_lid);
+                    }
+                    Err(e) => {
+                        eprintln!("  \x1b[31m✗\x1b[0m mkdir '{}' failed: {e}", name_str);
+                        let _ = cache.delete_node(&volume_id, &prov_link);
+                    }
+                }
+            });
+        });
     }
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
@@ -371,7 +531,6 @@ impl Filesystem for ProtonDriveFS {
         match ino {
             INO_ROOT => {
                 entries.push((INO_MYFILES, FileType::Directory, "MyFiles".to_string()));
-                entries.push((INO_TRASH, FileType::Directory, "Trash".to_string()));
                 entries.push((INO_PHOTOS, FileType::Directory, "Photos".to_string()));
                 entries.push((INO_COMPUTERS, FileType::Directory, "Computers".to_string()));
             }
@@ -383,20 +542,54 @@ impl Filesystem for ProtonDriveFS {
                     }
                 }
             }
-            INO_TRASH => {
-                if let Ok(nodes) = self.cache.list_trash(&self.volume_id) {
-                    for node in nodes {
-                        let kind = if node.node_type == "Folder" || node.node_type == "Album" { FileType::Directory } else { FileType::RegularFile };
-                        entries.push((node.inode.unwrap_or(0) + INO_START, kind, node.name));
+            INO_PHOTOS => {
+                entries.push((INO_PHOTOS_ALBUMS,      FileType::Directory, "Albums".to_string()));
+                entries.push((INO_PHOTOS_ALL,         FileType::Directory, "All".to_string()));
+                entries.push((INO_PHOTOS_FAVS,        FileType::Directory, "Favorites".to_string()));
+                entries.push((INO_PHOTOS_VIDEOS,      FileType::Directory, "Videos".to_string()));
+                entries.push((INO_PHOTOS_SCREENSHOTS, FileType::Directory, "Screenshots".to_string()));
+            }
+            INO_PHOTOS_ALBUMS => {
+                if let Some(vid) = &self.photos_volume_id.clone() {
+                    if let Ok(albums) = self.cache.list_albums(vid) {
+                        for node in albums {
+                            entries.push((node.inode.unwrap_or(0) + INO_START, FileType::Directory, node.name));
+                        }
                     }
                 }
             }
-            INO_PHOTOS => {
-                if let (Some(vid), Some(root)) = (&self.photos_volume_id.clone(), &self.photos_root_link_id.clone()) {
-                    if let Ok(nodes) = self.cache.list_children(vid, Some(root)) {
-                        for node in nodes {
-                            let kind = if node.node_type == "Folder" || node.node_type == "Album" { FileType::Directory } else { FileType::RegularFile };
-                            entries.push((node.inode.unwrap_or(0) + INO_START, kind, node.name));
+            INO_PHOTOS_ALL => {
+                if let Some(vid) = &self.photos_volume_id.clone() {
+                    if let Ok(photos) = self.cache.list_all_photos(vid) {
+                        for node in photos {
+                            entries.push((node.inode.unwrap_or(0) + INO_START, FileType::RegularFile, node.name));
+                        }
+                    }
+                }
+            }
+            INO_PHOTOS_FAVS => {
+                if let Some(vid) = &self.photos_volume_id.clone() {
+                    if let Ok(photos) = self.cache.list_photos_by_tag(vid, 0) {
+                        for node in photos {
+                            entries.push((node.inode.unwrap_or(0) + INO_START, FileType::RegularFile, node.name));
+                        }
+                    }
+                }
+            }
+            INO_PHOTOS_VIDEOS => {
+                if let Some(vid) = &self.photos_volume_id.clone() {
+                    if let Ok(photos) = self.cache.list_photos_by_tag(vid, 2) {
+                        for node in photos {
+                            entries.push((node.inode.unwrap_or(0) + INO_START, FileType::RegularFile, node.name));
+                        }
+                    }
+                }
+            }
+            INO_PHOTOS_SCREENSHOTS => {
+                if let Some(vid) = &self.photos_volume_id.clone() {
+                    if let Ok(photos) = self.cache.list_photos_by_tag(vid, 1) {
+                        for node in photos {
+                            entries.push((node.inode.unwrap_or(0) + INO_START, FileType::RegularFile, node.name));
                         }
                     }
                 }
@@ -420,7 +613,10 @@ impl Filesystem for ProtonDriveFS {
             }
             _ if ino >= INO_START => {
                 if let Ok(Some(p_node)) = self.cache.get_node_by_inode(ino - INO_START) {
-                    if let Ok(nodes) = self.cache.list_children(&self.volume_id, Some(&LinkId::new(p_node.link_id))) {
+                    // Use the node's own volume_id so computer subdirectories
+                    // (which live in a different volume) are listed correctly.
+                    let vol = VolumeId::new(p_node.volume_id.clone());
+                    if let Ok(nodes) = self.cache.list_children(&vol, Some(&LinkId::new(p_node.link_id))) {
                         for node in nodes {
                             let kind = if node.node_type == "Folder" || node.node_type == "Album" { FileType::Directory } else { FileType::RegularFile };
                             entries.push((node.inode.unwrap_or(0) + INO_START, kind, node.name));
@@ -440,63 +636,24 @@ impl Filesystem for ProtonDriveFS {
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        let access_mode = flags & libc::O_ACCMODE;
-        if access_mode == libc::O_WRONLY || access_mode == libc::O_RDWR {
-            reply.error(libc::EROFS);
-            return;
-        }
         if ino < INO_START { reply.error(libc::EISDIR); return; }
 
-        let node = match self.cache.get_node_by_inode(ino - INO_START) {
-            Ok(Some(n)) => n,
-            _ => { reply.error(ENOENT); return; }
-        };
-        let link_id = LinkId::new(node.link_id.clone());
-        eprintln!("  [FUSE] open '{}' flags={:#o}", node.name, flags);
-
-        if let Ok(Some(path)) = self.cache.get_cached_download(&self.volume_id, &link_id) {
-            if path.exists() {
-                reply.opened(ino, fuser::consts::FOPEN_KEEP_CACHE);
-                return;
-            }
-        }
-        self.next_fh += 1;
-        let fh = self.next_fh;
-
-        if self.intent_confirmed.contains(&node.link_id) {
-            eprintln!("  [FUSE] open '{}' → real open (intent confirmed), fh={}", node.name, fh);
-            reply.opened(fh, fuser::consts::FOPEN_DIRECT_IO);
+        let access_mode = flags & libc::O_ACCMODE;
+        if access_mode == libc::O_WRONLY {
+            reply.error(libc::EACCES);
             return;
         }
 
-        const PROBE_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
-        let now = std::time::Instant::now();
-        let is_probe = match self.probe_last_seen.get_mut(&node.link_id) {
-            None => {
-                self.probe_last_seen.insert(node.link_id.clone(), now);
-                true
-            }
-            Some(last) if now.duration_since(*last) < PROBE_WINDOW => {
-                *last = now;
-                true
-            }
-            Some(_) => {
-                self.probe_last_seen.remove(&node.link_id);
-                self.intent_confirmed.insert(node.link_id.clone());
-                false
-            }
-        };
-
-        if is_probe {
-            self.probe_fhs.insert(fh);
-            eprintln!("  [FUSE] open '{}' → probe (scan), fh={}", node.name, fh);
-        } else {
-            eprintln!("  [FUSE] open '{}' → real open, fh={}", node.name, fh);
+        if self.cache.get_node_by_inode(ino - INO_START).ok().flatten().is_none() {
+            reply.error(ENOENT);
+            return;
         }
-        reply.opened(fh, fuser::consts::FOPEN_DIRECT_IO);
+
+        self.next_fh += 1;
+        reply.opened(self.next_fh, 0);
     }
 
-    fn read(&mut self, _req: &Request<'_>, ino: u64, fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
+    fn read(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
         if ino < INO_START { reply.error(libc::EISDIR); return; }
 
         let node = match self.cache.get_node_by_inode(ino - INO_START) {
@@ -504,34 +661,46 @@ impl Filesystem for ProtonDriveFS {
             _ => { reply.error(ENOENT); return; }
         };
         let link_id = LinkId::new(node.link_id.clone());
+        let node_volume_id = VolumeId::new(node.volume_id.clone());
 
-        if let Ok(Some(path)) = self.cache.get_cached_download(&self.volume_id, &link_id) {
+        if let Ok(Some(path)) = self.cache.get_cached_download(&node_volume_id, &link_id) {
             if path.exists() {
                 Self::serve_file_range(&path, offset, size, reply);
                 return;
             }
         }
 
-        if self.probe_fhs.contains(&fh) {
+        if let Some(ref _thumb_id) = node.thumbnail_id {
+            if let Ok(paths) = crate::app_paths::resolve_paths() {
+                let thumb_path = paths.cache_dir.join("thumbs").join(&node.link_id);
+                if thumb_path.exists() {
+                    Self::serve_file_range(&thumb_path, offset, size, reply);
+                    return;
+                }
+            }
+        }
+
+        let is_computers_vol = self.photos_volume_id
+            .as_ref()
+            .map(|pv| node.volume_id != self.volume_id.raw() && node.volume_id != pv.raw())
+            .unwrap_or(node.volume_id != self.volume_id.raw());
+        if is_computers_vol {
             reply.error(libc::ENODATA);
             return;
         }
 
-        eprintln!("  [FUSE] read '{}' → not cached, hydrating...", node.name);
         if !self.pending_downloads.contains_key(&node.link_id) {
-            let waiter = self.start_background_download(&link_id, &node.name, node.size);
+            let waiter = self.start_background_download(&node_volume_id, &link_id, &node.name, node.size);
             self.pending_downloads.insert(node.link_id.clone(), waiter);
         }
         let waiter = self.pending_downloads[&node.link_id].clone();
         match Self::wait_for_download(&waiter) {
             Ok(path) => {
                 self.pending_downloads.remove(&node.link_id);
-                self.intent_confirmed.remove(&node.link_id);
                 Self::serve_file_range(&path, offset, size, reply);
             }
             Err(e) => {
                 eprintln!("  \x1b[31m✗\x1b[0m Read failed for '{}': {}", node.name, e);
-                self.intent_confirmed.remove(&node.link_id);
                 reply.error(libc::EIO);
             }
         }
@@ -539,8 +708,6 @@ impl Filesystem for ProtonDriveFS {
 
     fn create(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, _mode: u32, _umask: u32, _flags: i32, reply: ReplyCreate) {
         let name_str = name.to_string_lossy().to_string();
-        eprintln!("  [FUSE] create '{}' in parent inode {}", name_str, parent);
-
         let parent_link = match self.resolve_parent_link(parent) {
             Some(Some(link)) => link,
             Some(None) => { reply.error(libc::EPERM); return; }
@@ -549,7 +716,8 @@ impl Filesystem for ProtonDriveFS {
 
         self.next_fh += 1;
         let fh = self.next_fh;
-        let fake_ino = 1_000_000_000u64 + fh;
+        let provisional_id = format!("pending:{}", fh);
+        let prov_link = LinkId::new(provisional_id.clone());
 
         let temp_path = match crate::app_paths::resolve_paths() {
             Ok(p) => p.cache_dir.join("uploads").join(format!("{}.tmp", fh)),
@@ -563,26 +731,21 @@ impl Filesystem for ProtonDriveFS {
             Err(e) => { eprintln!("  \x1b[31m✗\x1b[0m create: temp file error: {}", e); reply.error(libc::EIO); return; }
         }
 
+        let _ = self.cache.insert_provisional_node(
+            &self.volume_id, &provisional_id, Some(&parent_link), &name_str, "File", Some(0),
+        );
+        let node = match self.cache.get_node_by_uid(&self.volume_id, &prov_link) {
+            Ok(Some(n)) => n,
+            _ => { reply.error(libc::EIO); return; }
+        };
+
         self.pending_uploads.insert(fh, UploadBuffer {
             temp_path,
             parent_link_id: parent_link,
-            name: name_str.clone(),
+            name: name_str,
         });
 
-        let now = std::time::SystemTime::now();
-        let attr = FileAttr {
-            ino: fake_ino,
-            size: 0,
-            blocks: 0,
-            atime: now, mtime: now, ctime: now, crtime: now,
-            kind: FileType::RegularFile,
-            perm: 0o644,
-            nlink: 1,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
-            rdev: 0, flags: 0, blksize: 4096,
-        };
-        reply.created(&TTL, &attr, 0, fh, 0);
+        reply.created(&TTL, &self.node_to_attr(&node), 0, fh, 0);
     }
 
     fn write(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyWrite) {
@@ -604,31 +767,35 @@ impl Filesystem for ProtonDriveFS {
     }
 
     fn release(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, _flags: i32, _lock_owner: Option<u64>, _flush: bool, reply: ReplyEmpty) {
-        self.probe_fhs.remove(&fh);
         if let Some(buf) = self.pending_uploads.remove(&fh) {
-            eprintln!("  [FUSE] release '{}': uploading in background...", buf.name);
-
             let provisional_id = format!("pending:{}", fh);
-            let file_size = buf.temp_path.metadata().map(|m| m.len() as i64).ok();
-            let _ = self.cache.insert_provisional_node(
-                &self.volume_id,
-                &provisional_id,
-                Some(&buf.parent_link_id),
-                &buf.name,
-                "File",
-                file_size,
-            );
+            let prov_link = LinkId::new(provisional_id.clone());
+
+            if let Ok(size) = buf.temp_path.metadata().map(|m| m.len() as i64) {
+                let _ = self.cache.update_node_size(&self.volume_id, &prov_link, size);
+            }
 
             let client = self.client.clone();
             let volume_id = self.volume_id.clone();
             let cache = self.cache.clone();
-            let parent_uid = NodeUid::new(volume_id.clone(), buf.parent_link_id);
+            let prov_map = self.provisional_map.clone();
+            let raw_parent = buf.parent_link_id.raw().to_string();
             let name = buf.name.clone();
             let temp_path = buf.temp_path.clone();
-            let prov_id = provisional_id.clone();
             std::thread::spawn(move || {
                 let rt = RuntimeBuilder::new_current_thread().enable_all().build().expect("rt");
                 rt.block_on(async move {
+                    let real_parent_raw = if raw_parent.starts_with("provisional-dir-") {
+                        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                        loop {
+                            { let m = prov_map.lock(); if let Some(r) = m.get(&raw_parent) { break r.clone(); } }
+                            if std::time::Instant::now() >= deadline { break raw_parent.clone(); }
+                            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                        }
+                    } else {
+                        raw_parent
+                    };
+                    let parent_uid = NodeUid::new(volume_id.clone(), LinkId::new(real_parent_raw));
                     let named_path = temp_path.parent().unwrap().join(&name);
                     let _ = std::fs::rename(&temp_path, &named_path);
                     eprintln!("  \x1b[36m↑\x1b[0m Uploading '{}' to Proton Drive...", name);
@@ -636,15 +803,12 @@ impl Filesystem for ProtonDriveFS {
                         Ok(_) => {
                             let _ = std::fs::remove_file(&named_path);
                             eprintln!("  \x1b[32m✓\x1b[0m '{}' uploaded.", name);
-                            let fake_link = proton_drive_sdk::links::LinkId::new(prov_id);
-                            let _ = cache.delete_node(&volume_id, &fake_link);
                         }
                         Err(e) => {
                             eprintln!("  \x1b[31m✗\x1b[0m Upload failed for '{}': {}", name, e);
-                            let fake_link = proton_drive_sdk::links::LinkId::new(prov_id);
-                            let _ = cache.delete_node(&volume_id, &fake_link);
                         }
                     }
+                    let _ = cache.delete_node(&volume_id, &prov_link);
                 });
             });
         }
@@ -652,12 +816,12 @@ impl Filesystem for ProtonDriveFS {
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        eprintln!("  [FUSE] unlink '{}'", name.to_string_lossy());
+        tracing::trace!("[FUSE] unlink '{}'", name.to_string_lossy());
         self.do_trash_optimistic(parent, name, reply);
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        eprintln!("  [FUSE] rmdir '{}'", name.to_string_lossy());
+        tracing::trace!("[FUSE] rmdir '{}'", name.to_string_lossy());
         self.do_trash_optimistic(parent, name, reply);
     }
 
@@ -689,7 +853,7 @@ impl Filesystem for ProtonDriveFS {
         let need_move = newparent != parent;
         let need_rename = newname_str != name_str;
 
-        eprintln!("  [FUSE] rename '{}' → '{}' move={} rename={}", name_str, newname_str, need_move, need_rename);
+        tracing::trace!("[FUSE] rename '{}' → '{}' move={} rename={}", name_str, newname_str, need_move, need_rename);
         let new_name_opt: Option<&str> = if need_rename { Some(&newname_str) } else { None };
         let new_parent_opt: Option<&LinkId> = if need_move { Some(&newparent_link) } else { None };
         let _ = self.cache.rename_cached_node(&self.volume_id, &link_id, new_name_opt, new_parent_opt);
@@ -722,6 +886,7 @@ impl Filesystem for ProtonDriveFS {
     }
 }
 
+#[allow(dead_code)]
 fn format_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
     let mut size = bytes as f64;

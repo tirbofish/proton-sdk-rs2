@@ -176,6 +176,66 @@ impl FolderOperations {
         Ok(results)
     }
 
+    /// Streaming version of [`enumerate_children`]: fetches and decrypts children
+    /// page-by-page, sending each item through `tx` as soon as it is ready.
+    /// Intended to be called from inside a `tokio::spawn` so the caller gets
+    /// items without waiting for the whole listing to complete.
+    pub async fn enumerate_children_to_channel(
+        client: ProtonDriveClient,
+        folder_uid: NodeUid,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<PotentialObject<Node, DegradedNode>>>,
+    ) {
+        let result: anyhow::Result<()> = async {
+            let volume_id = folder_uid.volume_id.clone();
+            let folder_secrets = Self::get_secrets(&client, folder_uid.clone()).await?;
+            let mut batch_loader = crate::node::NodeBatchLoader::new(
+                Arc::new(client.clone()),
+                volume_id.clone(),
+                Some(folder_secrets.base.key),
+            );
+
+            let mut anchor_id = None;
+            let mut must_try_more_results = true;
+            while must_try_more_results {
+                let response = client
+                    .api()
+                    .folders()
+                    .get_children(
+                        volume_id.clone(),
+                        folder_uid.link_id.clone(),
+                        anchor_id.clone(),
+                    )
+                    .await?;
+
+                must_try_more_results = response.more_results_exist;
+                if let Some(last) = response.link_ids.last() {
+                    anchor_id = Some(last.clone());
+                }
+                for child_id in response.link_ids {
+                    let batch = batch_loader.queue_and_try_load_batch(child_id).await?;
+                    for item in batch {
+                        if tx.send(Ok(item)).await.is_err() {
+                            return Ok(()); // receiver dropped — stop silently
+                        }
+                    }
+                }
+            }
+
+            let remaining = batch_loader.load_remaining().await?;
+            for item in remaining {
+                if tx.send(Ok(item)).await.is_err() {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = result {
+            let _ = tx.send(Err(e)).await;
+        }
+    }
+
     pub async fn get_secrets(
         client: &ProtonDriveClient,
         folder_uid: crate::node::NodeUid,

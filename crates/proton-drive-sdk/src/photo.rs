@@ -9,7 +9,7 @@ use crate::links::LinkId;
 use crate::node::file::download::FileDownloader;
 use crate::node::file::upload::FileUploader;
 use crate::node::folder::FolderNode;
-use crate::node::photo::{PhotosFileUploadMetadata, PhotosTimelineItem};
+use crate::node::photo::{PhotosFileUploadMetadata, PhotosTimelineItem, TimelineEntry};
 use crate::node::{DegradedNode, Node, NodeAndSecrets, NodeUid};
 use crate::share_ops::ShareOperations;
 use crate::node::DtoToMetadataConverter;
@@ -240,6 +240,25 @@ impl ProtonPhotosClient {
         self.drive.list_children(volume_id, parent_link_id).await
     }
 
+    /// Streaming version of [`list_children`]: returns a stream that yields
+    /// items as they are fetched and decrypted, without waiting for all of them.
+    pub async fn enumerate_children(
+        &self,
+        volume_id: VolumeId,
+        parent_link_id: Option<LinkId>,
+    ) -> anyhow::Result<
+        impl futures::Stream<Item = anyhow::Result<PotentialObject<Node, DegradedNode>>> + 'static,
+    > {
+        let uid = match parent_link_id {
+            Some(id) => NodeUid::new(volume_id, id),
+            None => {
+                let root = self.get_photos_root_folder().await?;
+                root.base.uid
+            }
+        };
+        self.drive.enumerate_folder_children(uid).await
+    }
+
     /// Creates a file uploader for a new photo in the given parent folder.
     ///
     /// `media_type` should be a MIME type such as `"image/jpeg"`.  The upload
@@ -388,6 +407,36 @@ impl ProtonPhotosClient {
         event_id: &str,
     ) -> anyhow::Result<CoreEventsResponse> {
         self.drive.api().events().get_core_events(event_id).await
+    }
+
+    /// Fetch one page of the photos timeline, returning raw entries with tags
+    /// and an optional cursor for the next page.
+    ///
+    /// Pass `cursor = None` for the first page, then the returned `next_cursor`
+    /// for each subsequent page. `next_cursor = None` means this was the last page.
+    pub async fn get_timeline_page(
+        &self,
+        volume_id: &VolumeId,
+        cursor: Option<&LinkId>,
+    ) -> anyhow::Result<(Vec<TimelineEntry>, Option<LinkId>)> {
+        use crate::api::file::photos::TimelinePhotoListRequest;
+        let request = TimelinePhotoListRequest {
+            volume_id: volume_id.clone(),
+            previous_page_last_link_id: cursor.cloned(),
+        };
+        let response = self.photos_api.get_timeline_photos(request).await?;
+        let is_last = response.photos.len() < 500;
+        let next_cursor = if is_last {
+            None
+        } else {
+            response.photos.last().map(|p| p.id.clone())
+        };
+        let entries = response.photos.into_iter().map(|dto| TimelineEntry {
+            uid: NodeUid::new(volume_id.clone(), dto.id),
+            capture_time: dto.capture_time,
+            tags: dto.tags,
+        }).collect();
+        Ok((entries, next_cursor))
     }
 
     /// Access the underlying [`ProtonDriveClient`] for operations not yet

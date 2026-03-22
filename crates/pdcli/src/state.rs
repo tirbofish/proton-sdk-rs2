@@ -1,7 +1,9 @@
 use crate::rusqlite_cache::RusqliteCache;
 use crate::settings::Settings;
 use proton_drive_sdk::client::ProtonDriveClient;
+use proton_drive_sdk::links::LinkId;
 use proton_drive_sdk::node::NodeUid;
+use proton_drive_sdk::volume::VolumeId;
 use proton_sdk_rs2::session::ProtonAPISession;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +35,10 @@ pub struct ReplState {
     mount_point: Option<PathBuf>,
     /// Application settings
     settings: Settings,
+    /// Registered computers: (device_id, name, volume_id, root_link_id)
+    computers: Vec<(String, String, VolumeId, LinkId)>,
+    /// Whether MyFiles has been fully indexed this session
+    myfiles_indexed: bool,
 }
 
 impl ReplState {
@@ -50,6 +56,8 @@ impl ReplState {
             cancelled: AtomicBool::new(false),
             mount_point: None,
             settings: Settings::default(),
+            computers: Vec::new(),
+            myfiles_indexed: false,
         }
     }
 
@@ -165,5 +173,29 @@ impl ReplState {
 
     pub fn get_settings_mut(&mut self) -> &mut Settings {
         &mut self.settings
+    }
+
+    pub fn set_computers(&mut self, computers: Vec<(String, String, VolumeId, LinkId)>) {
+        self.computers = computers;
+    }
+
+    pub fn get_photos_root_node_uid(&self) -> Option<&NodeUid> {
+        self.photos_root_node_uid.as_ref()
+    }
+
+    pub fn set_photos_root_node_uid(&mut self, uid: NodeUid) {
+        self.photos_root_node_uid = Some(uid);
+    }
+
+    pub fn get_computers(&self) -> &[(String, String, VolumeId, LinkId)] {
+        &self.computers
+    }
+
+    pub fn myfiles_indexed(&self) -> bool {
+        self.myfiles_indexed
+    }
+
+    pub fn set_myfiles_indexed(&mut self, v: bool) {
+        self.myfiles_indexed = v;
     }
 }

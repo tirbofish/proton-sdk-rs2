@@ -6,7 +6,7 @@ use proton_drive_sdk::photo::ProtonPhotosClient;
 use std::sync::Arc;
 use parking_lot::Mutex;
 
-use super::helpers::{new_spinner, progress_bar_for, progress_callback};
+use super::helpers::{new_spinner, download_progress_bar, progress_callback, finish_progress};
 
 pub async fn photos_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Result<()> {
     let sub = args.first().copied().unwrap_or("ls");
@@ -112,12 +112,12 @@ async fn photos_get(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Result<()> 
         local_path.to_path_buf()
     };
 
-    let pb = progress_bar_for(&name, size);
+    let pb = download_progress_bar(&name, size);
     photos
         .drive()
         .download_to_file(uid, &dest, progress_callback(pb.clone()))
         .await?;
-    pb.finish_and_clear();
+    finish_progress(&pb);
 
     println!("Downloaded '{}' → {}", name, dest.display());
     Ok(())

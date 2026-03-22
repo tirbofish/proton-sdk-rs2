@@ -128,6 +128,7 @@ impl LinksApiClient for DefaultLinksApiClient {
                 return Err(e.into());
             }
         };
+        result.base.to_result()?;
         Ok(result)
     }
 
@@ -333,6 +334,7 @@ pub struct LinkDetailsResponse {
     #[serde(flatten)]
     pub base: ApiResponse,
 
+    #[serde(default)]
     pub links: Vec<LinkDetailsDto>,
 }
 

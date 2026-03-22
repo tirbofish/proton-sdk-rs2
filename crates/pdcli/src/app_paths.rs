@@ -9,6 +9,10 @@ pub struct AppDataPaths {
     pub history_path: PathBuf,
     pub cache_dir: PathBuf,
     pub settings_path: PathBuf,
+    /// PID file for the background daemon process.
+    pub daemon_pid_path: PathBuf,
+    /// Unix socket path used to send commands to the daemon.
+    pub daemon_socket_path: PathBuf,
 }
 
 pub fn resolve_paths() -> Result<AppDataPaths> {
@@ -25,5 +29,7 @@ pub fn resolve_paths() -> Result<AppDataPaths> {
         history_path: app_dirs.data_dir.join("history.txt"),
         settings_path: app_dirs.config_dir.join("settings.toml"),
         cache_dir: app_dirs.cache_dir,
+        daemon_pid_path: app_dirs.data_dir.join("daemon.pid"),
+        daemon_socket_path: app_dirs.data_dir.join("daemon.sock"),
     })
 }

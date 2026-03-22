@@ -3,7 +3,7 @@ use std::pin::Pin;
 
 use crate::state::ReplState;
 use crate::rusqlite_cache::RusqliteCache;
-use crate::app_paths::resolve_paths;
+use crate::app_paths::{resolve_paths, AppDataPaths};
 use anyhow::{anyhow, Result};
 use glob::glob;
 use proton_drive_sdk::node::{Node, NodeUid};
@@ -12,13 +12,14 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use super::helpers::{
-    find_child_by_name, has_wildcards, list_children, progress_bar_for, progress_callback,
-    resolve_folder_path, selector_matches, split_parent_and_leaf,
+    download_progress_bar, find_child_by_name, finish_progress, has_wildcards, list_children,
+    node_file_size, progress_callback, resolve_folder_path, selector_matches,
+    split_parent_and_leaf, upload_progress_bar,
 };
 
 pub async fn hydrate_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Result<()> {
     if args.is_empty() {
-        return Err(anyhow!("Usage: hydrate <remote_path>"));
+        return Err(anyhow!("Usage: hydrate <remote_path|pattern>"));
     }
 
     let (client, current_uid, current_path, root_uid, cache) = {
@@ -31,40 +32,124 @@ pub async fn hydrate_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Re
         (client, uid, path, root, cache)
     };
 
+    let paths = resolve_paths()?;
+
     for arg in args {
-        let (parent_selector, leaf_selector) = split_parent_and_leaf(arg);
-        let target_uid: NodeUid = if parent_selector == "." {
-            current_uid.clone().ok_or_else(|| anyhow!("No current directory"))?
-        } else {
-            let cu = current_uid.clone().ok_or_else(|| anyhow!("No current directory"))?;
-            resolve_folder_path(&client, cu, current_path.clone(), root_uid.clone(), parent_selector, Some(&*cache)).await?.0
-        };
-
-        let node = find_child_by_name(&client, target_uid, leaf_selector, Some(&*cache)).await?;
-        let node_uid = node.uid().clone();
-        let node_name = node.base().name.clone();
-
-        match &node {
-            Node::File(_) | Node::Photo(_) => {
-                let paths = resolve_paths()?;
-                let dest_path = paths.cache_dir.join("files").join(node_uid.link_id.raw());
-                let _ = std::fs::create_dir_all(dest_path.parent().unwrap());
-                
-                println!("Hydrating '{}'...", node_name);
-                let pb = progress_bar_for(&node_name, 0);
-                client
-                    .download_to_file(node_uid.clone(), &dest_path, progress_callback(pb.clone()))
-                    .await?;
-                pb.finish_and_clear();
-                
-                cache.register_download(&node_uid.volume_id, &node_uid.link_id, &dest_path)?;
-                println!("'{}' is now available offline.", node_name);
+        if has_wildcards(arg) {
+            // Wildcard: enumerate the current folder and hydrate all matches.
+            let (parent_selector, leaf_selector) = split_parent_and_leaf(arg);
+            let target_uid: NodeUid = if parent_selector == "." {
+                current_uid.clone().ok_or_else(|| anyhow!("No current directory"))?
+            } else {
+                let cu = current_uid.clone().ok_or_else(|| anyhow!("No current directory"))?;
+                resolve_folder_path(&client, cu, current_path.clone(), root_uid.clone(), parent_selector, Some(&*cache)).await?.0
+            };
+            let children = list_children(&client, target_uid).await?;
+            let matched: Vec<_> = children.into_iter()
+                .filter(|n| selector_matches(leaf_selector, &n.base().name).unwrap_or(false))
+                .collect();
+            if matched.is_empty() {
+                println!("No files matched '{}'", arg);
+                continue;
             }
-            _ => println!("'{}' is a directory, hydration not needed.", node_name),
+            for node in matched {
+                hydrate_node(&client, &cache, &paths, node).await?;
+            }
+        } else {
+            let (parent_selector, leaf_selector) = split_parent_and_leaf(arg);
+            let target_uid: NodeUid = if parent_selector == "." {
+                current_uid.clone().ok_or_else(|| anyhow!("No current directory"))?
+            } else {
+                let cu = current_uid.clone().ok_or_else(|| anyhow!("No current directory"))?;
+                resolve_folder_path(&client, cu, current_path.clone(), root_uid.clone(), parent_selector, Some(&*cache)).await?.0
+            };
+            let node = find_child_by_name(&client, target_uid, leaf_selector, Some(&*cache)).await?;
+            hydrate_node(&client, &cache, &paths, node).await?;
         }
     }
 
     Ok(())
+}
+
+async fn hydrate_node(
+    client: &ProtonDriveClient,
+    cache: &Arc<RusqliteCache>,
+    paths: &AppDataPaths,
+    node: proton_drive_sdk::node::Node,
+) -> Result<()> {
+    use proton_drive_sdk::node::Node;
+    match node {
+        Node::File(_) | Node::Photo(_) => {
+            let node_uid = node.uid().clone();
+            let node_name = node.base().name.clone();
+            let dest_path = paths.cache_dir.join("files").join(node_uid.link_id.raw());
+            let _ = std::fs::create_dir_all(dest_path.parent().unwrap());
+
+            // Skip if already cached on disk.
+            if let Ok(Some(cached)) = cache.get_cached_download(&node_uid.volume_id, &node_uid.link_id) {
+                if cached.exists() {
+                    println!("  '{}' already cached.", node_name);
+                    return Ok(());
+                }
+            }
+
+            let pb = download_progress_bar(&node_name, node_file_size(&node));
+            client
+                .download_to_file(node_uid.clone(), &dest_path, progress_callback(pb.clone()))
+                .await?;
+            finish_progress(&pb);
+            cache.register_download(&node_uid.volume_id, &node_uid.link_id, &dest_path)?;
+            println!("  '{}' cached for offline access.", node_name);
+        }
+        Node::Folder(_) | Node::Album(_) => {
+            let folder_uid = node.uid().clone();
+            let folder_name = node.base().name.clone();
+            println!("  Hydrating folder '{}'...", folder_name);
+            let children = list_children(client, folder_uid).await?;
+            let mut count = 0usize;
+            for child in children {
+                hydrate_node_recursive(client, cache, paths, child, &mut count).await?;
+            }
+            println!("  Hydrated {} file(s) from '{}'.", count, folder_name);
+        }
+    }
+    Ok(())
+}
+
+fn hydrate_node_recursive<'a>(
+    client: &'a ProtonDriveClient,
+    cache: &'a Arc<RusqliteCache>,
+    paths: &'a AppDataPaths,
+    node: proton_drive_sdk::node::Node,
+    count: &'a mut usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        use proton_drive_sdk::node::Node;
+        match node {
+            Node::File(_) | Node::Photo(_) => {
+                let node_uid = node.uid().clone();
+                let node_name = node.base().name.clone();
+                let dest = paths.cache_dir.join("files").join(node_uid.link_id.raw());
+                let _ = std::fs::create_dir_all(dest.parent().unwrap());
+                if let Ok(Some(cached)) = cache.get_cached_download(&node_uid.volume_id, &node_uid.link_id) {
+                    if cached.exists() { return Ok(()); }
+                }
+                let pb = download_progress_bar(&node_name, node_file_size(&node));
+                client.download_to_file(node_uid.clone(), &dest, progress_callback(pb.clone())).await?;
+                finish_progress(&pb);
+                cache.register_download(&node_uid.volume_id, &node_uid.link_id, &dest)?;
+                *count += 1;
+            }
+            Node::Folder(_) | Node::Album(_) => {
+                let folder_uid = node.uid().clone();
+                let children = list_children(client, folder_uid).await?;
+                for child in children {
+                    hydrate_node_recursive(client, cache, paths, child, count).await?;
+                }
+            }
+        }
+        Ok(())
+    })
 }
 
 pub async fn download_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Result<()> {
@@ -127,11 +212,11 @@ pub async fn download_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> R
                 }
 
                 println!("Downloading '{}' → '{}'", node_name, local_path.display());
-                let pb = progress_bar_for(&node_name, 0);
+                let pb = download_progress_bar(&node_name, node_file_size(&node));
                 client
                     .download_to_file(node_uid.clone(), &local_path, progress_callback(pb.clone()))
                     .await?;
-                pb.finish_and_clear();
+                finish_progress(&pb);
                 cache.register_download(&node_uid.volume_id, &node_uid.link_id, &local_path)?;
             }
             Node::Folder(_) | Node::Album(_) => {
@@ -154,11 +239,11 @@ pub async fn download_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> R
                     Node::File(_) | Node::Photo(_) => {
                         let out_path = destination.join(&node_name);
                         println!("Downloading '{}' → '{}'", node_name, out_path.display());
-                        let pb = progress_bar_for(&node_name, 0);
+                        let pb = download_progress_bar(&node_name, node_file_size(&node));
                         client
                             .download_to_file(node_uid.clone(), &out_path, progress_callback(pb.clone()))
                             .await?;
-                        pb.finish_and_clear();
+                        finish_progress(&pb);
                         cache.register_download(&node_uid.volume_id, &node_uid.link_id, &out_path)?;
                         total_count += 1;
                     }
@@ -197,13 +282,13 @@ fn download_folder_recursive<'a>(
             let node_name = node.base().name.clone();
             let sub_path = local_path.join(&node_name);
 
-            match node {
+            match &node {
                 Node::File(_) | Node::Photo(_) => {
-                    let pb = progress_bar_for(&node_name, 0);
+                    let pb = download_progress_bar(&node_name, node_file_size(&node));
                     client
                         .download_to_file(node_uid, &sub_path, progress_callback(pb.clone()))
                         .await?;
-                    pb.finish_and_clear();
+                    finish_progress(&pb);
                     count += 1;
                 }
                 Node::Folder(_) | Node::Album(_) => {
@@ -239,43 +324,111 @@ pub async fn upload_command(args: &[&str], state: &Arc<Mutex<ReplState>>) -> Res
         current_uid.ok_or_else(|| anyhow!("No current directory"))?
     };
 
-    let mut local_files = Vec::new();
+    // Collect local paths — both files and directories are accepted.
+    let mut local_paths: Vec<std::path::PathBuf> = Vec::new();
     if local_selector.contains('*') || local_selector.contains('?') {
         for entry in glob(local_selector)? {
-            let path = entry?;
-            if path.is_file() {
-                local_files.push(path);
-            }
+            local_paths.push(entry?);
+        }
+        if local_paths.is_empty() {
+            return Err(anyhow!("No local files matched '{}'", local_selector));
         }
     } else {
-        local_files.push(std::path::PathBuf::from(local_selector));
-    }
-
-    if local_files.is_empty() {
-        return Err(anyhow!("No local files matched '{}'", local_selector));
-    }
-
-    for path in &local_files {
-        let name = path.file_name().unwrap().to_string_lossy().to_string();
-        println!("Uploading '{}'...", name);
-        let pb = progress_bar_for(&name, 0);
-        
-        let result = client.upload_file(path, target_uid.clone(), false, progress_callback(pb.clone())).await;
-        pb.finish_and_clear();
-        
-        match result {
-            Ok(_) => println!("Uploaded '{}'", name),
-            Err(e) if format!("{}", e).contains("2500") => {
-                println!("File '{}' already exists. Updating revision...", name);
-                let children = list_children(&client, target_uid.clone()).await?;
-                if let Some(existing) = children.iter().find(|n| n.base().name == name) {
-                    client.upload_file(path, existing.uid().clone(), true, progress_callback(progress_bar_for(&name, 0))).await?;
-                    println!("Updated revision for '{}'", name);
-                }
-            }
-            Err(e) => return Err(e),
+        let p = std::path::PathBuf::from(local_selector);
+        if !p.exists() {
+            return Err(anyhow!("Path does not exist: '{}'", local_selector));
         }
+        local_paths.push(p);
     }
+
+    let mut total = 0usize;
+    for path in &local_paths {
+        total += upload_path_recursive(&client, path, target_uid.clone()).await?;
+    }
+    println!("Uploaded {} item(s).", total);
 
     Ok(())
+}
+
+/// Recursively upload a local file or directory tree to a remote folder.
+/// Returns the number of files uploaded.
+fn upload_path_recursive<'a>(
+    client: &'a ProtonDriveClient,
+    local_path: &'a std::path::Path,
+    remote_uid: NodeUid,
+) -> Pin<Box<dyn Future<Output = Result<usize>> + Send + 'a>> {
+    Box::pin(async move {
+        if local_path.is_file() {
+            upload_single_file(client, local_path, remote_uid).await?;
+            Ok(1)
+        } else if local_path.is_dir() {
+            let dir_name = local_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "upload".to_string());
+            let sub_uid = get_or_create_remote_folder(client, remote_uid, &dir_name).await?;
+            let mut count = 0usize;
+            for entry in std::fs::read_dir(local_path)? {
+                let entry = entry?;
+                count += upload_path_recursive(client, &entry.path(), sub_uid.clone()).await?;
+            }
+            Ok(count)
+        } else {
+            Ok(0)
+        }
+    })
+}
+
+async fn upload_single_file(
+    client: &ProtonDriveClient,
+    path: &std::path::Path,
+    remote_uid: NodeUid,
+) -> Result<()> {
+    let name = path.file_name().unwrap().to_string_lossy().to_string();
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let pb = upload_progress_bar(&name, file_size);
+    let result = client
+        .upload_file(path, remote_uid.clone(), false, progress_callback(pb.clone()))
+        .await;
+    pb.set_position(file_size);
+    finish_progress(&pb);
+    match result {
+        Ok(_) => {}
+        Err(e) if e.to_string().contains("2500") => {
+            // File already exists — update its revision.
+            let children = list_children(client, remote_uid.clone()).await?;
+            if let Some(existing) = children.iter().find(|n| n.base().name == name) {
+                let pb2 = upload_progress_bar(&name, file_size);
+                client
+                    .upload_file(path, existing.uid().clone(), true, progress_callback(pb2.clone()))
+                    .await?;
+                pb2.set_position(file_size);
+                finish_progress(&pb2);
+            }
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
+/// Return the UID of a remote folder `name` under `parent_uid`, creating it
+/// if it does not yet exist.
+async fn get_or_create_remote_folder(
+    client: &ProtonDriveClient,
+    parent_uid: NodeUid,
+    name: &str,
+) -> Result<NodeUid> {
+    match client.create_folder(parent_uid.clone(), name.to_string(), None).await {
+        Ok(f) => Ok(f.base.uid),
+        Err(e) if e.to_string().contains("2500") => {
+            // Folder already exists — locate its UID in the parent's children.
+            let children = list_children(client, parent_uid).await?;
+            children
+                .iter()
+                .find(|n| n.base().name == name)
+                .map(|n| n.uid().clone())
+                .ok_or_else(|| anyhow!("Remote folder '{}' exists but was not found in listing", name))
+        }
+        Err(e) => Err(e),
+    }
 }

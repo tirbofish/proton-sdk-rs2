@@ -1,6 +1,7 @@
 pub mod helpers;
 pub mod auth;
 pub mod computers;
+pub mod daemon;
 pub mod navigation;
 pub mod management;
 pub mod photos;
@@ -22,6 +23,7 @@ pub use management::{mkdir_command, move_command, remove_command, drop_command, 
 pub use transfer::{download_command, upload_command, hydrate_command};
 pub use cache::cache_command;
 pub use computers::computers_command;
+pub use daemon::daemon_command;
 pub use mount::{mount_command, umount_command};
 pub use photos::photos_command;
 pub use settings::settings_command;

@@ -143,6 +143,24 @@ pub trait FilesApiClient: Send + Sync {
 }
 use proton_sdk_rs2::auth::TokenCredential;
 
+/// Parse an HTTP response as JSON, including the raw body text in the error
+/// message on failure so that Proton error pages are visible in logs.
+async fn parse_json_response<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> anyhow::Result<T> {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        // Try to extract a Proton error message from the JSON body.
+        if let Ok(api) = serde_json::from_str::<ApiResponse>(&body) {
+            if let Some(msg) = &api.error_message {
+                return Err(anyhow::anyhow!("API error {}: {}", api.code.0, msg));
+            }
+        }
+        return Err(anyhow::anyhow!("HTTP {}: {}", status, body));
+    }
+    serde_json::from_str::<T>(&body)
+        .map_err(|e| anyhow::anyhow!("JSON parse error: {}. Body: {}", e, &body[..body.len().min(512)]))
+}
+
 pub struct DefaultFilesApiClient {
     client: ClientWithMiddleware,
     base_url: reqwest::Url,
@@ -189,7 +207,7 @@ impl FilesApiClient for DefaultFilesApiClient {
             .join(&format!("v2/volumes/{}/files", volume_id.raw()))?;
         let builder = self.client.post(url).json(&request);
         let builder = self.add_auth_headers(builder).await?;
-        let resp = builder.send().await?.json::<FileCreationResponse>().await?;
+        let resp = parse_json_response::<FileCreationResponse>(builder.send().await?).await?;
         tracing::info!(link_id = %resp.identifiers.link_id.raw(), revision_id = %resp.identifiers.revision_id.raw(), "File created");
         Ok(resp)
     }
@@ -209,11 +227,7 @@ impl FilesApiClient for DefaultFilesApiClient {
         ))?;
         let builder = self.client.post(url).json(&request);
         let builder = self.add_auth_headers(builder).await?;
-        let resp = builder
-            .send()
-            .await?
-            .json::<RevisionCreationResponse>()
-            .await?;
+        let resp = parse_json_response::<RevisionCreationResponse>(builder.send().await?).await?;
         tracing::info!(revision_id = %resp.identity.revision_id.raw(), "Revision created");
         Ok(resp)
     }
@@ -227,11 +241,7 @@ impl FilesApiClient for DefaultFilesApiClient {
         let url = self.base_url.join("blocks")?;
         let builder = self.client.post(url).json(&request);
         let builder = self.add_auth_headers(builder).await?;
-        let resp = builder
-            .send()
-            .await?
-            .json::<BlockUploadPreparationResponse>()
-            .await?;
+        let resp = parse_json_response::<BlockUploadPreparationResponse>(builder.send().await?).await?;
         tracing::info!(
             blocks = resp.upload_targets.len(),
             thumbnails = resp.thumbnail_upload_targets.len(),
@@ -257,7 +267,7 @@ impl FilesApiClient for DefaultFilesApiClient {
         ))?;
         let builder = self.client.put(url).json(&request);
         let builder = self.add_auth_headers(builder).await?;
-        let resp = builder.send().await?.json::<ApiResponse>().await?;
+        let resp = parse_json_response::<ApiResponse>(builder.send().await?).await?;
         if resp.is_success() {
             tracing::info!("Revision sealed successfully");
         } else {

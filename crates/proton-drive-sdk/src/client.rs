@@ -333,13 +333,14 @@ impl ProtonDriveClient {
         parent_link_id: Option<LinkId>,
     ) -> anyhow::Result<Vec<PotentialObject<Node, DegradedNode>>> {
         let parent_uid = parent_link_id.map(|id| NodeUid::new(volume_id.clone(), id));
-        let mut stream = match parent_uid {
+        let stream = match parent_uid {
             Some(uid) => self.enumerate_folder_children(uid).await?,
             None => {
                 let root = self.get_my_files_folder().await?;
                 self.enumerate_folder_children(root.base.uid).await?
             }
         };
+        tokio::pin!(stream);
         let mut results = Vec::new();
         while let Some(item) = futures::StreamExt::next(&mut stream).await {
             results.push(item?);
@@ -397,12 +398,55 @@ impl ProtonDriveClient {
         NodeOperations::get_node(self, node_uid).await
     }
 
+    /// Fetch and decrypt a thumbnail block belonging to the file identified by
+    /// `node_uid`.  `thumbnail_id` is the server-assigned ID stored in the
+    /// node's `Revision.thumbnails` list.  Returns the raw (decrypted) image
+    /// bytes on success.
+    pub async fn fetch_thumbnail(
+        &self,
+        node_uid: NodeUid,
+        thumbnail_id: String,
+    ) -> anyhow::Result<Vec<u8>> {
+        use proton_rpgp::{DataEncoding, Decryptor, SessionKey, pgp::crypto::sym::SymmetricKeyAlgorithm};
+
+        let secrets = FileOperations::get_secrets(self, node_uid.clone()).await?;
+        let volume_id = node_uid.volume_id.clone();
+
+        let resp = self
+            .api()
+            .files()
+            .get_thumbnail_blocks(volume_id, vec![thumbnail_id.clone()])
+            .await?;
+
+        let block = resp
+            .blocks
+            .into_iter()
+            .find(|b| b.thumbnail_id == thumbnail_id)
+            .ok_or_else(|| anyhow::anyhow!("thumbnail block not returned by server"))?;
+
+        let response = self
+            .api()
+            .storage()
+            .get_blob_stream(&block.bare_url, &block.token)
+            .await?;
+        let blob_bytes = response.bytes().await?;
+
+        let alg = SymmetricKeyAlgorithm::from(secrets.content_key.algorithm);
+        let sk = SessionKey::new(&secrets.content_key.key, alg);
+        let result = Decryptor::default()
+            .with_session_key(sk)
+            .decrypt(&blob_bytes, DataEncoding::Auto)?;
+
+        Ok(result.data)
+    }
+
     pub async fn enumerate_nodes(
         &self,
         node_uids: Vec<NodeUid>,
     ) -> anyhow::Result<
         impl futures::Stream<Item = anyhow::Result<PotentialObject<Node, DegradedNode>>> + '_,
     > {
+        // enumerate_nodes now uses FuturesUnordered internally for parallelism.
         let results = NodeOperations::enumerate_nodes(self, node_uids).await?;
         Ok(futures::stream::iter(results.into_iter().map(Ok)))
     }
@@ -416,14 +460,21 @@ impl ProtonDriveClient {
         FolderOperations::create(self, parent_id, name, last_modification_time).await
     }
 
+    /// Enumerate children of a folder, streaming items as they are fetched and
+    /// decrypted.  The `.await` returns immediately after spawning the background
+    /// task; items appear in the stream as soon as each batch is ready.
     pub async fn enumerate_folder_children(
         &self,
         folder_id: NodeUid,
     ) -> anyhow::Result<
-        impl futures::Stream<Item = anyhow::Result<PotentialObject<Node, DegradedNode>>> + '_,
+        impl futures::Stream<Item = anyhow::Result<PotentialObject<Node, DegradedNode>>> + 'static,
     > {
-        let results = FolderOperations::enumerate_children(self, folder_id).await?;
-        Ok(futures::stream::iter(results.into_iter().map(Ok)))
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let client = self.clone();
+        tokio::spawn(FolderOperations::enumerate_children_to_channel(client, folder_id, tx));
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }))
     }
 
     pub async fn enumerate_thumbnails(

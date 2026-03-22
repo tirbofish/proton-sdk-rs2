@@ -1,6 +1,8 @@
 pub mod client;
+pub mod encrypted;
 pub mod entity;
 pub mod secret;
+pub mod sqlite;
 
 use crate::node::{DegradedNode, Node};
 use crate::share::ShareId;

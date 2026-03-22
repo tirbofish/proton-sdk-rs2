@@ -1,4 +1,5 @@
 //! start off at [`session::ProtonAPISession`]
+pub mod ser;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub mod protobuf {

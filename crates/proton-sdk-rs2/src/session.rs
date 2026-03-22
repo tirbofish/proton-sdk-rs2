@@ -8,6 +8,7 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use crate::auth::DefaultAuthenticationApiClient;
 use crate::keys::{DefaultKeysApiClient, KeysApiClient};
 use crate::secret::SessionSecretCache;
+use crate::ser::StoredCredentials;
 use crate::{
     PasswordMode, SessionId, UserId,
     auth::{AuthenticationApiClient, TokenCredential},
@@ -138,6 +139,60 @@ impl ProtonAPISession {
         )))
     }
 
+    /// Restores a [`ProtonAPISession`] from previously serialized credentials.
+    ///
+    /// This is the complement of [`Self::to_stored_credentials`].  Use it on startup to resume a
+    /// session that was persisted across process restarts, avoiding a full re-authentication.
+    ///
+    /// # Arguments
+    ///
+    /// * `cred` – Credentials returned by a prior call to [`Self::to_stored_credentials`].
+    /// * `app_version` – The current application version, used to build the `x-pm-appversion`
+    ///   header on every request.
+    /// * `secret_cache_repository` – Repository used to cache decrypted key material for the
+    ///   duration of the restored session.
+    pub fn from_stored_credentials(
+        cred: StoredCredentials,
+        app_version: semver::Version,
+        secret_cache_repository: Arc<dyn CacheRepository>,
+    ) -> Self {
+        Self::resume(
+            SessionId::new(cred.session_id().to_string()),
+            cred.username(),
+            UserId::new(cred.user_id().to_string()),
+            cred.access_token().to_string(),
+            cred.refresh_token().to_string(),
+            cred.scopes().to_vec(),
+            cred.is_waiting_for_second_factor_code(),
+            cred.password_mode(),
+            app_version,
+            secret_cache_repository,
+        )
+    }
+
+    /// Serializes the current session state into a [`StoredCredentials`] value that can be
+    /// persisted and later handed to [`Self::from_stored_credentials`].
+    ///
+    /// The snapshot captures the tokens that were active at the time of this call.  If the
+    /// session's access token has been silently refreshed since the last explicit store, prefer
+    /// calling the async [`crate::auth::TokenCredential::get_tokens`] directly and constructing
+    /// [`StoredCredentials`] from those values.
+    pub fn to_stored_credentials(&self) -> StoredCredentials {
+        StoredCredentials::new(
+            self.session_id.raw().clone(),
+            self.username.clone(),
+            self.user_id.raw().clone(),
+            self.token_credential.current_access_token().to_string(),
+            self.token_credential.current_refresh_token().to_string(),
+            self.scopes.clone(),
+            self.is_waiting_for_second_factor_code,
+            self.password_mode,
+        )
+    }
+
+    /// Initialises a new session. 
+    /// 
+    /// It is recommended to store the results of this session. 
     pub async fn begin(
         username: impl Into<String>,
         password: &str,
@@ -219,6 +274,7 @@ impl ProtonAPISession {
         Ok(session)
     }
 
+    /// Convenience wrapper for [`Self::resume_with_options`] with default client options.
     pub fn resume(
         session_id: SessionId,
         username: impl Into<String>,
@@ -287,6 +343,9 @@ impl ProtonAPISession {
         session
     }
 
+    /// Renews the session. 
+    /// 
+    /// 
     pub fn renew(
         expired_session: ProtonAPISession,
         session_id: SessionId,
@@ -321,6 +380,8 @@ impl ProtonAPISession {
         )
     }
 
+    /// Ends the session from the provided session and options by sending a `DELETE` request
+    /// to `auth/v4`
     pub async fn end_from_token(
         id: String,
         access_token: String,
@@ -336,6 +397,7 @@ impl ProtonAPISession {
         Ok(())
     }
 
+    /// Applies the second factor code by sending a request to `auth/v4/2fa`. 
     pub async fn apply_second_factor_code(
         &mut self,
         second_factor_code: String,
@@ -350,6 +412,9 @@ impl ProtonAPISession {
         Ok(())
     }
 
+    /// Apply the data password. 
+    /// 
+    /// This function unlocks the key salts required. 
     pub async fn apply_data_password(&mut self, password: &str) -> anyhow::Result<()> {
         let response = self.keys_api()?.get_key_salts().await?;
 
@@ -374,6 +439,7 @@ impl ProtonAPISession {
         Ok(())
     }
 
+    /// Refreshes scopes, typically used during reauthentication. 
     pub async fn refresh_scopes(&mut self) -> anyhow::Result<()> {
         let auth_api_client = Self::create_authentication_api_client(&self.client_config)?;
         let scopes_response = auth_api_client.get_scopes().await?;
@@ -381,6 +447,8 @@ impl ProtonAPISession {
         Ok(())
     }
 
+    /// Ensures authentication by sending a request to `/auth/v4/scopes` and 
+    /// verifying the response to be 200, or to refresh tokens and restart `http_client`. 
     pub async fn ensure_authenticated(&mut self) -> anyhow::Result<()> {
         let (probe_access_token, _) = self.token_credential.get_tokens().await?;
         let probe = Self::create_http_client(
@@ -450,6 +518,7 @@ impl ProtonAPISession {
         Ok(true)
     }
 
+    /// Creates a new http client or takes the http client from self. 
     pub fn get_http_client(
         &self,
         base_route_path: Option<String>,
@@ -468,6 +537,7 @@ impl ProtonAPISession {
         }
     }
 
+    /// Utility function for deriving secrets from a password+salt. 
     pub fn derive_secret_from_password(password: &str, salt: &[u8]) -> anyhow::Result<Vec<u8>> {
         let hash = proton_srp::mailbox_password_hash(password, salt)?;
         Ok(hash.as_bytes()[29..].to_vec())

@@ -41,6 +41,8 @@ tracing.workspace = true
 parking_lot.workspace = true
 mime_guess.workspace = true
 image.workspace = true
+rusqlite.workspace = true
+aes-gcm.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true

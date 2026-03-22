@@ -82,6 +82,16 @@ impl TokenCredential {
         &self.access_token
     }
 
+    /// Returns the refresh token that was active when this credential was constructed or last
+    /// explicitly stored.
+    ///
+    /// Note: if the access token has been silently refreshed during the session the internally
+    /// stored refresh token field is not updated; callers that need the latest token pair should
+    /// use the async [`Self::get_tokens`] instead.
+    pub fn current_refresh_token(&self) -> &str {
+        &self.refresh_token
+    }
+
     fn trigger_tokens_refreshed(&self, access_token: String, refresh_token: String) {
         let _ = self.tokens_refreshed_tx.send((access_token, refresh_token));
     }

@@ -50,7 +50,9 @@ pub struct ProtonDriveClientOptions {
     ///
     /// By default, it is `None`, but when constructed in the x-pm-appversion, it is considered as `rust`.
     pub bindings_language: Option<String>,
+    /// The amount of time in seconds before a timeout. 
     pub api_call_timeout: Option<u32>,
+    /// The amount of time in seconds before a timeout for storage-based api's. 
     pub storage_call_timeout: Option<u32>,
 }
 
@@ -76,7 +78,9 @@ impl ProtonDriveClient {
     const MIN_DEGREE_OF_BLOCK_TRANSFER_PARALLELISM: usize = 2;
     const MAX_DEGREE_OF_BLOCK_TRANSFER_PARALLELISM: usize = 6;
 
-
+    /// Creates a new [`ProtonDriveClient`] based on an existing [`ProtonAPISession`]. 
+    /// 
+    /// The defacto initialiser. 
     pub fn new(session: &ProtonAPISession, uid: Option<String>) -> anyhow::Result<Self> {
         Self::from_session_with_drive_api_clients_factory(
             session,
@@ -85,6 +89,9 @@ impl ProtonDriveClient {
         )
     }
 
+    /// Creates a new [`ProtonDriveClient`] by ensuring that the session is authenticated. 
+    /// 
+    /// Can throw an error if any issues occur with authentication. 
     pub async fn new_with_preflight_auth(
         session: &mut ProtonAPISession,
         uid: Option<String>,
@@ -97,6 +104,10 @@ impl ProtonDriveClient {
         )
     }
 
+    /// Creates a new [`ProtonDriveClient`] from custom implementations of clients and caches. 
+    /// 
+    /// Use this if you want full control, however this is typically derived
+    /// from [`ProtonAPISession`] in [`Self::new`]
     pub fn from_http_client_factory(
         account_client: Arc<dyn AccountClient>,
         entity_cache_repository: Arc<dyn DriveEntityCache>,

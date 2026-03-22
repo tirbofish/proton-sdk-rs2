@@ -34,7 +34,7 @@ parking_lot.workspace = true
 async-trait.workspace = true
 glob = "0.3"
 indicatif = "0.17"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite.workspace = true
 r2d2 = "0.8"
 r2d2_sqlite = "0.25"
 chrono = { version = "0.4", features = ["serde"] }

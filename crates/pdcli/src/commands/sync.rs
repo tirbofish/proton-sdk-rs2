@@ -344,29 +344,6 @@ pub async fn seed_and_index_myfiles(
     index_unindexed_folders(client, volume_id, cache, state, None, None).await;
 }
 
-/// Index trashed items into the SQLite cache so the Trash virtual directory
-/// in FUSE shows real nodes.
-pub async fn run_trash_index(
-    client: &ProtonDriveClient,
-    _volume_id: &VolumeId,
-    cache: &Arc<RusqliteCache>,
-) -> Result<()> {
-    let trash = client.enumerate_trash().await?;
-    let batch: Vec<_> = trash
-        .into_iter()
-        .filter_map(|r| r.ok())
-        .map(|n| (n, true))
-        .collect();
-    if !batch.is_empty() {
-        cache.upsert_nodes_batch(&batch)?;
-        tracing::info!(count = batch.len(), "Trash index: cached items");
-        eprintln!("  [FUSE] Trash indexed ({} item(s)).", batch.len());
-    } else {
-        eprintln!("  [FUSE] Trash is empty.");
-    }
-    Ok(())
-}
-
 /// Events polling loop — runs indefinitely. Spawn as a background task after
 /// `run_initial_sync` has completed.
 pub async fn run_events_loop(

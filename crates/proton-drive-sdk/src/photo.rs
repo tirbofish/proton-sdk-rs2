@@ -1,23 +1,32 @@
 use crate::api::events::{CoreEventsResponse, VolumeEventsResponse};
 use crate::api::file::photos::{
-    DefaultPhotosApiClient, PhotosApiClient, PhotosApiClients, TimelinePhotoListRequest,
+    AddPhotoToAlbumItem, AddPhotosToAlbumRequest, AlbumChildItem, AlbumCreationRequest,
+    AlbumInfo, AlbumLinkCreationFields, AlbumNameUpdate, AlbumUpdateRequest,
+    DefaultPhotosApiClient, FavoritePhotoData, FavoritePhotoPayload,
+    PhotoTagUpdate, PhotosApiClient, PhotosApiClients,
+    TimelinePhotoListRequest,
 };
 use crate::api::{DriveApiClients, DriveApiClientsFactory};
 use crate::cache::entity::{DefaultPhotosEntityCache, PhotosEntityCache};
 use crate::client::{ProtonDriveClient, ProtonDriveDefaults};
 use crate::links::LinkId;
+use crate::node::crypto::NodeCrypto;
 use crate::node::file::download::FileDownloader;
 use crate::node::file::upload::FileUploader;
-use crate::node::folder::FolderNode;
-use crate::node::photo::{PhotosFileUploadMetadata, PhotosTimelineItem, TimelineEntry};
+use crate::node::folder::{FolderNode, FolderOperations, FolderSecrets};
+use crate::node::photo::{PhotoTag, PhotosFileUploadMetadata, PhotosTimelineItem, TimelineEntry};
 use crate::node::{DegradedNode, Node, NodeAndSecrets, NodeUid};
+use crate::pgp::PgpPrivateKey;
 use crate::share_ops::ShareOperations;
 use crate::node::DtoToMetadataConverter;
 use crate::utils::PotentialObject;
 use crate::volume::VolumeId;
+use hmac::{Hmac, KeyInit, Mac};
 use proton_sdk_rs2::auth::TokenCredential;
 use proton_sdk_rs2::session::ProtonAPISession;
 use std::sync::Arc;
+
+type HmacSha256 = Hmac<sha2::Sha256>;
 
 struct PhotosApiClientsFactory;
 
@@ -443,5 +452,552 @@ impl ProtonPhotosClient {
     /// surfaced by [`ProtonPhotosClient`] (e.g. block-level upload/download).
     pub fn drive(&self) -> &ProtonDriveClient {
         &self.drive
+    }
+
+    /// Checks for existing photos that match both the name and SHA-1 content hash.
+    /// Returns the UIDs of any matching duplicates, or an empty Vec when none are found.
+    pub async fn find_photo_duplicates(
+        &self,
+        name: &str,
+        sha1_hex: &str,
+    ) -> anyhow::Result<Vec<NodeUid>> {
+        let volume_id = self.get_photos_volume_id().await?;
+        let root = self.get_photos_root_folder().await?;
+
+        let hash_key = self.get_root_hash_key(&root.base.uid).await?;
+
+        let name_hash = {
+            let mut mac = HmacSha256::new_from_slice(&hash_key)
+                .map_err(|_| anyhow::anyhow!("Invalid hash key length"))?;
+            mac.update(name.as_bytes());
+            hex::encode(mac.finalize().into_bytes())
+        };
+
+        let response = self
+            .photos_api
+            .check_duplicates(volume_id.clone(), vec![name_hash.clone()])
+            .await?;
+
+        let candidates: Vec<_> = response
+            .duplicate_hashes
+            .into_iter()
+            .filter(|d| d.link_state == 1 && d.name_hash == name_hash && d.content_hash.is_some())
+            .collect();
+
+        if candidates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let content_hash = {
+            let mut mac = HmacSha256::new_from_slice(&hash_key)
+                .map_err(|_| anyhow::anyhow!("Invalid hash key length"))?;
+            mac.update(sha1_hex.as_bytes());
+            hex::encode(mac.finalize().into_bytes())
+        };
+
+        Ok(candidates
+            .into_iter()
+            .filter(|d| d.content_hash.as_deref() == Some(&content_hash))
+            .map(|d| NodeUid::new(volume_id.clone(), d.link_id))
+            .collect())
+    }
+
+    /// Returns true when a photo with the same name and SHA-1 content already exists in the timeline.
+    pub async fn is_duplicate_photo(&self, name: &str, sha1_hex: &str) -> anyhow::Result<bool> {
+        Ok(!self.find_photo_duplicates(name, sha1_hex).await?.is_empty())
+    }
+
+    /// Returns a list of all albums in the photos volume, paginated internally.
+    pub async fn iterate_albums(&self) -> anyhow::Result<Vec<AlbumInfo>> {
+        let volume_id = self.get_photos_volume_id().await?;
+        let mut albums = Vec::new();
+        let mut anchor: Option<LinkId> = None;
+
+        loop {
+            let response = self
+                .photos_api
+                .get_albums(volume_id.clone(), anchor.clone())
+                .await?;
+
+            for dto in &response.albums {
+                albums.push(AlbumInfo {
+                    uid: NodeUid::new(volume_id.clone(), dto.link_id.clone()),
+                    photo_count: dto.photo_count,
+                    last_activity_time: dto.last_activity_time,
+                    cover_uid: dto
+                        .cover_link_id
+                        .clone()
+                        .map(|id| NodeUid::new(volume_id.clone(), id)),
+                });
+            }
+
+            if !response.more || response.anchor_id.is_none() {
+                break;
+            }
+            anchor = response.anchor_id;
+        }
+
+        Ok(albums)
+    }
+
+    /// Returns all photo entries inside an album, sorted by capture time descending.
+    pub async fn iterate_album(&self, album_uid: NodeUid) -> anyhow::Result<Vec<AlbumChildItem>> {
+        let volume_id = album_uid.volume_id.clone();
+        let mut items = Vec::new();
+        let mut anchor: Option<LinkId> = None;
+
+        loop {
+            let response = self
+                .photos_api
+                .get_album_children(volume_id.clone(), album_uid.link_id.clone(), anchor.clone())
+                .await?;
+
+            for dto in &response.photos {
+                items.push(AlbumChildItem {
+                    uid: NodeUid::new(volume_id.clone(), dto.link_id.clone()),
+                    capture_time: dto.capture_time,
+                });
+            }
+
+            if !response.more || response.anchor_id.is_none() {
+                break;
+            }
+            anchor = response.anchor_id;
+        }
+
+        Ok(items)
+    }
+
+    /// Creates a new album under the photos root folder and returns its `NodeUid`.
+    pub async fn create_album(&self, name: String) -> anyhow::Result<NodeUid> {
+        let volume_id = self.get_photos_volume_id().await?;
+        let root = self.get_photos_root_folder().await?;
+        let root_secrets = self.get_root_folder_secrets(&root.base.uid).await?;
+
+        let signing_key = self.get_signing_key().await?;
+
+        let album_key = crate::crypto::CryptoGenerator::generate_private_key()?;
+        let album_passphrase = crate::crypto::CryptoGenerator::generate_passphrase();
+        let _locked_album_key =
+            album_key.to_armored_private_key(Some(album_passphrase.as_bytes()))?;
+
+        let album_hash_key = crate::crypto::CryptoGenerator::generate_folder_hash_key().to_vec();
+
+        let (encrypted_passphrase, passphrase_signature, _) =
+            NodeCrypto::encrypt_and_sign_passphrase(
+                album_passphrase.as_bytes(),
+                &root_secrets.base.key,
+                &signing_key,
+            )?;
+
+        let (encrypted_name, name_hash_digest, _) = NodeCrypto::encrypt_and_sign_name(
+            &name,
+            &root_secrets.hash_key,
+            &root_secrets.base.key,
+            &signing_key,
+        )?;
+
+        let encrypted_album_hash_key = NodeCrypto::encrypt_folder_hash_key(
+            &crate::pgp::PgpPrivateKey(album_key.0.clone()),
+            &album_hash_key,
+            &signing_key,
+        )?;
+
+        let default_address = self.drive.account().get_default_address().await?;
+
+        let locked_album_key = album_key.to_armored_private_key(Some(album_passphrase.as_bytes()))?;
+
+        let request = AlbumCreationRequest {
+            locked: false,
+            link: AlbumLinkCreationFields {
+                name: encrypted_name,
+                name_hash_digest,
+                node_key: locked_album_key,
+                node_passphrase: encrypted_passphrase,
+                node_passphrase_signature: passphrase_signature
+                    .ok_or_else(|| anyhow::anyhow!("Passphrase signature missing"))?,
+                signature_email: default_address.email_address.clone(),
+                node_hash_key: encrypted_album_hash_key,
+                x_attr: None,
+            },
+        };
+
+        let response = self
+            .photos_api
+            .create_album(volume_id.clone(), request)
+            .await?;
+
+        Ok(NodeUid::new(volume_id, response.album.link.link_id))
+    }
+
+    /// Updates an existing album: optionally renames it and/or sets a new cover photo.
+    pub async fn update_album(
+        &self,
+        album_uid: NodeUid,
+        name: Option<String>,
+        cover_photo_uid: Option<NodeUid>,
+    ) -> anyhow::Result<()> {
+        let volume_id = album_uid.volume_id.clone();
+
+        let name_update = if let Some(new_name) = name {
+            let root = self.get_photos_root_folder().await?;
+            let root_secrets = self.get_root_folder_secrets(&root.base.uid).await?;
+            let signing_key = self.get_signing_key().await?;
+
+            let metadata = DtoToMetadataConverter::get_fresh_node_metadata(
+                &self.drive,
+                album_uid.clone(),
+                None,
+            )
+            .await?;
+            let (_, _, _, original_name_hash_digest) = metadata.result()?.deconstruct();
+
+            let album_secrets = self.get_root_folder_secrets(&album_uid).await?;
+
+            let (encrypted_name, name_hash_digest, _) = NodeCrypto::encrypt_and_sign_name(
+                &new_name,
+                &root_secrets.hash_key,
+                &root_secrets.base.key,
+                &signing_key,
+            )?;
+
+            let default_address = self.drive.account().get_default_address().await?;
+            let _ = album_secrets;
+
+            Some(AlbumNameUpdate {
+                name: encrypted_name,
+                name_hash_digest,
+                original_name_hash_digest,
+                name_signature_email: default_address.email_address.clone(),
+            })
+        } else {
+            None
+        };
+
+        let cover_link_id = cover_photo_uid.map(|uid| uid.link_id);
+
+        self.photos_api
+            .update_album(
+                volume_id,
+                album_uid.link_id,
+                AlbumUpdateRequest {
+                    cover_link_id,
+                    link: name_update,
+                },
+            )
+            .await
+    }
+
+    /// Permanently deletes an album. Photos in the timeline are kept; set `force` to also
+    /// delete photos that exist only in the album and not in the timeline.
+    pub async fn delete_album(&self, album_uid: NodeUid, force: bool) -> anyhow::Result<()> {
+        let volume_id = album_uid.volume_id.clone();
+        self.photos_api
+            .delete_album(volume_id, album_uid.link_id, force)
+            .await
+    }
+
+    /// Adds photos to an album by re-encrypting each photo's key material for the album context.
+    pub async fn add_photos_to_album(
+        &self,
+        album_uid: NodeUid,
+        photo_uids: Vec<NodeUid>,
+    ) -> anyhow::Result<Vec<(NodeUid, bool)>> {
+        if photo_uids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let volume_id = album_uid.volume_id.clone();
+        let album_secrets = self.get_root_folder_secrets(&album_uid).await?;
+        let signing_key = self.get_signing_key().await?;
+        let default_address = self.drive.account().get_default_address().await?;
+
+        let link_ids: Vec<LinkId> = photo_uids.iter().map(|u| u.link_id.clone()).collect();
+        let link_details_response = self
+            .drive
+            .api()
+            .links()
+            .get_details(volume_id.clone(), link_ids)
+            .await?;
+
+        let mut album_data = Vec::new();
+
+        for link_details in &link_details_response.links {
+            let photo_dto = link_details.photo.as_ref();
+            let content_hash_bytes = photo_dto.and_then(|p| p.content_hash.as_ref());
+
+            let node_uid = NodeUid::new(volume_id.clone(), link_details.link.id.clone());
+
+            let meta = DtoToMetadataConverter::convert_dto_to_node_metadata(
+                self.drive.account().clone(),
+                self.drive.cache().entities().as_ref(),
+                self.drive.cache().secrets().as_ref(),
+                volume_id.clone(),
+                link_details.clone(),
+                None,
+            )
+            .await?;
+
+            let (node, node_and_secrets, _, _) = match meta.result() {
+                Ok(m) => m.deconstruct(),
+                Err(_) => continue,
+            };
+
+            let (file_secrets, photo_name) = match (node, node_and_secrets) {
+                (Node::File(ref f), NodeAndSecrets::File(_, s))
+                | (Node::Photo(ref f), NodeAndSecrets::File(_, s)) => {
+                    (s, f.base.base.name.clone())
+                }
+                _ => continue,
+            };
+
+            let content_hash = match content_hash_bytes {
+                Some(bytes) => {
+                    let sha1_hex = hex::encode(bytes);
+                    let mut mac = HmacSha256::new_from_slice(&album_secrets.hash_key)
+                        .map_err(|_| anyhow::anyhow!("Invalid album hash key"))?;
+                    mac.update(sha1_hex.as_bytes());
+                    hex::encode(mac.finalize().into_bytes())
+                }
+                None => {
+                    anyhow::bail!("Photo {} has no content hash", node_uid);
+                }
+            };
+
+            let mut name_mac = HmacSha256::new_from_slice(&album_secrets.hash_key)
+                .map_err(|_| anyhow::anyhow!("Invalid album hash key"))?;
+            name_mac.update(photo_name.as_bytes());
+            let name_hash = hex::encode(name_mac.finalize().into_bytes());
+
+            let encrypted_name = NodeCrypto::encrypt_name(
+                &photo_name,
+                &file_secrets.base.name_session_key,
+                &album_secrets.base.key,
+                &signing_key,
+            )?;
+
+            let encrypted_passphrase = NodeCrypto::reencrypt_passphrase(
+                &file_secrets.base.passphrase_session_key.key,
+                file_secrets.base.passphrase_pgp_session_key.as_ref(),
+                &album_secrets.base.key,
+                &signing_key,
+            )?;
+
+            album_data.push(AddPhotoToAlbumItem {
+                link_id: node_uid.link_id.clone(),
+                name_hash,
+                name: encrypted_name,
+                name_signature_email: default_address.email_address.clone(),
+                node_passphrase: encrypted_passphrase,
+                content_hash,
+            });
+        }
+
+        let response = self
+            .photos_api
+            .add_photos_to_album(
+                volume_id.clone(),
+                album_uid.link_id,
+                AddPhotosToAlbumRequest { album_data },
+            )
+            .await?;
+
+        let results = response
+            .responses
+            .into_iter()
+            .map(|r| {
+                let uid = NodeUid::new(volume_id.clone(), r.link_id);
+                let ok = r.response.is_success();
+                (uid, ok)
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Removes photos from an album without deleting them from the timeline.
+    pub async fn remove_photos_from_album(
+        &self,
+        album_uid: NodeUid,
+        photo_uids: Vec<NodeUid>,
+    ) -> anyhow::Result<()> {
+        if photo_uids.is_empty() {
+            return Ok(());
+        }
+        let volume_id = album_uid.volume_id.clone();
+        let link_ids: Vec<LinkId> = photo_uids.into_iter().map(|u| u.link_id).collect();
+        self.photos_api
+            .remove_photos_from_album(volume_id, album_uid.link_id, link_ids)
+            .await
+    }
+
+    /// Applies tag additions and removals to a batch of photos. For the Favorite tag,
+    /// the photo's key material is re-encrypted for the root timeline volume.
+    pub async fn update_photos(
+        &self,
+        updates: Vec<PhotoTagUpdate>,
+    ) -> anyhow::Result<()> {
+        let volume_id = self.get_photos_volume_id().await?;
+
+        for update in updates {
+            let link_id = update.uid.link_id.clone();
+
+            let add_non_fav: Vec<PhotoTag> = update
+                .tags_to_add
+                .iter()
+                .copied()
+                .filter(|&t| t != PhotoTag::Favorite)
+                .collect();
+
+            let wants_favorite = update.tags_to_add.contains(&PhotoTag::Favorite);
+
+            if !add_non_fav.is_empty() {
+                self.photos_api
+                    .add_photo_tags(volume_id.clone(), link_id.clone(), add_non_fav)
+                    .await?;
+            }
+
+            if !update.tags_to_remove.is_empty() {
+                self.photos_api
+                    .remove_photo_tags(
+                        volume_id.clone(),
+                        link_id.clone(),
+                        update.tags_to_remove.clone(),
+                    )
+                    .await?;
+            }
+
+            if wants_favorite {
+                let payload = self
+                    .build_favorite_payload(&update.uid, &volume_id)
+                    .await
+                    .ok()
+                    .flatten();
+                self.photos_api
+                    .set_photo_favorite(volume_id.clone(), link_id, payload)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn get_root_hash_key(&self, root_uid: &NodeUid) -> anyhow::Result<Vec<u8>> {
+        let secrets = self.get_root_folder_secrets(root_uid).await?;
+        Ok(secrets.hash_key)
+    }
+
+    async fn get_root_folder_secrets(&self, uid: &NodeUid) -> anyhow::Result<FolderSecrets> {
+        FolderOperations::get_secrets(&self.drive, uid.clone()).await
+    }
+
+    async fn get_signing_key(&self) -> anyhow::Result<PgpPrivateKey> {
+        let default_address = self.drive.account().get_default_address().await?;
+        let key = self
+            .drive
+            .account()
+            .get_address_primary_private_key(&crate::account::AddressId::new(
+                default_address.address_id.clone(),
+            ))
+            .await?;
+        Ok(PgpPrivateKey(key))
+    }
+
+    async fn build_favorite_payload(
+        &self,
+        photo_uid: &NodeUid,
+        volume_id: &VolumeId,
+    ) -> anyhow::Result<Option<FavoritePhotoPayload>> {
+        let root = self.get_photos_root_folder().await?;
+        if photo_uid.volume_id == root.base.uid.volume_id {
+            let parent_uid = {
+                let node = self.drive.get_node(photo_uid.clone()).await?;
+                node.result()
+                    .map_err(|e| anyhow::anyhow!("{}", e))?
+                    .base()
+                    .parent_uid
+                    .clone()
+            };
+            if parent_uid.as_ref() == Some(&root.base.uid) {
+                return Ok(None);
+            }
+        }
+
+        let root_secrets = self.get_root_folder_secrets(&root.base.uid).await?;
+        let signing_key = self.get_signing_key().await?;
+        let default_address = self.drive.account().get_default_address().await?;
+
+        let link_details_response = self
+            .drive
+            .api()
+            .links()
+            .get_details(volume_id.clone(), vec![photo_uid.link_id.clone()])
+            .await?;
+
+        let link_details = link_details_response
+            .links
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Photo not found"))?;
+
+        let content_hash_bytes = link_details
+            .photo
+            .clone()
+            .and_then(|p| p.content_hash)
+            .ok_or_else(|| anyhow::anyhow!("Photo has no content hash"))?;
+
+        let meta = DtoToMetadataConverter::convert_dto_to_node_metadata(
+            self.drive.account().clone(),
+            self.drive.cache().entities().as_ref(),
+            self.drive.cache().secrets().as_ref(),
+            volume_id.clone(),
+            link_details,
+            None,
+        )
+        .await?;
+
+        let (node, node_and_secrets, _, _) = meta.result()?.deconstruct();
+
+        let (file_secrets, photo_name) = match (node, node_and_secrets) {
+            (Node::File(ref f), NodeAndSecrets::File(_, s))
+            | (Node::Photo(ref f), NodeAndSecrets::File(_, s)) => (s, f.base.base.name.clone()),
+            _ => anyhow::bail!("Node is not a file or photo"),
+        };
+
+        let sha1_hex = hex::encode(&content_hash_bytes);
+        let mut content_mac = HmacSha256::new_from_slice(&root_secrets.hash_key)
+            .map_err(|_| anyhow::anyhow!("Invalid hash key"))?;
+        content_mac.update(sha1_hex.as_bytes());
+        let content_hash = hex::encode(content_mac.finalize().into_bytes());
+
+        let mut name_mac = HmacSha256::new_from_slice(&root_secrets.hash_key)
+            .map_err(|_| anyhow::anyhow!("Invalid hash key"))?;
+        name_mac.update(photo_name.as_bytes());
+        let name_hash = hex::encode(name_mac.finalize().into_bytes());
+
+        let encrypted_name = NodeCrypto::encrypt_name(
+            &photo_name,
+            &file_secrets.base.name_session_key,
+            &root_secrets.base.key,
+            &signing_key,
+        )?;
+
+        let encrypted_passphrase = NodeCrypto::reencrypt_passphrase(
+            &file_secrets.base.passphrase_session_key.key,
+            file_secrets.base.passphrase_pgp_session_key.as_ref(),
+            &root_secrets.base.key,
+            &signing_key,
+        )?;
+
+        Ok(Some(FavoritePhotoPayload {
+            photo_data: FavoritePhotoData {
+                name: encrypted_name,
+                name_signature_email: default_address.email_address.clone(),
+                node_passphrase: encrypted_passphrase,
+                content_hash,
+                name_hash,
+                related_photos: vec![],
+            },
+        }))
     }
 }

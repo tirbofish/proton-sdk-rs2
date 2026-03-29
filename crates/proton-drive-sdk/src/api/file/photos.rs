@@ -18,6 +18,7 @@ use crate::api::volumes::{DefaultVolumesApiClient, VolumeCreationResponse, Volum
 use crate::api::{AggregateApiResponse, ApiResponse, DriveApiClients};
 use crate::links::LinkId;
 use crate::node::photo::PhotoTag;
+use crate::node::NodeUid;
 use crate::pgp::{PgpArmoredMessage, PgpArmoredPrivateKey, PgpArmoredSignature};
 use crate::volume::VolumeId;
 use async_trait::async_trait;
@@ -41,6 +42,80 @@ pub trait PhotosApiClient: Send + Sync {
         &self,
         request: TimelinePhotoListRequest,
     ) -> anyhow::Result<TimelinePhotoListResponse>;
+
+    async fn check_duplicates(
+        &self,
+        volume_id: VolumeId,
+        name_hashes: Vec<String>,
+    ) -> anyhow::Result<CheckDuplicatesResponse>;
+
+    async fn get_albums(
+        &self,
+        volume_id: VolumeId,
+        anchor_id: Option<LinkId>,
+    ) -> anyhow::Result<AlbumsListResponse>;
+
+    async fn get_album_children(
+        &self,
+        volume_id: VolumeId,
+        album_link_id: LinkId,
+        anchor_id: Option<LinkId>,
+    ) -> anyhow::Result<AlbumChildrenResponse>;
+
+    async fn create_album(
+        &self,
+        volume_id: VolumeId,
+        request: AlbumCreationRequest,
+    ) -> anyhow::Result<AlbumCreationResponse>;
+
+    async fn update_album(
+        &self,
+        volume_id: VolumeId,
+        album_link_id: LinkId,
+        request: AlbumUpdateRequest,
+    ) -> anyhow::Result<()>;
+
+    async fn delete_album(
+        &self,
+        volume_id: VolumeId,
+        album_link_id: LinkId,
+        force: bool,
+    ) -> anyhow::Result<()>;
+
+    async fn add_photos_to_album(
+        &self,
+        volume_id: VolumeId,
+        album_link_id: LinkId,
+        request: AddPhotosToAlbumRequest,
+    ) -> anyhow::Result<AddPhotosToAlbumResponse>;
+
+    async fn remove_photos_from_album(
+        &self,
+        volume_id: VolumeId,
+        album_link_id: LinkId,
+        link_ids: Vec<LinkId>,
+    ) -> anyhow::Result<()>;
+
+    async fn add_photo_tags(
+        &self,
+        volume_id: VolumeId,
+        link_id: LinkId,
+        tags: Vec<PhotoTag>,
+    ) -> anyhow::Result<()>;
+
+    async fn remove_photo_tags(
+        &self,
+        volume_id: VolumeId,
+        link_id: LinkId,
+        tags: Vec<PhotoTag>,
+    ) -> anyhow::Result<()>;
+
+    async fn set_photo_favorite(
+        &self,
+        volume_id: VolumeId,
+        link_id: LinkId,
+        payload: Option<FavoritePhotoPayload>,
+    ) -> anyhow::Result<()>;
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -205,6 +280,253 @@ impl PhotoDetailsResponse {
     }
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct CheckDuplicatesRequest {
+    pub name_hashes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct DuplicateHashDto {
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+
+    #[serde(rename = "Hash")]
+    pub name_hash: String,
+
+    pub content_hash: Option<String>,
+
+    pub link_state: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct CheckDuplicatesResponse {
+    pub duplicate_hashes: Vec<DuplicateHashDto>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct AlbumListItemDto {
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+
+    pub photo_count: u64,
+
+    #[serde(with = "crate::utils::serde::epoch_seconds")]
+    pub last_activity_time: DateTime<Utc>,
+
+    #[serde(rename = "CoverLinkID")]
+    pub cover_link_id: Option<LinkId>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct AlbumsListResponse {
+    pub albums: Vec<AlbumListItemDto>,
+
+    #[serde(rename = "More", default)]
+    pub more: bool,
+
+    #[serde(rename = "AnchorID")]
+    pub anchor_id: Option<LinkId>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct AlbumChildItemDto {
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+
+    #[serde(with = "crate::utils::serde::epoch_seconds")]
+    pub capture_time: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct AlbumChildrenResponse {
+    pub photos: Vec<AlbumChildItemDto>,
+
+    #[serde(rename = "More", default)]
+    pub more: bool,
+
+    #[serde(rename = "AnchorID")]
+    pub anchor_id: Option<LinkId>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct AlbumLinkCreationFields {
+    pub name: PgpArmoredMessage,
+
+    #[serde(rename = "Hash")]
+    #[serde(with = "crate::utils::serde::forgiving_hex_bytes")]
+    pub name_hash_digest: Vec<u8>,
+
+    pub node_key: PgpArmoredPrivateKey,
+    pub node_passphrase: PgpArmoredMessage,
+    pub node_passphrase_signature: PgpArmoredSignature,
+    pub signature_email: String,
+    pub node_hash_key: PgpArmoredMessage,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_attr: Option<PgpArmoredMessage>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct AlbumCreationRequest {
+    pub locked: bool,
+    pub link: AlbumLinkCreationFields,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct AlbumCreationLinkId {
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct AlbumCreationResponseAlbum {
+    pub link: AlbumCreationLinkId,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct AlbumCreationResponse {
+    pub album: AlbumCreationResponseAlbum,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct AlbumNameUpdate {
+    pub name: PgpArmoredMessage,
+
+    #[serde(rename = "Hash")]
+    #[serde(with = "crate::utils::serde::forgiving_hex_bytes")]
+    pub name_hash_digest: Vec<u8>,
+
+    #[serde(rename = "OriginalHash")]
+    #[serde(with = "crate::utils::serde::forgiving_hex_bytes")]
+    pub original_name_hash_digest: Vec<u8>,
+
+    pub name_signature_email: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct AlbumUpdateRequest {
+    #[serde(rename = "CoverLinkID")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cover_link_id: Option<LinkId>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<AlbumNameUpdate>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct AddPhotoToAlbumItem {
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+
+    #[serde(rename = "Hash")]
+    pub name_hash: String,
+
+    pub name: PgpArmoredMessage,
+    pub name_signature_email: String,
+    pub node_passphrase: PgpArmoredMessage,
+    pub content_hash: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct AddPhotosToAlbumRequest {
+    pub album_data: Vec<AddPhotoToAlbumItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct AddPhotoToAlbumResult {
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+
+    pub response: ApiResponse,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct AddPhotosToAlbumResponse {
+    #[serde(default)]
+    pub responses: Vec<AddPhotoToAlbumResult>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct RemovePhotosFromAlbumRequest {
+    #[serde(rename = "LinkIDs")]
+    pub link_ids: Vec<LinkId>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PhotoTagsRequest {
+    pub tags: Vec<PhotoTag>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct FavoritePhotoPayloadRelated {
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+    pub name: PgpArmoredMessage,
+    pub name_signature_email: String,
+    pub node_passphrase: PgpArmoredMessage,
+    pub content_hash: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct FavoritePhotoData {
+    pub name: PgpArmoredMessage,
+    pub name_signature_email: String,
+    pub node_passphrase: PgpArmoredMessage,
+    pub content_hash: String,
+    #[serde(rename = "Hash")]
+    pub name_hash: String,
+    pub related_photos: Vec<FavoritePhotoPayloadRelated>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct FavoritePhotoPayload {
+    pub photo_data: FavoritePhotoData,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlbumInfo {
+    pub uid: NodeUid,
+    pub photo_count: u64,
+    pub last_activity_time: DateTime<Utc>,
+    pub cover_uid: Option<NodeUid>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlbumChildItem {
+    pub uid: NodeUid,
+    pub capture_time: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PhotoTagUpdate {
+    pub uid: NodeUid,
+    pub tags_to_add: Vec<PhotoTag>,
+    pub tags_to_remove: Vec<PhotoTag>,
+}
+
 pub struct DefaultPhotosApiClient {
     client: ClientWithMiddleware,
     base_url: reqwest::Url,
@@ -281,6 +603,197 @@ impl PhotosApiClient for DefaultPhotosApiClient {
             .await?
             .json::<TimelinePhotoListResponse>()
             .await?)
+    }
+
+    async fn check_duplicates(
+        &self,
+        volume_id: VolumeId,
+        name_hashes: Vec<String>,
+    ) -> anyhow::Result<CheckDuplicatesResponse> {
+        let url = self
+            .base_url
+            .join(&format!("volumes/{}/photos/duplicates", volume_id.raw()))?;
+        let builder = self
+            .client
+            .post(url)
+            .json(&CheckDuplicatesRequest { name_hashes });
+        let builder = self.add_auth_headers(builder).await?;
+        Ok(builder.send().await?.json::<CheckDuplicatesResponse>().await?)
+    }
+
+    async fn get_albums(
+        &self,
+        volume_id: VolumeId,
+        anchor_id: Option<LinkId>,
+    ) -> anyhow::Result<AlbumsListResponse> {
+        let path = match anchor_id {
+            Some(anchor) => format!(
+                "photos/volumes/{}/albums?AnchorID={}",
+                volume_id.raw(),
+                anchor.raw()
+            ),
+            None => format!("photos/volumes/{}/albums", volume_id.raw()),
+        };
+        let url = self.base_url.join(&path)?;
+        let builder = self.add_auth_headers(self.client.get(url)).await?;
+        Ok(builder.send().await?.json::<AlbumsListResponse>().await?)
+    }
+
+    async fn get_album_children(
+        &self,
+        volume_id: VolumeId,
+        album_link_id: LinkId,
+        anchor_id: Option<LinkId>,
+    ) -> anyhow::Result<AlbumChildrenResponse> {
+        let path = match anchor_id {
+            Some(anchor) => format!(
+                "photos/volumes/{}/albums/{}/children?Sort=Captured&Desc=1&AnchorID={}",
+                volume_id.raw(),
+                album_link_id.raw(),
+                anchor.raw()
+            ),
+            None => format!(
+                "photos/volumes/{}/albums/{}/children?Sort=Captured&Desc=1",
+                volume_id.raw(),
+                album_link_id.raw()
+            ),
+        };
+        let url = self.base_url.join(&path)?;
+        let builder = self.add_auth_headers(self.client.get(url)).await?;
+        Ok(builder.send().await?.json::<AlbumChildrenResponse>().await?)
+    }
+
+    async fn create_album(
+        &self,
+        volume_id: VolumeId,
+        request: AlbumCreationRequest,
+    ) -> anyhow::Result<AlbumCreationResponse> {
+        let url = self
+            .base_url
+            .join(&format!("photos/volumes/{}/albums", volume_id.raw()))?;
+        let builder = self.add_auth_headers(self.client.post(url).json(&request)).await?;
+        Ok(builder.send().await?.json::<AlbumCreationResponse>().await?)
+    }
+
+    async fn update_album(
+        &self,
+        volume_id: VolumeId,
+        album_link_id: LinkId,
+        request: AlbumUpdateRequest,
+    ) -> anyhow::Result<()> {
+        let url = self.base_url.join(&format!(
+            "photos/volumes/{}/albums/{}",
+            volume_id.raw(),
+            album_link_id.raw()
+        ))?;
+        let builder = self.add_auth_headers(self.client.put(url).json(&request)).await?;
+        builder.send().await?;
+        Ok(())
+    }
+
+    async fn delete_album(
+        &self,
+        volume_id: VolumeId,
+        album_link_id: LinkId,
+        force: bool,
+    ) -> anyhow::Result<()> {
+        let url = self.base_url.join(&format!(
+            "photos/volumes/{}/albums/{}?DeleteAlbumPhotos={}",
+            volume_id.raw(),
+            album_link_id.raw(),
+            if force { 1 } else { 0 }
+        ))?;
+        let builder = self.add_auth_headers(self.client.delete(url)).await?;
+        builder.send().await?;
+        Ok(())
+    }
+
+    async fn add_photos_to_album(
+        &self,
+        volume_id: VolumeId,
+        album_link_id: LinkId,
+        request: AddPhotosToAlbumRequest,
+    ) -> anyhow::Result<AddPhotosToAlbumResponse> {
+        let url = self.base_url.join(&format!(
+            "photos/volumes/{}/albums/{}/add-multiple",
+            volume_id.raw(),
+            album_link_id.raw()
+        ))?;
+        let builder = self.add_auth_headers(self.client.post(url).json(&request)).await?;
+        Ok(builder.send().await?.json::<AddPhotosToAlbumResponse>().await?)
+    }
+
+    async fn remove_photos_from_album(
+        &self,
+        volume_id: VolumeId,
+        album_link_id: LinkId,
+        link_ids: Vec<LinkId>,
+    ) -> anyhow::Result<()> {
+        let url = self.base_url.join(&format!(
+            "photos/volumes/{}/albums/{}/remove-multiple",
+            volume_id.raw(),
+            album_link_id.raw()
+        ))?;
+        let request = RemovePhotosFromAlbumRequest { link_ids };
+        let builder = self.add_auth_headers(self.client.post(url).json(&request)).await?;
+        builder.send().await?;
+        Ok(())
+    }
+
+    async fn add_photo_tags(
+        &self,
+        volume_id: VolumeId,
+        link_id: LinkId,
+        tags: Vec<PhotoTag>,
+    ) -> anyhow::Result<()> {
+        let url = self.base_url.join(&format!(
+            "photos/volumes/{}/links/{}/tags",
+            volume_id.raw(),
+            link_id.raw()
+        ))?;
+        let builder = self
+            .add_auth_headers(self.client.post(url).json(&PhotoTagsRequest { tags }))
+            .await?;
+        builder.send().await?;
+        Ok(())
+    }
+
+    async fn remove_photo_tags(
+        &self,
+        volume_id: VolumeId,
+        link_id: LinkId,
+        tags: Vec<PhotoTag>,
+    ) -> anyhow::Result<()> {
+        let url = self.base_url.join(&format!(
+            "photos/volumes/{}/links/{}/tags",
+            volume_id.raw(),
+            link_id.raw()
+        ))?;
+        let builder = self
+            .add_auth_headers(self.client.delete(url).json(&PhotoTagsRequest { tags }))
+            .await?;
+        builder.send().await?;
+        Ok(())
+    }
+
+    async fn set_photo_favorite(
+        &self,
+        volume_id: VolumeId,
+        link_id: LinkId,
+        payload: Option<FavoritePhotoPayload>,
+    ) -> anyhow::Result<()> {
+        let url = self.base_url.join(&format!(
+            "photos/volumes/{}/links/{}/favorite",
+            volume_id.raw(),
+            link_id.raw()
+        ))?;
+        let builder = match payload {
+            Some(p) => self.client.post(url).json(&p),
+            None => self.client.post(url),
+        };
+        let builder = self.add_auth_headers(builder).await?;
+        builder.send().await?;
+        Ok(())
     }
 }
 

@@ -1,3 +1,5 @@
+use crate::api::block::BlockUploadPreparationRequest;
+use crate::api::file::thumbnail::ThumbnailCreationRequest;
 use crate::author::Author;
 use crate::client::ProtonDriveClient;
 use crate::error::ProtonDriveError;
@@ -7,16 +9,23 @@ use crate::node::NodeUid;
 use crate::node::download::DownloadState;
 use crate::node::draft::RevisionDraft;
 use crate::node::file::FileContentDigests;
+use crate::pgp::PgpArmoredMessage;
+use crate::pgp::PgpArmoredSignature;
 use crate::protobuf::SignatureVerificationError;
 use crate::protobuf::ThumbnailHeader;
 use crate::revision::RevisionId;
 use crate::utils::PotentialObject;
 use crate::volume::VolumeId;
 use chrono::{DateTime, Utc};
+use proton_rpgp::AsPublicKeyRef;
+use proton_rpgp::DataEncoding;
+use proton_rpgp::Encryptor;
+use proton_rpgp::Signer;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
-use sha1::Digest;
 use proton_rpgp::pgp::ser::Serialize as _;
+use sha2::Digest;
+use sha2::Sha256;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 
@@ -24,29 +33,49 @@ pub const REVISION_WRITER_DEFAULT_BLOCK_SIZE: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct DegradedRevision {
+    /// Unique identifier combining the parent node UID and the revision ID.
     pub uid: RevisionUid,
+    /// When this revision was committed on the server.
     pub creation_time: DateTime<Utc>,
+    /// Encrypted size of the revision stored on cloud storage.
     pub size_on_cloud_storage: i64,
+    /// Plaintext size declared by the uploader; `None` if unavailable.
     pub claimed_size: Option<i64>,
+    /// Content digests declared by the uploader; `None` if decryption of extended attributes failed.
     pub claimed_digests: Option<FileContentDigests>,
+    /// Last-modified timestamp declared by the uploader; `None` if unavailable.
     pub claimed_modification_time: Option<DateTime<Utc>>,
+    /// Thumbnail descriptors attached to this revision.
     pub thumbnails: Vec<ThumbnailHeader>,
+    /// Additional metadata properties that could not be mapped to known fields.
     pub additional_claimed_metadata: Option<Vec<AdditionalMetadataProperty>>,
+    /// Authorship claim for the content signature; `None` if the revision has no content block.
     pub content_author: Option<PotentialObject<Author, SignatureVerificationError>>,
+    /// `true` when the revision's content key could be decrypted and blocks can be downloaded.
     pub can_decrypt: bool,
+    /// Non-fatal errors encountered while decrypting or verifying this revision.
     pub errors: Vec<ProtonDriveError>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Revision {
+    /// Unique identifier combining the parent node UID and the revision ID.
     pub uid: RevisionUid,
+    /// When this revision was committed on the server.
     pub creation_time: DateTime<Utc>,
+    /// Encrypted size of the revision stored on cloud storage.
     pub size_on_cloud_storage: i64,
+    /// Plaintext size in bytes declared by the uploader.
     pub claimed_size: Option<i64>,
+    /// Content digests declared by the uploader (SHA-1 etc.) for post-download verification.
     pub claimed_digests: FileContentDigests,
+    /// Last-modified timestamp declared by the uploader.
     pub claimed_modification_time: Option<DateTime<Utc>>,
+    /// Thumbnail descriptors attached to this revision.
     pub thumbnails: Vec<ThumbnailHeader>,
+    /// Additional metadata properties that could not be mapped to known fields.
     pub additional_claimed_metadata: Option<Vec<AdditionalMetadataProperty>>,
+    /// Authorship claim for the content signature.
     pub content_author: Option<PotentialObject<Author, SignatureVerificationError>>,
 }
 
@@ -60,12 +89,19 @@ pub enum RevisionState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevisionInfo {
+    /// Unique identifier combining the parent node UID and the revision ID.
     pub uid: RevisionUid,
+    /// Lifecycle state of this revision (draft, active, or superseded).
     pub state: RevisionState,
+    /// When the revision was committed on the server.
     pub creation_time: DateTime<Utc>,
+    /// Encrypted size of the revision data stored on cloud storage.
     pub size_on_cloud_storage: i64,
+    /// Plaintext size in bytes as declared by the uploader; `None` if not provided.
     pub claimed_size: Option<i64>,
+    /// Last-modified timestamp declared by the uploader at upload time.
     pub claimed_modification_time: Option<DateTime<Utc>>,
+    /// SHA-1 digest of the plaintext content as declared by the uploader.
     pub claimed_sha1: Option<Vec<u8>>,
 }
 
@@ -293,11 +329,6 @@ impl RevisionWriter {
         &mut self,
         thumbnails: Vec<crate::node::thumbnail::Thumbnail>,
     ) -> anyhow::Result<()> {
-        use crate::api::block::BlockUploadPreparationRequest;
-        use crate::api::file::thumbnail::ThumbnailCreationRequest;
-        use sha2::{Digest, Sha256};
-        use proton_rpgp::Encryptor;
-
         if thumbnails.is_empty() {
             return Ok(());
         }
@@ -312,11 +343,9 @@ impl RevisionWriter {
                 .with_session_key(sk.clone())
                 .with_signing_key(&self.draft.signing_key.0);
 
-            // 1. Encrypt the thumbnail data
             let result = encryptor.encrypt(&thumb.content)?;
             let encrypted_data = result.to_bytes()?;
 
-            // 2. Compute SHA256 of the ENCRYPTED data
             let mut hasher = Sha256::new();
             hasher.update(&encrypted_data);
             let hash_digest = hasher.finalize().to_vec();
@@ -329,7 +358,6 @@ impl RevisionWriter {
             encrypted_thumbnails.push((thumb.r#type, encrypted_data, hash_digest));
         }
 
-        // 3. Prepare thumbnails upload
         let request = BlockUploadPreparationRequest {
             address_id: crate::account::AddressId::new(
                 self.draft.membership_address.address_id.clone(),
@@ -359,7 +387,6 @@ impl RevisionWriter {
                 "Uploading thumbnail blob"
             );
 
-            // 4. Upload thumbnail blob
             self.client
                 .api()
                 .storage()
@@ -370,7 +397,6 @@ impl RevisionWriter {
                 )
                 .await?;
 
-            // 5. Store digest for manifest
             self.thumbnail_digests.extend_from_slice(&hash_digest);
         }
 
@@ -379,9 +405,7 @@ impl RevisionWriter {
 
     #[tracing::instrument(skip(self))]
     pub async fn commit(&mut self) -> anyhow::Result<()> {
-        use crate::pgp::{PgpArmoredMessage, PgpArmoredSignature};
-        use proton_rpgp::DataEncoding;
-        use proton_rpgp::{Encryptor, Signer};
+        use sha1::Digest;
 
         tracing::info!(
             total_written = self.total_written,
@@ -400,7 +424,6 @@ impl RevisionWriter {
             signer.sign_detached(&manifest, DataEncoding::Armored)?,
         )?);
 
-        // 2. Prepare Extended Attributes
         let sha1_digest = self.sha1_hasher.clone().finalize().to_vec();
         let mut additional_metadata = std::collections::HashMap::new();
         if let Some(meta) = &self.additional_metadata {
@@ -422,15 +445,12 @@ impl RevisionWriter {
 
         let xattr_json = serde_json::to_vec(&xattr)?;
 
-        // 3. Encrypt Extended Attributes
-        use proton_rpgp::AsPublicKeyRef;
         let xattr_encryptor = Encryptor::default()
             .with_encryption_key(self.draft.file_key.0.as_public_key())
             .with_signing_key(&self.draft.signing_key.0);
         let xattr_result = xattr_encryptor.encrypt(&xattr_json)?;
         let encrypted_xattr = PgpArmoredMessage(String::from_utf8(xattr_result.armor()?)?);
 
-        // 4. Update Revision
         let request = crate::api::revision::RevisionUpdateRequest {
             manifest_signature,
             signature_email_address: self.draft.membership_address.email_address.clone(),

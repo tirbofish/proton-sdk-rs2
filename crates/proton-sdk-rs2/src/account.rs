@@ -8,11 +8,14 @@ use proton_rpgp::{
 use std::sync::Arc;
 
 pub struct ProtonAccountClient {
+    /// API client collection providing access to addresses, keys, and users endpoints.
     pub api: Arc<dyn AccountApiClients>,
+    /// Layered cache (entities + secrets + public keys) backed by the session's cache repositories.
     pub cache: Arc<dyn AccountClientCache>,
 }
 
 impl ProtonAccountClient {
+    /// Constructs a `ProtonAccountClient` wired to the given authenticated session's HTTP client and caches.
     pub fn new(session: &ProtonAPISession) -> Self {
         Self {
             api: Arc::new(DefaultAccountApiClients::new_with_token_credential(
@@ -27,6 +30,7 @@ impl ProtonAccountClient {
         }
     }
 
+    /// Returns the address matching `address_id`, fetching and caching it from the API if needed.
     pub async fn get_address(&self, address_id: &str) -> anyhow::Result<Address> {
         if let Some(address) = self.cache.entities().try_get_address(address_id).await? {
             return Ok(address);
@@ -43,6 +47,7 @@ impl ProtonAccountClient {
         Ok(address)
     }
 
+    /// Returns all addresses for the current user, fetching and caching them if not yet loaded.
     pub async fn get_current_user_addresses(&self) -> anyhow::Result<Vec<Address>> {
         if let Some(addresses) = self
             .cache
@@ -75,6 +80,7 @@ impl ProtonAccountClient {
         Ok(addresses)
     }
 
+    /// Returns the address with the lowest `order` value, which is the user's primary address.
     pub async fn get_current_user_default_address(&self) -> anyhow::Result<Address> {
         let mut addresses = self.get_current_user_addresses().await?;
         if addresses.is_empty() {
@@ -84,6 +90,7 @@ impl ProtonAccountClient {
         Ok(addresses.remove(0))
     }
 
+    /// Returns all decrypted private keys for the given address, caching them after the first fetch.
     pub async fn get_address_private_keys(
         &self,
         address_id: &str,
@@ -113,6 +120,7 @@ impl ProtonAccountClient {
         anyhow::bail!("Could not get address keys for address {address_id}")
     }
 
+    /// Returns the address's primary key as identified by its `primary_key_index` field.
     pub async fn get_address_primary_private_key(
         &self,
         address_id: &str,
@@ -125,6 +133,7 @@ impl ProtonAccountClient {
             .ok_or_else(|| anyhow::anyhow!("Address primary key index out of bounds"))
     }
 
+    /// Returns the private key at the given position within the address's key list.
     pub async fn get_address_private_key(
         &self,
         address_id: &str,
@@ -136,6 +145,7 @@ impl ProtonAccountClient {
             .ok_or_else(|| anyhow::anyhow!("Address key index out of bounds"))
     }
 
+    /// Fetches and caches the active public keys for the given email address from the Keys API.
     pub async fn get_address_public_keys(
         &self,
         email_address: &str,
@@ -166,6 +176,7 @@ impl ProtonAccountClient {
         Ok(keys)
     }
 
+    /// Returns all unlocked user-level private keys, fetching and caching them from the Users API if needed.
     pub async fn get_user_keys(&self) -> anyhow::Result<Vec<PrivateKey>> {
         if let Some(keys) = self.cache.secrets().try_get_user_keys().await? {
             return Ok(keys);

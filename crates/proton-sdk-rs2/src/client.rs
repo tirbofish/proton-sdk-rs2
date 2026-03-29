@@ -15,33 +15,52 @@ use crate::{
 };
 
 pub struct ProtonClientOptions {
+    /// Overrides the default Proton API base URL (`https://mail.proton.me`).
     pub base_url: Option<http::Uri>,
+    /// Custom `User-Agent` header value sent with every request.
     pub user_agent: Option<String>,
+    /// TLS verification strictness; defaults to `Strict`.
     pub tls_policy: Option<ProtonClientTlsPolicy>,
+    /// Optional custom HTTP handler factory (e.g. for certificate pinning or request logging).
     pub custom_http_message_handler_factory:
         Option<Arc<dyn Fn() -> Box<dyn HttpMessageHandler> + Send + Sync>>,
+    /// Repository used to persist entity data such as shares and nodes between sessions.
     pub entity_cache_repository: Option<Arc<dyn CacheRepository>>,
+    /// Sink for telemetry events emitted by the SDK.
     pub telemetry: Option<Arc<dyn Telemetry>>,
+    /// Provider queried before gating experimental features.
     pub feature_flag_provider: Option<Arc<dyn FeatureFlagProvider>>,
-
+    /// Repository used to persist sensitive key material (passphrases, session keys).
     pub secret_cache_repository: Option<Arc<dyn CacheRepository>>,
+    /// URI that the token-refresh flow redirects to after a successful refresh.
     pub refresh_redirect_uri: Option<http::Uri>,
+    /// BCP-47 language tag forwarded by language bindings (e.g. `"en-US"`).
     pub bindings_language: Option<String>,
 }
 
 pub struct ProtonClientConfiguration {
-    /// Base URL used for the drive API. 
+    /// Base URL used for the drive API.
     pub base_url: http::Uri,
+    /// Application version reported in the `x-pm-appversion` header (e.g. `android@1.2.3`).
     pub app_version: semver::Version,
+    /// `User-Agent` string sent with every request.
     pub user_agent: String,
+    /// TLS verification policy in use; strict by default.
     pub tls_policy: ProtonClientTlsPolicy,
+    /// Optional custom HTTP message handler factory (pinning, logging, etc.).
     pub custom_http_message_handler_factory:
         Option<Arc<dyn Fn() -> Box<dyn HttpMessageHandler> + Send + Sync>>,
+    /// Repository used to store decrypted key material across restarts.
     pub secret_cache_repository: Arc<dyn CacheRepository>,
+    /// Repository used to store entity metadata (shares, nodes, volumes) across restarts.
     pub entity_cache_repository: Arc<dyn CacheRepository>,
+    /// Telemetry sink; a no-op implementation is used when none is provided.
     pub telemetry: Arc<dyn Telemetry>,
+    /// Feature-flag provider; all flags are disabled by default.
     pub feature_flag_provider: Arc<dyn FeatureFlagProvider>,
+    /// URI the server redirects to after a successful token refresh.
     pub refresh_redirect_uri: http::Uri,
+    /// Optional BCP-47 language tag forwarded by language bindings.
     pub bindings_language: Option<String>,
 }
 

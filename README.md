@@ -23,7 +23,7 @@ You can check it out [here](https://github.com/tirbofish/proton-sdk-rs)
 - [x] uploads
 - [x] thumbnails
 - [x] photos + albums
-- [ ] some good documentation
+- [x] some good documentation
 - [x] events (doable, not in c# library but available in js lib)
 - repl (wip)
 

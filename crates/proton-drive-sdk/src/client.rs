@@ -318,14 +318,17 @@ impl ProtonDriveClient {
 
 // getters
 impl ProtonDriveClient {
+    /// Returns the unique identifier assigned to this client instance.
     pub fn uid(&self) -> &str {
         &self.uid
     }
 
+    /// Returns the target encrypted block size (in bytes) used when uploading file data.
     pub fn target_block_size(&self) -> usize {
         self.target_block_size
     }
 
+    /// Overrides the target encrypted block size. `value` is in bytes; the default is 4 MiB.
     pub fn set_target_block_size(&mut self, value: usize) {
         self.target_block_size = value;
     }
@@ -334,10 +337,13 @@ impl ProtonDriveClient {
         &self.account
     }
 
+    /// Returns the Drive API client bundle used for all HTTP calls.
     pub fn api(&self) -> &Arc<dyn DriveApiClients> {
         &self.api
     }
 
+    /// Lists the direct children of a folder, or the root "My Files" folder if `parent_link_id` is `None`.
+    /// Fetches, decrypts and returns all items up-front, collecting the stream into a `Vec`.
     pub async fn list_children(
         &self,
         volume_id: VolumeId,
@@ -367,30 +373,37 @@ impl ProtonDriveClient {
         &self.block_verifier_factory
     }
 
+    /// Returns the telemetry sink attached to this client.
     pub fn telemetry(&self) -> &Arc<dyn Telemetry> {
         &self.telemetry
     }
 
+    /// Returns the feature flag provider used to gate experimental behaviour.
     pub fn feature_flag_provider(&self) -> &Arc<dyn FeatureFlagProvider> {
         &self.feature_flag_provider
     }
 
+    /// Returns the semaphore used to limit the number of concurrent revision creation requests.
     pub fn revision_creation_semaphore(&self) -> &FifoFlexibleSemaphore {
         &self.revision_creation_semaphore
     }
 
+    /// Returns the semaphore used to limit concurrent block-list fetch requests.
     pub fn block_listing_semaphore(&self) -> &FifoFlexibleSemaphore {
         &self.block_listing_semaphore
     }
 
+    /// Returns the block uploader, which manages upload parallelism.
     pub fn block_uploader(&self) -> &BlockUploader {
         &self.block_uploader
     }
 
+    /// Returns the block downloader used for file content.
     pub fn block_downloader(&self) -> &BlockDownloader {
         &self.block_downloader
     }
 
+    /// Returns the block downloader dedicated to thumbnail content.
     pub fn thumbnail_block_downloader(&self) -> &BlockDownloader {
         &self.thumbnail_block_downloader
     }
@@ -398,10 +411,13 @@ impl ProtonDriveClient {
 
 // the meat
 impl ProtonDriveClient {
+    /// Returns the root "My Files" folder for the authenticated user.
     pub async fn get_my_files_folder(&self) -> anyhow::Result<FolderNode> {
         NodeOperations::get_my_files_folder(self).await
     }
 
+    /// Fetches and decrypts a single node by its `NodeUid`.
+    /// Returns a `PotentialObject` that is either a fully-decrypted `Node` or a `DegradedNode` when decryption partially fails.
     pub async fn get_node(
         &self,
         node_uid: NodeUid,
@@ -451,6 +467,7 @@ impl ProtonDriveClient {
         Ok(result.data)
     }
 
+    /// Fetches and decrypts multiple nodes in parallel, returning results in an unordered stream.
     pub async fn enumerate_nodes(
         &self,
         node_uids: Vec<NodeUid>,
@@ -462,6 +479,8 @@ impl ProtonDriveClient {
         Ok(futures::stream::iter(results.into_iter().map(Ok)))
     }
 
+    /// Creates a new folder under `parent_id` with the given `name`.
+    /// `last_modification_time` sets the folder's extended-attributes modification timestamp.
     pub async fn create_folder(
         &self,
         parent_id: NodeUid,
@@ -488,6 +507,8 @@ impl ProtonDriveClient {
         }))
     }
 
+    /// Fetches thumbnails for the given files, filtered by `thumbnail_type`.
+    /// Returns an unordered stream of `FileThumbnail` items.
     pub async fn enumerate_thumbnails(
         &self,
         file_uids: Vec<NodeUid>,
@@ -497,6 +518,8 @@ impl ProtonDriveClient {
         Ok(futures::stream::iter(results.into_iter().map(Ok)))
     }
 
+    /// Creates a `FileUploader` for a brand-new file under `parent_folder_uid`.
+    /// Set `override_existing_draft_by_other_client` to `true` to replace an abandoned draft from another client.
     pub async fn get_file_uploader(
         &self,
         parent_folder_uid: NodeUid,
@@ -526,6 +549,8 @@ impl ProtonDriveClient {
         .await
     }
 
+    /// Creates a `FileUploader` for a new revision of an existing file.
+    /// Pass the `RevisionUid` of the current active revision to replace it.
     pub async fn get_file_revision_uploader(
         &self,
         current_active_revision_uid: RevisionUid,
@@ -550,6 +575,7 @@ impl ProtonDriveClient {
         .await
     }
 
+    /// Creates a `FileDownloader` for the active revision of a file, identified by its `RevisionUid`.
     pub async fn get_file_downloader(
         &self,
         revision_uid: RevisionUid,
@@ -680,6 +706,8 @@ impl ProtonDriveClient {
         Ok(())
     }
 
+    /// Downloads the active revision of a file node and writes it to `path` on disk.
+    /// `on_progress` is called with (bytes_written, total_bytes) as data arrives.
     pub async fn download_to_file(
         &self,
         node_uid: NodeUid,
@@ -703,6 +731,8 @@ impl ProtonDriveClient {
         controller.completion.await?
     }
 
+    /// Reads `path` from disk and uploads it as a new file under `parent_folder_uid`.
+    /// Set `override_existing` to `true` to replace an existing file with the same name.
     pub async fn upload_file(
         &self,
         path: &std::path::Path,
@@ -748,6 +778,8 @@ impl ProtonDriveClient {
             .await
     }
 
+    /// Returns a unique variant of `name` that does not conflict with any existing child under `parent_uid`.
+    /// If `name` is already available it is returned unchanged.
     pub async fn get_available_name(
         &self,
         parent_uid: NodeUid,
@@ -756,6 +788,7 @@ impl ProtonDriveClient {
         NodeOperations::get_available_name(self, parent_uid, name).await
     }
 
+    /// Moves multiple nodes to `new_parent_folder_uid`, re-encrypting their key material for the new parent.
     pub async fn move_nodes(
         &self,
         uids: Vec<NodeUid>,
@@ -765,6 +798,8 @@ impl ProtonDriveClient {
     }
 
 
+    /// Copies a single node to `new_parent_folder_uid`, optionally renaming it with `new_name`.
+    /// Returns the `LinkId` of the newly created copy.
     pub async fn copy_node(
         &self,
         uid: NodeUid,
@@ -774,6 +809,7 @@ impl ProtonDriveClient {
         NodeOperations::copy_single(self, uid, new_parent_folder_uid, new_name).await
     }
 
+    /// Renames a node, optionally updating its `new_media_type` MIME type.
     pub async fn rename_node(
         &self,
         uid: NodeUid,
@@ -783,6 +819,7 @@ impl ProtonDriveClient {
         NodeOperations::rename(self, uid, new_name, new_media_type).await
     }
 
+    /// Moves the given nodes to the trash. Returns a per-node result map.
     pub async fn trash_nodes(
         &self,
         uids: Vec<NodeUid>,
@@ -790,6 +827,7 @@ impl ProtonDriveClient {
         NodeOperations::trash(self, uids).await
     }
 
+    /// Permanently deletes nodes that are currently in the default location (not from trash). Returns a per-node result map.
     pub async fn delete_nodes(
         &self,
         uids: Vec<NodeUid>,
@@ -797,6 +835,7 @@ impl ProtonDriveClient {
         NodeOperations::delete(self, uids).await
     }
 
+    /// Permanently deletes nodes from the trash. Returns a per-node result map.
     pub async fn delete_nodes_from_trash(
         &self,
         uids: Vec<NodeUid>,
@@ -804,6 +843,7 @@ impl ProtonDriveClient {
         NodeOperations::delete_from_trash(self, uids).await
     }
 
+    /// Restores previously-trashed nodes to their original location. Returns a per-node result map.
     pub async fn restore_nodes(
         &self,
         uids: Vec<NodeUid>,
@@ -811,15 +851,15 @@ impl ProtonDriveClient {
         NodeOperations::restore(self, uids).await
     }
 
+    /// Returns all nodes currently in the trash, decrypting each where possible.
     pub async fn enumerate_trash(&self) -> anyhow::Result<Vec<Result<Node, DegradedNode>>> {
         VolumeOperations::enumerate_trash(self).await
     }
 
+    /// Permanently deletes every item in the trash for this user.
     pub async fn empty_trash(&self) -> anyhow::Result<()> {
         VolumeOperations::empty_trash(self).await
     }
-
-    // ── Events ────────────────────────────────────────────────────────────────
 
     /// Returns the latest known event-ID for the given volume. Use this cursor
     /// to start polling with [`poll_volume_events`].
@@ -920,4 +960,12 @@ fn generate_uid() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("drive-client-{}", nanos)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn something() {
+
+    }
 }

@@ -31,6 +31,8 @@ pub struct TokenCredential {
 }
 
 impl TokenCredential {
+    /// Creates a new `TokenCredential` seeded with the given access and refresh tokens.
+    /// The underlying token pair is refreshed automatically when callers invoke `get_tokens`.
     pub fn new(
         client: Arc<dyn AuthenticationApiClient>,
         session_id: SessionId,
@@ -54,6 +56,7 @@ impl TokenCredential {
         }
     }
 
+    /// Returns the current valid (access, refresh) token pair, refreshing silently if needed.
     pub async fn get_tokens(&self) -> anyhow::Result<(String, String)> {
         let task = self.tokens_task.read().await.clone();
         let tokens = task
@@ -62,22 +65,30 @@ impl TokenCredential {
         Ok((tokens.0.clone(), tokens.1.clone()))
     }
 
+    /// Alias for `get_tokens`; returns the (access, refresh) token pair.
     pub async fn get_access_token(&self) -> anyhow::Result<(String, String)> {
         self.get_tokens().await
     }
 
+    /// Subscribes to a broadcast channel that fires whenever tokens are successfully refreshed.
+    /// The sent value is the new (access, refresh) token pair.
     pub fn subscribe_tokens_refreshed(&self) -> broadcast::Receiver<(String, String)> {
         self.tokens_refreshed_tx.subscribe()
     }
 
+    /// Subscribes to a broadcast channel that fires when the refresh token is irrevocably expired.
+    /// Callers should prompt for re-authentication on receipt.
     pub fn subscribe_refresh_token_expired(&self) -> broadcast::Receiver<()> {
         self.refresh_token_expired_tx.subscribe()
     }
 
+    /// Returns the session identifier associated with this credential.
     pub fn session_id(&self) -> SessionId {
         self.session_id.clone()
     }
 
+    /// Returns the access token that was last explicitly stored in this credential.
+    /// For the latest valid token use the async `get_tokens` instead.
     pub fn current_access_token(&self) -> &str {
         &self.access_token
     }
@@ -101,6 +112,8 @@ impl TokenCredential {
         let _ = self.refresh_token_expired_tx.send(());
     }
 
+    /// Obtains a fresh access token, triggering a server-side refresh if the given
+    /// `rejected_access_token` matches the current stored token.
     pub async fn get_refreshed_access_token(
         &self,
         rejected_access_token: String,

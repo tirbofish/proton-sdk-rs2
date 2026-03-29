@@ -146,28 +146,38 @@ pub struct AddressResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AddressDto {
+    /// Opaque address ID used as the key for per-address operations.
     #[serde(rename = "ID", alias = "id")]
     pub id: String,
+    /// Display/sort order; lower numbers appear first.
     #[serde(rename = "Order", alias = "order", default)]
     pub order: i32,
+    /// The email address string (e.g. `"alice@proton.me"`).
     #[serde(rename = "Email", alias = "email", default)]
     pub email: String,
+    /// Address status: `1` = enabled, `0` = disabled.
     #[serde(rename = "Status", alias = "status", default)]
     pub status: i32,
+    /// Cryptographic keys associated with this address.
     #[serde(rename = "Keys", alias = "keys", default)]
     pub keys: Vec<AddressKeyDto>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AddressKeyDto {
+    /// Opaque key ID.
     #[serde(rename = "ID", alias = "id")]
     pub id: String,
+    /// Armored PGP private key (locked with the user's key passphrase).
     #[serde(rename = "PrivateKey", alias = "private_key", default)]
     pub private_key: String,
+    /// Encrypted token used to unlock the private key without the full passphrase (modern format).
     #[serde(rename = "Token", alias = "token", default)]
     pub token: Option<String>,
+    /// Detached PGP signature over `token`, signed by the user key.
     #[serde(rename = "Signature", alias = "signature", default)]
     pub signature: Option<String>,
+    /// `true` when this is the primary key for the address.
     #[serde(
         rename = "Primary",
         alias = "primary",
@@ -175,6 +185,7 @@ pub struct AddressKeyDto {
         deserialize_with = "deserialize_boolish"
     )]
     pub is_primary: bool,
+    /// `true` when this key is currently active and usable.
     #[serde(
         rename = "Active",
         alias = "active",
@@ -182,6 +193,7 @@ pub struct AddressKeyDto {
         deserialize_with = "deserialize_boolish"
     )]
     pub is_active: bool,
+    /// Bitfield of `AddressKeyFlags` indicating which operations the key supports.
     #[serde(rename = "Flags", alias = "flags", default)]
     pub flags: i32,
 }

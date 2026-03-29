@@ -51,6 +51,7 @@ pub struct FolderDecryptionResult {
 pub struct NodeCrypto;
 
 impl NodeCrypto {
+    /// Encrypts `name` with `session_key` (for the node itself) and seals it with `parent_key`, signed by `signing_key`.
     pub fn encrypt_name(
         name: &str,
         session_key: &PgpSessionKey,
@@ -71,6 +72,8 @@ impl NodeCrypto {
         Ok(PgpArmoredMessage(armored))
     }
 
+    /// Generates a fresh session key, encrypts `name` with it under `parent_key`, and computes an HMAC name-hash over `hash_key`.
+    /// Returns the encrypted name, the raw HMAC digest, and the generated session key.
     pub fn encrypt_and_sign_name(
         name: &str,
         hash_key: &[u8],
@@ -96,6 +99,8 @@ impl NodeCrypto {
         Ok((PgpArmoredMessage(armored), name_hash_digest, session_key))
     }
 
+    /// Encrypts `passphrase` under `parent_key` and produces a detached signature over the plaintext via `signing_key`.
+    /// Returns the armored ciphertext, an optional detached signature, and the generated session key.
     pub fn encrypt_and_sign_passphrase(
         passphrase: &[u8],
         parent_key: &PgpPrivateKey,
@@ -164,6 +169,7 @@ impl NodeCrypto {
         Ok(PgpArmoredMessage(armored))
     }
 
+    /// Encrypts the folder's random `hash_key` under `node_key`, signed by `signing_key`.
     pub fn encrypt_folder_hash_key(
         node_key: &PgpPrivateKey,
         hash_key: &[u8],
@@ -183,6 +189,7 @@ impl NodeCrypto {
         Ok(PgpArmoredMessage(armored))
     }
 
+    /// Decrypts all cryptographic fields of a file link (name, passphrase, node key, content key) and verifies authorship.
     pub async fn decrypt_file(
         account_client: Arc<dyn crate::account::AccountClient>,
         link: &crate::api::links::LinkDto,
@@ -215,6 +222,7 @@ impl NodeCrypto {
         }
     }
 
+    /// Decrypts all cryptographic fields of a folder link (name, passphrase, node key, hash key) and verifies authorship.
     pub async fn decrypt_folder(
         account_client: Arc<dyn crate::account::AccountClient>,
         link: &crate::api::links::LinkDto,
@@ -237,6 +245,7 @@ impl NodeCrypto {
         }
     }
 
+    /// Decrypts the folder's encrypted `hash_key` using `node_key` and verifies the authorship signature.
     pub fn decrypt_hash_key(
         encrypted_hash_key: Option<&PgpArmoredMessage>,
         node_key: Option<&PgpPrivateKey>,
@@ -267,6 +276,7 @@ impl NodeCrypto {
         }
     }
 
+    /// Decrypts the content key packet for a file revision using `node_key`, returning the raw PGP session key.
     pub fn decrypt_content_key(
         node_key: Option<&PgpPrivateKey>,
         content_key_packet: &[u8],
@@ -294,6 +304,7 @@ impl NodeCrypto {
         }
     }
 
+    /// Decrypts a link's name, passphrase, and node key using the provided parent keys and verifies node authorship.
     pub async fn decrypt_link(
         account_client: Arc<dyn crate::account::AccountClient>,
         link: &crate::api::links::LinkDto,
@@ -363,6 +374,7 @@ impl NodeCrypto {
         }
     }
 
+    /// Imports and unlocks an armored private key using the given `passphrase` bytes.
     pub fn unlock_key_with_passphrase(
         armored_key: &PgpArmoredPrivateKey,
         passphrase: &[u8],
@@ -373,6 +385,7 @@ impl NodeCrypto {
         }
     }
 
+    /// Decrypts an encrypted node passphrase using one or more `node_keys`, returning the raw session key bytes.
     pub fn decrypt_passphrase<'a>(
         node_keys: impl IntoIterator<Item = &'a PgpPrivateKey>,
         encrypted_passphrase: &PgpArmoredMessage,
@@ -413,6 +426,7 @@ impl NodeCrypto {
         }
     }
 
+    /// Decrypts an armored PGP message with the given keys and optionally verifies a detached signature against the authorship claim.
     pub fn decrypt_message<'a>(
         encrypted_message: &PgpArmoredMessage,
         detached_signature: Option<&PgpArmoredSignature>,

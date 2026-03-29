@@ -91,14 +91,19 @@ where
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SesisonInitiationResponse {
+    /// SRP protocol version negotiated with the server.
     #[serde(rename = "Version", alias = "version")]
     pub version: i32,
+    /// Signed SRP modulus returned by the server.
     #[serde(rename = "Modulus", alias = "modulus")]
     pub modulus: String,
+    /// Server's SRP ephemeral value (base64-encoded).
     #[serde(rename = "ServerEphemeral", alias = "server_ephemeral")]
     pub server_ephemeral: String,
+    /// Per-account password salt (base64-encoded).
     #[serde(rename = "Salt", alias = "salt")]
     pub salt: String,
+    /// Opaque SRP session identifier to be echoed back in the auth request.
     #[serde(rename = "SRPSession", alias = "srp_session_id")]
     pub srp_session_id: String,
     #[serde(flatten)]
@@ -107,20 +112,28 @@ pub struct SesisonInitiationResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthenticationResponse {
+    /// The session UID assigned by the server (`UID` field).
     #[serde(rename = "UID", alias = "session_id")]
     pub session_id: SessionId,
+    /// The authenticated user's ID.
     #[serde(rename = "UserID", alias = "user_id")]
     pub user_id: UserId,
+    /// Latest core event ID at the time of login; use as the starting cursor for event polling.
     #[serde(rename = "EventID", alias = "event_id")]
     pub event_id: Option<EventId>,
+    /// Short-lived access token; `None` when a second factor is still required.
     #[serde(rename = "AccessToken", alias = "access_token", default)]
     pub access_token: Option<String>,
+    /// Long-lived refresh token used to obtain new access tokens.
     #[serde(rename = "RefreshToken", alias = "refresh_token", default)]
     pub refresh_token: Option<String>,
+    /// List of OAuth-style scopes granted to this session.
     #[serde(rename = "Scopes", alias = "scopes", default)]
     pub scopes: Vec<String>,
+    /// Indicates whether the account uses one or two passwords.
     #[serde(rename = "PasswordMode", alias = "password_mode", default)]
     pub password_mode: Option<PasswordMode>,
+    /// Present when a second authentication factor must be provided before the session is fully active.
     #[serde(rename = "2FA", alias = "two_factor", default)]
     pub second_factor_parameters: Option<SecondFactorParameters>,
 }
@@ -133,19 +146,23 @@ pub struct SecondFactorParameters {
         default,
         deserialize_with = "deserialize_boolish"
     )]
+    /// `true` when at least one second factor method (TOTP or U2F) is enabled for the account.
     pub is_enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RefreshSessionResponse {
+    /// New short-lived access token replacing the expired one.
     #[serde(rename = "AccessToken", alias = "access_token")]
     pub access_token: String,
+    /// Rotated long-lived refresh token; replace the stored value with this after each refresh.
     #[serde(rename = "RefreshToken", alias = "refresh_token")]
     pub refresh_token: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScopesResponse {
+    /// Scopes currently granted to the session.
     #[serde(rename = "Scopes", alias = "scopes", default)]
     pub scopes: Vec<String>,
     #[serde(
@@ -154,6 +171,7 @@ pub struct ScopesResponse {
         default,
         deserialize_with = "deserialize_option_boolish"
     )]
+    /// `Some(true)` when a second factor code is still required to fully activate the session.
     pub is_waiting_for_second_factor_code: Option<bool>,
     #[serde(flatten)]
     pub response: ApiResponse,
@@ -169,8 +187,10 @@ pub struct ModulusResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AddressPublicKeyListResponse {
+    /// The email address these keys belong to, if echoed by the server.
     #[serde(rename = "Address", alias = "address", default)]
     pub address: Option<String>,
+    /// Active public keys for the address, including flags and source metadata.
     #[serde(rename = "AddressPublicKeys", alias = "address_public_keys", default)]
     pub address_public_keys: Vec<AddressPublicKey>,
     #[serde(flatten)]
@@ -179,12 +199,16 @@ pub struct AddressPublicKeyListResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AddressPublicKey {
+    /// Email address associated with this key.
     #[serde(rename = "Email", alias = "email", default)]
     pub email: Option<String>,
+    /// Bitfield indicating key capabilities (verify=1, encrypt=2).
     #[serde(rename = "Flags", alias = "flags", default)]
     pub flags: Option<i32>,
+    /// Armored PGP public key.
     #[serde(rename = "PublicKey", alias = "public_key", default)]
     pub public_key: Option<String>,
+    /// Origin of the key: `0` = ProtonMail, `3` = external/WKD.
     #[serde(rename = "Source", alias = "source", default)]
     pub source: Option<i32>,
 }

@@ -274,7 +274,8 @@ impl ProtonAPISession {
         Ok(session)
     }
 
-    /// Convenience wrapper for [`Self::resume_with_options`] with default client options.
+    /// Restores a session from stored token material using default client options.
+    /// Prefer [`Self::from_stored_credentials`] when reviving a persisted session.
     pub fn resume(
         session_id: SessionId,
         username: impl Into<String>,
@@ -302,6 +303,8 @@ impl ProtonAPISession {
         )
     }
 
+    /// Restores a session from stored token material with custom client options.
+    /// The `secret_cache_repository` is attached to `options` and used to re-populate the key cache on demand.
     pub fn resume_with_options(
         session_id: SessionId,
         username: impl Into<String>,
@@ -343,9 +346,8 @@ impl ProtonAPISession {
         session
     }
 
-    /// Renews the session. 
-    /// 
-    /// 
+    /// Re-creates a session around new token material returned by the server after a token rotation.
+    /// Preserves the username, user ID and client configuration from the expired session.
     pub fn renew(
         expired_session: ProtonAPISession,
         session_id: SessionId,
@@ -507,6 +509,8 @@ impl ProtonAPISession {
         Ok(())
     }
 
+    /// Terminates the session by revoking the current access token server-side.
+    /// Returns `true` if the session was successfully ended or was already ended.
     pub async fn end_from_session(&mut self) -> anyhow::Result<bool> {
         if self.is_ended {
             return Ok(true);
@@ -550,6 +554,8 @@ impl ProtonAPISession {
 }
 
 impl ProtonAPISession {
+    /// Returns a lazily-initialised client for the Proton Keys API (`/keys`). 
+    /// The client is cached on the session after the first call.
     pub fn keys_api(&mut self) -> anyhow::Result<Arc<dyn KeysApiClient>> {
         if let Some(api) = self.keys_api.as_ref() {
             Ok(api.clone())
@@ -565,6 +571,8 @@ impl ProtonAPISession {
         }
     }
 
+    /// Returns a lazily-initialised client for the Proton Authentication API (`/auth`). 
+    /// The client is cached on the session after the first call.
     pub fn authentication_api(&mut self) -> anyhow::Result<Arc<dyn AuthenticationApiClient>> {
         if let Some(api) = self.authentication_api.as_ref() {
             Ok(api.clone())
@@ -586,6 +594,8 @@ pub struct ProtonSessionOptions {
 }
 
 impl ProtonSessionOptions {
+    /// Creates `ProtonSessionOptions` from the given client options, propagating the
+    /// `secret_cache_repository` field so it can be passed independently to `begin`.
     pub fn new(client_options: ProtonClientOptions) -> Self {
         let secret_cache_repository = client_options.secret_cache_repository.clone();
         Self {

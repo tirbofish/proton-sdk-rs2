@@ -961,11 +961,3 @@ fn generate_uid() -> String {
         .unwrap_or(0);
     format!("drive-client-{}", nanos)
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn something() {
-
-    }
-}

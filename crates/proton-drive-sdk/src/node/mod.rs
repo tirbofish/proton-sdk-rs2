@@ -1,5 +1,7 @@
 use std::fmt::Display;
 
+use futures::stream::{FuturesUnordered, StreamExt};
+
 use crate::author::Author;
 use crate::client::ProtonDriveClient;
 use crate::error::ProtonDriveError;
@@ -477,20 +479,36 @@ impl crate::utils::batch::BatchLoader<crate::links::LinkId, PotentialObject<Node
             .links()
             .get_details(self.volume_id.clone(), ids)
             .await?;
-        let mut results = Vec::with_capacity(response.links.len());
 
-        for link_details in response.links {
-            let metadata_result = DtoToMetadataConverter::convert_dto_to_node_metadata(
-                self.client.account().clone(),
-                self.client.cache().entities().as_ref(),
-                self.client.cache().secrets().as_ref(),
-                self.volume_id.clone(),
-                link_details,
-                self.parent_key.as_ref(),
-            )
-            .await?;
+        let client = self.client.clone();
+        let volume_id = self.volume_id.clone();
+        let parent_key = self.parent_key.clone();
 
-            results.push(metadata_result.to_node_result());
+        let mut futs: FuturesUnordered<_> = response
+            .links
+            .into_iter()
+            .map(|link_details| {
+                let c = client.clone();
+                let vid = volume_id.clone();
+                let pk = parent_key.clone();
+                async move {
+                    DtoToMetadataConverter::convert_dto_to_node_metadata(
+                        c.account().clone(),
+                        c.cache().entities().as_ref(),
+                        c.cache().secrets().as_ref(),
+                        vid,
+                        link_details,
+                        pk.as_ref(),
+                    )
+                    .await
+                    .map(|r| r.to_node_result())
+                }
+            })
+            .collect();
+
+        let mut results = Vec::new();
+        while let Some(result) = futs.next().await {
+            results.push(result?);
         }
 
         Ok(results)
@@ -561,38 +579,81 @@ impl crate::utils::batch::BatchLoader<crate::links::LinkId, PotentialObject<Node
             .get_details(self.volume_id.clone(), ids.clone())
             .await?;
 
-        let mut results = Vec::with_capacity(ids.len());
+        // Collect unique parent IDs that are not yet cached.
+        let mut missing_parent_ids: Vec<crate::links::LinkId> = {
+            let parent_keys = self.parent_keys.lock().await;
+            response
+                .links
+                .iter()
+                .filter_map(|ld| ld.link.parent_id.clone())
+                .filter(|pid| !parent_keys.contains_key(pid))
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect()
+        };
 
-        for link_details in response.links {
-            let parent_key = if let Some(parent_id) = &link_details.link.parent_id {
-                let mut parent_keys = self.parent_keys.lock().await;
-                if let Some(key) = parent_keys.get(parent_id) {
-                    key.clone()
-                } else {
-                    let folder_secrets = crate::node::folder::FolderOperations::get_secrets(
-                        &self.client,
-                        NodeUid::new(self.volume_id.clone(), parent_id.clone()),
-                    )
-                    .await?;
-                    let key = folder_secrets.base.key;
-                    parent_keys.insert(parent_id.clone(), key.clone());
-                    key
-                }
-            } else {
-                self.share_key.clone()
-            };
+        // Fetch all missing parent secrets in parallel.
+        if !missing_parent_ids.is_empty() {
+            let mut fetch_futs: FuturesUnordered<_> = missing_parent_ids
+                .drain(..)
+                .map(|parent_id| {
+                    let client = self.client.clone();
+                    let volume_id = self.volume_id.clone();
+                    async move {
+                        let secrets = crate::node::folder::FolderOperations::get_secrets(
+                            &client,
+                            NodeUid::new(volume_id, parent_id.clone()),
+                        )
+                        .await?;
+                        anyhow::Ok((parent_id, secrets.base.key))
+                    }
+                })
+                .collect();
 
-            let metadata_result = DtoToMetadataConverter::convert_dto_to_node_metadata(
-                self.client.account().clone(),
-                self.client.cache().entities().as_ref(),
-                self.client.cache().secrets().as_ref(),
-                self.volume_id.clone(),
-                link_details,
-                Some(&parent_key),
-            )
-            .await?;
+            let mut parent_keys = self.parent_keys.lock().await;
+            while let Some(result) = fetch_futs.next().await {
+                let (id, key) = result?;
+                parent_keys.entry(id).or_insert(key);
+            }
+        }
 
-            results.push(metadata_result.to_node_result());
+        // Now decrypt all links in parallel (parent keys are all cached).
+        let client = self.client.clone();
+        let volume_id = self.volume_id.clone();
+        let share_key = self.share_key.clone();
+
+        let mut decrypt_futs: FuturesUnordered<_> = {
+            let parent_keys = self.parent_keys.lock().await;
+            response
+                .links
+                .into_iter()
+                .map(|link_details| {
+                    let parent_key = if let Some(pid) = &link_details.link.parent_id {
+                        parent_keys.get(pid).cloned().unwrap_or_else(|| share_key.clone())
+                    } else {
+                        share_key.clone()
+                    };
+                    let c = client.clone();
+                    let vid = volume_id.clone();
+                    async move {
+                        DtoToMetadataConverter::convert_dto_to_node_metadata(
+                            c.account().clone(),
+                            c.cache().entities().as_ref(),
+                            c.cache().secrets().as_ref(),
+                            vid,
+                            link_details,
+                            Some(&parent_key),
+                        )
+                        .await
+                        .map(|r| r.to_node_result())
+                    }
+                })
+                .collect()
+        };
+
+        let mut results = Vec::new();
+        while let Some(result) = decrypt_futs.next().await {
+            results.push(result?);
         }
 
         Ok(results)

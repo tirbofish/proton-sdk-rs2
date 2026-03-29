@@ -739,7 +739,7 @@ impl ProtonDriveClient {
         parent_folder_uid: NodeUid,
         override_existing: bool,
         on_progress: Box<dyn Fn(i64, i64) + Send + Sync>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<NodeUid> {
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -854,6 +854,19 @@ impl ProtonDriveClient {
     /// Returns all nodes currently in the trash, decrypting each where possible.
     pub async fn enumerate_trash(&self) -> anyhow::Result<Vec<Result<Node, DegradedNode>>> {
         VolumeOperations::enumerate_trash(self).await
+    }
+
+    /// Streams trash items progressively as they are fetched and decrypted,
+    /// rather than waiting for all pages. Items arrive batch-by-batch.
+    pub fn stream_trash(
+        &self,
+    ) -> impl futures::Stream<Item = anyhow::Result<Result<Node, DegradedNode>>> + 'static {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let client = self.clone();
+        tokio::spawn(VolumeOperations::enumerate_trash_to_channel(client, tx));
+        futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        })
     }
 
     /// Permanently deletes every item in the trash for this user.

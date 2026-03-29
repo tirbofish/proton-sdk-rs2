@@ -47,8 +47,9 @@ impl FileUploader {
         content_stream: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         thumbnails: Vec<crate::node::thumbnail::Thumbnail>,
         on_progress: Box<dyn Fn(i64, i64) + Send + Sync>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<crate::node::NodeUid> {
         let draft = self.revision_draft_provider.get_draft().await?;
+        let node_uid = draft.uid.node_uid.clone();
 
         let on_progress_arc: Arc<dyn Fn(i64, i64) + Send + Sync> = Arc::from(on_progress);
 
@@ -71,7 +72,8 @@ impl FileUploader {
         writer.upload_thumbnails(thumbnails).await?;
 
         writer.write(content_stream, on_progress_arc).await?;
-        writer.commit().await
+        writer.commit().await?;
+        Ok(node_uid)
     }
 }
 

@@ -85,4 +85,97 @@ impl VolumeOperations {
         let my_files = crate::node::operations::NodeOperations::get_my_files_folder(client).await?;
         Ok(my_files.base.uid.volume_id)
     }
+
+    /// Streams trash items as they are fetched and decrypted, sending each
+    /// through `tx`. Yields items batch-by-batch rather than waiting for all
+    /// pages to complete first.
+    pub async fn enumerate_trash_to_channel(
+        client: ProtonDriveClient,
+        tx: tokio::sync::mpsc::Sender<anyhow::Result<Result<Node, DegradedNode>>>,
+    ) {
+        if let Err(e) = Self::enumerate_trash_inner(&client, &tx).await {
+            let _ = tx.send(Err(e)).await;
+        }
+    }
+
+    async fn enumerate_trash_inner(
+        client: &ProtonDriveClient,
+        tx: &tokio::sync::mpsc::Sender<anyhow::Result<Result<Node, DegradedNode>>>,
+    ) -> anyhow::Result<()> {
+        let volume_id = Self::get_main_volume_id(client).await?;
+        let page_size = 500i32;
+        let mut page = 0i32;
+        let mut has_more = true;
+
+        while has_more {
+            let response = client
+                .api()
+                .trash()
+                .get_trash(volume_id.clone(), page_size, page)
+                .await?;
+
+            has_more = response
+                .trash
+                .iter()
+                .map(|s| s.link_ids.len())
+                .sum::<usize>()
+                == page_size as usize;
+
+            for share_trash in response.trash {
+                let share_and_key =
+                    match ShareOperations::get_share(client, share_trash.share_id).await {
+                        Ok(sk) => sk,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to get share for trash batch — skipping");
+                            continue;
+                        }
+                    };
+
+                let mut batch_loader = VolumeTrashBatchLoader::new(
+                    Arc::new(client.clone()),
+                    volume_id.clone(),
+                    share_and_key.key,
+                );
+
+                for link_id in share_trash.link_ids {
+                    let uid = NodeUid::new(volume_id.clone(), link_id.clone());
+                    if let Some(cached) = client.cache().entities().try_get_node(uid).await? {
+                        let item = match cached.node_provision_result {
+                            PotentialObject::Node(n) => Ok(n),
+                            PotentialObject::Degraded(d) => Err(d),
+                        };
+                        if tx.send(Ok(item)).await.is_err() {
+                            return Ok(());
+                        }
+                    } else {
+                        let batch = batch_loader.queue_and_try_load_batch(link_id).await?;
+                        for node in batch {
+                            let item = match node {
+                                PotentialObject::Node(n) => Ok(n),
+                                PotentialObject::Degraded(d) => Err(d),
+                            };
+                            if tx.send(Ok(item)).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+
+                let remaining = batch_loader.load_remaining().await?;
+                for node in remaining {
+                    let item = match node {
+                        PotentialObject::Node(n) => Ok(n),
+                        PotentialObject::Degraded(d) => Err(d),
+                    };
+                    if tx.send(Ok(item)).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+
+            page += 1;
+        }
+
+        Ok(())
+    }
 }

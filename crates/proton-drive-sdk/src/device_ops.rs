@@ -68,6 +68,8 @@ impl DeviceOperations {
         }
 
         // Batch-fetch the root folder node for each device to decrypt the name.
+        // enumerate_nodes uses FuturesUnordered and returns results in completion
+        // order, so we must match by UID rather than by position.
         let uids: Vec<NodeUid> = raw
             .iter()
             .map(|d| NodeUid::new(d.volume_id.clone(), d.root_link_id.clone()))
@@ -75,14 +77,27 @@ impl DeviceOperations {
 
         let nodes = crate::node::operations::NodeOperations::enumerate_nodes(client, uids).await?;
 
+        // Build a uid → name map from the (potentially out-of-order) results.
+        let mut name_map: std::collections::HashMap<NodeUid, String> =
+            std::collections::HashMap::with_capacity(nodes.len());
+        for node_result in &nodes {
+            let name = extract_name_from_node(node_result);
+            let uid = match node_result {
+                PotentialObject::Node(n) => n.uid().clone(),
+                PotentialObject::Degraded(d) => d.uid().clone(),
+            };
+            name_map.insert(uid, name);
+        }
+
         let mut devices = Vec::with_capacity(raw.len());
-        for (raw_info, node_result) in raw.into_iter().zip(nodes.into_iter()) {
-            let name = extract_name_from_node(&node_result);
+        for raw_info in raw.into_iter() {
+            let root_uid = NodeUid::new(raw_info.volume_id.clone(), raw_info.root_link_id.clone());
+            let name = name_map.remove(&root_uid).unwrap_or_else(|| "<unknown>".to_string());
             devices.push(Device {
                 device_id: raw_info.device_id,
                 volume_id: raw_info.volume_id.clone(),
                 share_id: raw_info.share_id,
-                root_uid: NodeUid::new(raw_info.volume_id, raw_info.root_link_id),
+                root_uid,
                 device_type: raw_info.device_type,
                 name,
                 create_time: raw_info.create_time,

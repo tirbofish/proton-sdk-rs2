@@ -58,6 +58,17 @@ pub enum RevisionState {
     Superseded = 2,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevisionInfo {
+    pub uid: RevisionUid,
+    pub state: RevisionState,
+    pub creation_time: DateTime<Utc>,
+    pub size_on_cloud_storage: i64,
+    pub claimed_size: Option<i64>,
+    pub claimed_modification_time: Option<DateTime<Utc>>,
+    pub claimed_sha1: Option<Vec<u8>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(try_from = "String", into = "String")]
 pub struct RevisionUid {

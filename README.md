@@ -49,6 +49,9 @@ proton-srp and other proton based cryptography libraries do not use crates.io, y
 proton-drive-sdk = { git = "https://github.com/tirbofish/proton-sdk-rs2" }
 ```
 
+> [!NOTE]
+> There is no need for you to include the `proton-sdk-rs2` library as part of your imports, it's already exported by `proton-drive-sdk`
+
 i *might* consider uploading the proton-crypto based libraries up to crates.io if proton permits me to (or they can do themself idk). 
 
 # license

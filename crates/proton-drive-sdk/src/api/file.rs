@@ -6,8 +6,8 @@ use crate::api::block::{BlockUploadPreparationRequest, BlockUploadPreparationRes
 use crate::api::file::thumbnail::{ThumbnailBlockListRequest, ThumbnailBlockListResponse};
 use crate::api::node::NodeCreationRequest;
 use crate::api::revision::{
-    ActiveRevisionDto, RevisionCreationRequest, RevisionCreationResponse, RevisionResponse,
-    RevisionUpdateRequest,
+    ActiveRevisionDto, RevisionCreationRequest, RevisionCreationResponse, RevisionListResponse,
+    RevisionResponse, RevisionUpdateRequest,
 };
 use crate::links::LinkId;
 use crate::pgp::PgpArmoredSignature;
@@ -133,6 +133,19 @@ pub trait FilesApiClient: Send + Sync {
         volume_id: VolumeId,
         thumbnail_ids: Vec<String>,
     ) -> anyhow::Result<ThumbnailBlockListResponse>;
+
+    async fn get_revisions(
+        &self,
+        volume_id: VolumeId,
+        link_id: LinkId,
+    ) -> anyhow::Result<RevisionListResponse>;
+
+    async fn restore_revision(
+        &self,
+        volume_id: VolumeId,
+        link_id: LinkId,
+        revision_id: RevisionId,
+    ) -> anyhow::Result<ApiResponse>;
 
     async fn delete_revision(
         &self,
@@ -312,6 +325,38 @@ impl FilesApiClient for DefaultFilesApiClient {
         Ok(builder.send().await?.json::<RevisionResponse>().await?)
     }
 
+    async fn get_revisions(
+        &self,
+        volume_id: VolumeId,
+        link_id: LinkId,
+    ) -> anyhow::Result<RevisionListResponse> {
+        let url = self.base_url.join(&format!(
+            "v2/volumes/{}/files/{}/revisions",
+            volume_id.raw(),
+            link_id.raw(),
+        ))?;
+        let builder = self.client.get(url);
+        let builder = self.add_auth_headers(builder).await?;
+        parse_json_response::<RevisionListResponse>(builder.send().await?).await
+    }
+
+    async fn restore_revision(
+        &self,
+        volume_id: VolumeId,
+        link_id: LinkId,
+        revision_id: RevisionId,
+    ) -> anyhow::Result<ApiResponse> {
+        let url = self.base_url.join(&format!(
+            "v2/volumes/{}/files/{}/revisions/{}/restore",
+            volume_id.raw(),
+            link_id.raw(),
+            revision_id.raw(),
+        ))?;
+        let builder = self.client.post(url).header(reqwest::header::CONTENT_LENGTH, 0);
+        let builder = self.add_auth_headers(builder).await?;
+        parse_json_response::<ApiResponse>(builder.send().await?).await
+    }
+
     async fn delete_revision(
         &self,
         volume_id: VolumeId,
@@ -326,7 +371,7 @@ impl FilesApiClient for DefaultFilesApiClient {
         ))?;
         let builder = self.client.delete(url);
         let builder = self.add_auth_headers(builder).await?;
-        Ok(builder.send().await?.json::<ApiResponse>().await?)
+        parse_json_response::<ApiResponse>(builder.send().await?).await
     }
 
     async fn get_thumbnail_blocks(

@@ -150,3 +150,18 @@ impl RevisionResponse {
         self.base.is_success()
     }
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct RevisionListResponse {
+    #[serde(flatten)]
+    pub base: ApiResponse,
+
+    pub revisions: Vec<RevisionDto>,
+}
+
+impl RevisionListResponse {
+    pub fn is_success(&self) -> bool {
+        self.base.is_success()
+    }
+}

@@ -18,7 +18,7 @@ use crate::node::file::download::FileDownloader;
 use crate::node::file::upload::FileUploader;
 use crate::node::folder::{FolderNode, FolderOperations};
 use crate::node::operations::NodeOperations;
-use crate::node::revision::{REVISION_WRITER_DEFAULT_BLOCK_SIZE, RevisionUid};
+use crate::node::revision::{REVISION_WRITER_DEFAULT_BLOCK_SIZE, RevisionInfo, RevisionState, RevisionUid};
 use crate::node::thumbnail::ThumbnailType;
 use crate::node::{DegradedNode, Node, NodeUid};
 use crate::api::events::{CoreEventsResponse, VolumeEventsResponse};
@@ -564,6 +564,120 @@ impl ProtonDriveClient {
         revision_uid: RevisionUid,
     ) -> anyhow::Result<FileDownloader> {
         FileDownloader::create(self, revision_uid).await
+    }
+
+    /// Returns all non-draft revisions for the given file, decrypting extended attributes
+    /// (size, modification time, SHA1 digest) with the node key where possible.
+    pub async fn iterate_revisions(
+        &self,
+        node_uid: NodeUid,
+    ) -> anyhow::Result<Vec<RevisionInfo>> {
+        use crate::api::attr::ExtendedAttributes;
+        use crate::author::Author;
+        use crate::node::authorship::AuthorshipClaim;
+        use crate::node::crypto::NodeCrypto;
+
+        let secrets = FileOperations::get_secrets(self, node_uid.clone()).await?;
+        let node_key = secrets.base.key;
+
+        let resp = self
+            .api()
+            .files()
+            .get_revisions(node_uid.volume_id.clone(), node_uid.link_id.clone())
+            .await?;
+
+        let authorship_claim = AuthorshipClaim {
+            keys: vec![],
+            author: Author::ANONYMOUS,
+            key_retrieval_error_message: None,
+        };
+
+        let mut results = Vec::new();
+        for dto in resp.revisions {
+            if dto.state == RevisionState::Draft {
+                continue;
+            }
+
+            let (claimed_size, claimed_modification_time, claimed_sha1) =
+                if let Some(xattr_msg) = &dto.extended_attributes {
+                    match NodeCrypto::decrypt_message(
+                        xattr_msg,
+                        None,
+                        [&node_key],
+                        &authorship_claim,
+                    ) {
+                        Ok((bytes, _, _)) => {
+                            if let Ok(xattr) =
+                                serde_json::from_slice::<ExtendedAttributes>(&bytes)
+                            {
+                                let common = xattr.common.as_ref();
+                                (
+                                    common.and_then(|c| c.size),
+                                    common.and_then(|c| c.modification_time),
+                                    common
+                                        .and_then(|c| c.digests.as_ref())
+                                        .and_then(|d| d.sha1.clone()),
+                                )
+                            } else {
+                                (None, None, None)
+                            }
+                        }
+                        Err(_) => (None, None, None),
+                    }
+                } else {
+                    (None, None, None)
+                };
+
+            results.push(RevisionInfo {
+                uid: RevisionUid::new(node_uid.clone(), dto.id),
+                state: dto.state,
+                creation_time: dto.creation_time,
+                size_on_cloud_storage: dto.size,
+                claimed_size,
+                claimed_modification_time,
+                claimed_sha1,
+            });
+        }
+
+        Ok(results)
+    }
+
+    /// Restores the given revision as the active revision of its file.
+    /// This operation promotes a superseded revision back to active.
+    pub async fn restore_revision(&self, revision_uid: RevisionUid) -> anyhow::Result<()> {
+        let (node_uid, revision_id) = revision_uid.deconstruct();
+        let resp = self
+            .api()
+            .files()
+            .restore_revision(node_uid.volume_id, node_uid.link_id, revision_id)
+            .await?;
+        if !resp.is_success() {
+            anyhow::bail!(
+                "restore_revision failed: code={} error={:?}",
+                resp.code.0,
+                resp.error_message
+            );
+        }
+        Ok(())
+    }
+
+    /// Permanently deletes the given revision. Only superseded revisions can be deleted.
+    /// Active revisions should be fully deleted by deleting the parent file node instead.
+    pub async fn delete_revision(&self, revision_uid: RevisionUid) -> anyhow::Result<()> {
+        let (node_uid, revision_id) = revision_uid.deconstruct();
+        let resp = self
+            .api()
+            .files()
+            .delete_revision(node_uid.volume_id, node_uid.link_id, revision_id)
+            .await?;
+        if !resp.is_success() {
+            anyhow::bail!(
+                "delete_revision failed: code={} error={:?}",
+                resp.code.0,
+                resp.error_message
+            );
+        }
+        Ok(())
     }
 
     pub async fn download_to_file(

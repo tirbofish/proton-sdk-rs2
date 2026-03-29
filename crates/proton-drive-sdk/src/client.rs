@@ -557,6 +557,15 @@ impl ProtonDriveClient {
         FileDownloader::create(self, revision_uid).await
     }
 
+    /// Creates a `FileDownloader` for a specific revision identified by its `RevisionUid`.
+    /// Use this to download a historical revision rather than the currently active one.
+    pub async fn get_file_revision_downloader(
+        &self,
+        revision_uid: RevisionUid,
+    ) -> anyhow::Result<FileDownloader> {
+        FileDownloader::create(self, revision_uid).await
+    }
+
     pub async fn download_to_file(
         &self,
         node_uid: NodeUid,

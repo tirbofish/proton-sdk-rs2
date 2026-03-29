@@ -382,19 +382,6 @@ impl RusqliteCache {
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
-    /// Find a trashed node by name (case-sensitive) in the given volume.
-    /// Used by the FUSE `lookup` handler for the virtual Trash directory,
-    /// where trashed nodes retain their original (non-null) parent_link_id.
-    pub fn get_trashed_by_name(&self, volume_id: &VolumeId, name: &str) -> Result<Option<CachedNode>> {
-        let conn = self.pool.get()?;
-        conn.query_row(
-            "SELECT volume_id, link_id, parent_link_id, name, node_type, creation_time, modification_time, is_trashed, size, inode, capture_time, tags, thumbnail_id 
-             FROM nodes WHERE volume_id = ?1 AND is_trashed = 1 AND name = ?2 LIMIT 1",
-            params![volume_id.raw(), name],
-            row_to_cached_node,
-        ).optional().map_err(Into::into)
-    }
-
     pub fn delete_node(&self, volume_id: &VolumeId, link_id: &LinkId) -> Result<()> {
         let conn = self.pool.get()?;
         conn.execute(
@@ -703,16 +690,6 @@ impl RusqliteCache {
             Ok((device_id, PathBuf::from(local_path)))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
-    }
-
-    /// Remove a stored sync config (e.g. when a device is deleted).
-    pub fn delete_computer_sync_config(&self, device_id: &str) -> Result<()> {
-        let conn = self.pool.get()?;
-        conn.execute(
-            "DELETE FROM computer_sync_configs WHERE device_id = ?1",
-            params![device_id],
-        )?;
-        Ok(())
     }
 
     // ── Computer synced-files registry ────────────────────────────────────

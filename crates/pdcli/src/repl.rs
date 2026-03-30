@@ -99,6 +99,7 @@ pub async fn repl_loop(state: &mut AppState) -> anyhow::Result<()> {
             Signal::Success(buf) => {
                 let line = buf.trim().to_string();
                 if !line.is_empty() {
+                    state.cancel = tokio_util::sync::CancellationToken::new();
                     tokio::select! {
                         result = commands::dispatch(&line, state) => {
                             if let Err(e) = result {
@@ -106,6 +107,7 @@ pub async fn repl_loop(state: &mut AppState) -> anyhow::Result<()> {
                             }
                         }
                         _ = tokio::signal::ctrl_c() => {
+                            state.cancel.cancel();
                             eprintln!();
                         }
                     }

@@ -10,6 +10,9 @@ pub mod trash;
 use crate::app::AppState;
 use crate::vfs::VfsSection;
 
+/// Parses and runs `line`. Automatically cancels if `state.cancel` is triggered
+/// before or during execution — new commands added to `run_cmd` are covered
+/// without any extra wiring.
 pub async fn dispatch(line: &str, state: &mut AppState) -> anyhow::Result<()> {
     let Some(tokens) = shlex::split(line) else {
         eprintln!("Syntax error: {line}");
@@ -20,6 +23,16 @@ pub async fn dispatch(line: &str, state: &mut AppState) -> anyhow::Result<()> {
     };
     let args = &tokens[1..];
 
+    // Clone before the mutable borrow so that both arms of select! can coexist.
+    let cancel = state.cancel.clone();
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Ok(()),
+        result = run_cmd(cmd, args, state) => result,
+    }
+}
+
+async fn run_cmd(cmd: &str, args: &[String], state: &mut AppState) -> anyhow::Result<()> {
     match cmd {
         "whoami" => info::whoami(state).await,
         "logout" => info::logout(args, state).await,
@@ -160,8 +173,8 @@ Examples:
   settings set <key> <value>   update a setting (persisted to disk)
 
 Keys:
-  indexing_method   on_demand (default) — fetch a folder only when listed
-                    on_init             — walk the entire drive tree at startup", hdr=style("settings — view and change configuration").bold()),
+  entity_cache_max_size   number (or 'unlimited') — LRU cap for the entity SQLite cache
+  secret_cache_max_size   number (or 'unlimited') — LRU cap for the secret SQLite cache", hdr=style("settings — view and change configuration").bold()),
 
         Some("drop") => eprintln!("\
 {hdr}

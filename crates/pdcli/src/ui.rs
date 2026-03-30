@@ -19,6 +19,12 @@ pub fn ok(msg: impl std::fmt::Display) {
     eprintln!("{} {}", style("✓").green().dim(), style(msg).dim());
 }
 
+/// Print a subtle skip/warning line to stderr.
+pub fn skip(msg: impl std::fmt::Display) {
+    use console::style;
+    eprintln!("{} {}", style("↪").yellow().dim(), style(msg).dim());
+}
+
 /// Upload bar: purple fill on white backing — progress is "from" local (white/neutral), destination is Drive (purple).
 pub fn upload_bar(total: i64) -> ProgressBar {
     let pb = ProgressBar::new(total.max(0) as u64);

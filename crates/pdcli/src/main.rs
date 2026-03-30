@@ -5,7 +5,6 @@ mod commands;
 mod completer;
 mod db;
 mod events;
-mod file_cache;
 mod index;
 mod photos_pager;
 mod repl;
@@ -26,8 +25,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let (session, cache) = auth::authenticate().await?;
-    let mut state = app::AppState::new(session, cache).await?;
+    let session = auth::authenticate().await?;
+    let mut state = app::AppState::new(session).await?;
     state.spawn_background_tasks();
 
     // One-time CLI mode: `pdcli <section> <command> [args...]`
@@ -51,16 +50,6 @@ async fn main() -> anyhow::Result<()> {
             commands::dispatch(&cmd_line, &mut state).await?;
         }
         return Ok(());
-    }
-
-    if state.settings.indexing_method == settings::IndexingMethod::IndexOnInit {
-        eprintln!("Indexing drive tree (on_init mode). Press Ctrl+C to pause and enter REPL.");
-        tokio::select! {
-            r = state.run_full_index() => { r?; }
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("Indexing paused. Progress saved — unindexed folders will be fetched on demand.");
-            }
-        }
     }
 
     repl::repl_loop(&mut state).await

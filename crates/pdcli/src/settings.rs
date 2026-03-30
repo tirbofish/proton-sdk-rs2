@@ -1,21 +1,21 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum IndexingMethod {
-    /// Eagerly index all files on startup; fast lookups after init but slow to start.
-    IndexOnInit,
-    /// Index a directory only when it is first listed; startup is instant but first `ls` may be slow.
-    IndexOnDemand,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
-    pub indexing_method: IndexingMethod,
+    /// Maximum number of entries in the entity cache before LRU eviction kicks in.
+    /// `None` (default) means the cache grows without bound.
+    pub entity_cache_max_size: Option<usize>,
+    /// Maximum number of entries in the secret cache before LRU eviction kicks in.
+    /// `None` (default) means the cache grows without bound.
+    pub secret_cache_max_size: Option<usize>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { indexing_method: IndexingMethod::IndexOnDemand }
+        Self {
+            entity_cache_max_size: None,
+            secret_cache_max_size: None,
+        }
     }
 }
 

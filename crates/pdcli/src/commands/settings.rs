@@ -1,7 +1,7 @@
 use console::style;
 
 use crate::app::AppState;
-use crate::settings::{IndexingMethod, Settings};
+use crate::settings::Settings;
 
 pub async fn settings_cmd(args: &[String], state: &AppState) -> anyhow::Result<()> {
     match args.first().map(|s| s.as_str()) {
@@ -16,16 +16,18 @@ pub async fn settings_cmd(args: &[String], state: &AppState) -> anyhow::Result<(
 
 fn show(state: &AppState) -> anyhow::Result<()> {
     let s = &state.settings;
-    let method = match s.indexing_method {
-        IndexingMethod::IndexOnInit => "on_init",
-        IndexingMethod::IndexOnDemand => "on_demand",
-    };
     eprintln!("{}", style("Settings").bold().underlined());
     eprintln!(
         "  {} = {}   {}",
-        style("indexing_method").cyan(),
-        style(method).green(),
-        style("(on_init | on_demand)").dim()
+        style("entity_cache_max_size").cyan(),
+        style(s.entity_cache_max_size.map_or("unlimited".to_string(), |n| n.to_string())).green(),
+        style("(positive integer, or unset for unlimited)").dim()
+    );
+    eprintln!(
+        "  {} = {}   {}",
+        style("secret_cache_max_size").cyan(),
+        style(s.secret_cache_max_size.map_or("unlimited".to_string(), |n| n.to_string())).green(),
+        style("(positive integer, or unset for unlimited)").dim()
     );
     Ok(())
 }
@@ -35,19 +37,27 @@ fn set_value(args: &[String]) -> anyhow::Result<()> {
     let val = args.get(1).map(|s| s.as_str()).unwrap_or("");
 
     match key {
-        "indexing_method" => {
-            let method = match val {
-                "on_init" => IndexingMethod::IndexOnInit,
-                "on_demand" => IndexingMethod::IndexOnDemand,
-                _ => anyhow::bail!("indexing_method must be 'on_init' or 'on_demand'"),
+        "entity_cache_max_size" | "secret_cache_max_size" => {
+            let parsed: Option<usize> = if val.is_empty() || val == "unlimited" || val == "none" {
+                None
+            } else {
+                let n: usize = val.parse().map_err(|_| anyhow::anyhow!("{key} must be a positive integer or 'unlimited'"))?;
+                anyhow::ensure!(n > 0, "{key} must be greater than 0");
+                Some(n)
             };
             let mut s = Settings::load().unwrap_or_default();
-            s.indexing_method = method;
+            if key == "entity_cache_max_size" {
+                s.entity_cache_max_size = parsed;
+            } else {
+                s.secret_cache_max_size = parsed;
+            }
             s.save()?;
+            let display = parsed.map_or("unlimited".to_string(), |n| n.to_string());
             eprintln!(
-                "{}  indexing_method = {}",
+                "{}  {} = {}",
                 style("✓").green().bold(),
-                style(val).green()
+                style(key).cyan(),
+                style(&display).green(),
             );
             eprintln!("{}", style("Restart pdcli for the change to take effect.").dim());
         }

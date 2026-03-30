@@ -4,6 +4,12 @@ use crate::app::AppState;
 use crate::index::IndexEntry;
 use crate::vfs::VirtualPath;
 
+/// Returns true if an error is an API "already exists" (error code 2500).
+fn is_already_exists(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    s.contains("2500") || s.to_lowercase().contains("already exists")
+}
+
 pub async fn mkdir(args: &[String], state: &AppState) -> anyhow::Result<()> {
     let name = args
         .first()
@@ -23,13 +29,15 @@ pub async fn mkdir(args: &[String], state: &AppState) -> anyhow::Result<()> {
     };
     state.index.insert(IndexEntry {
         uid: folder.base.uid,
-        parent_uid: Some(parent_uid),
+        parent_uid: Some(parent_uid.clone()),
         name: name.clone(),
         is_folder: true,
         size: None,
         modification_time: None,
         media_type: None,
     });
+    // Invalidate parent's cached children so `cd <name>` / `ls` re-fetches from server.
+    state.index.unmark_indexed(&parent_uid);
     crate::ui::ok(format!("Created '{name}'"));
     Ok(())
 }
@@ -297,6 +305,10 @@ async fn get_directory(
                 crate::ui::ok(format!("↓ {}", entry.name));
                 ok_count += 1;
             }
+            Err(e) if is_already_exists(&e) => {
+                pb.finish_and_clear();
+                crate::ui::skip(format!("{} — already exists, skipping", entry.name));
+            }
             Err(e) => {
                 pb.finish_and_clear();
                 eprintln!("  {} failed: {e}", entry.name);
@@ -335,7 +347,7 @@ pub async fn put(args: &[String], state: &AppState) -> anyhow::Result<()> {
     pb.set_message(file_display.clone());
     let pb_cb = pb.clone();
 
-    let node_uid = state
+    let upload_result = state
         .drive
         .upload_file(
             &local_path,
@@ -345,15 +357,30 @@ pub async fn put(args: &[String], state: &AppState) -> anyhow::Result<()> {
                 pb_cb.set_position(done as u64);
             }),
         )
-        .await?;
+        .await;
 
     pb.finish_and_clear();
 
-    // Fetch and insert just the new node — no full folder re-fetch needed.
-    if let Ok(node) = state.drive.get_node(node_uid).await {
-        state.index.insert_node(&node, Some(parent_uid));
+    let file_name = local_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    match upload_result {
+        Ok(node_uid) => {
+            // Optimistically insert with local metadata — no get_node round-trip needed.
+            state.index.insert(IndexEntry {
+                uid: node_uid,
+                parent_uid: Some(parent_uid),
+                name: file_name.to_string(),
+                is_folder: false,
+                size: Some(size),
+                modification_time: None,
+                media_type: None,
+            });
+            crate::ui::ok(format!("Uploaded '{file_name}'"));
+        }
+        Err(e) if is_already_exists(&e) => {
+            crate::ui::skip(format!("{file_name} — already exists, skipping"));
+        }
+        Err(e) => return Err(e),
     }
-    crate::ui::ok(format!("Uploaded '{}'", local_path.file_name().and_then(|n| n.to_str()).unwrap_or("")));
     Ok(())
 }
 
@@ -385,6 +412,8 @@ async fn put_directory(local_path: &PathBuf, state: &AppState) -> anyhow::Result
                 modification_time: None,
                 media_type: None,
             });
+            // Invalidate parent's cached children so `cd <dir_name>` works immediately.
+            state.index.unmark_indexed(&parent_uid);
             crate::ui::ok(format!("Created remote folder '{dir_name}'"));
             uid
         }
@@ -419,6 +448,7 @@ async fn put_directory(local_path: &PathBuf, state: &AppState) -> anyhow::Result
 
     eprintln!("Uploading {} file(s)…", files.len());
     let mut uploaded = 0usize;
+    let mut skipped = 0usize;
 
     for file in &files {
         let size = std::fs::metadata(file)?.len() as i64;
@@ -439,11 +469,23 @@ async fn put_directory(local_path: &PathBuf, state: &AppState) -> anyhow::Result
         {
             Ok(node_uid) => {
                 pb.finish_and_clear();
-                if let Ok(node) = state.drive.get_node(node_uid).await {
-                    state.index.insert_node(&node, Some(folder_uid.clone()));
-                }
+                // Optimistically insert with local metadata — no get_node round-trip.
+                state.index.insert(IndexEntry {
+                    uid: node_uid,
+                    parent_uid: Some(folder_uid.clone()),
+                    name: file_name.clone(),
+                    is_folder: false,
+                    size: Some(size),
+                    modification_time: None,
+                    media_type: None,
+                });
                 crate::ui::ok(format!("↑ {file_name}"));
                 uploaded += 1;
+            }
+            Err(e) if is_already_exists(&e) => {
+                pb.finish_and_clear();
+                crate::ui::skip(format!("{file_name} — already exists, skipping"));
+                skipped += 1;
             }
             Err(e) => {
                 pb.finish_and_clear();
@@ -452,8 +494,17 @@ async fn put_directory(local_path: &PathBuf, state: &AppState) -> anyhow::Result
         }
     }
 
-    crate::ui::ok(format!("Uploaded {uploaded}/{} file(s) into '{dir_name}'", files.len()));
-    // Mark as indexed so an immediate `ls` uses in-memory state instead of re-fetching.
+    let total = files.len();
+    let summary = if skipped > 0 {
+        format!("Uploaded {uploaded}/{total} file(s) into '{dir_name}' ({skipped} skipped)")
+    } else {
+        format!("Uploaded {uploaded}/{total} file(s) into '{dir_name}'")
+    };
+    crate::ui::ok(summary);
+    // Mark the folder as indexed with the files we just inserted so
+    // an immediate `ls` uses the in-memory cache without a server round-trip.
+    // Skipped files were pre-loaded via ensure_children_loaded earlier,
+    // so they are already in the in-memory children map.
     state.index.mark_indexed(&folder_uid);
     Ok(())
 }

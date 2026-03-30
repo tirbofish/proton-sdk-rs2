@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
 };
 
+use proton_drive_sdk::cache::sqlite::SqliteCacheRepository;
 use proton_sdk_rs2::{
     PasswordMode, SessionId, UserId,
     client::ProtonClientOptions,
@@ -11,19 +12,26 @@ use proton_sdk_rs2::{
 };
 use ron::ser::{PrettyConfig, to_string_pretty};
 
-use crate::file_cache::FileCacheRepository;
-
-pub async fn authenticate() -> anyhow::Result<(ProtonAPISession, Arc<FileCacheRepository>)> {
+pub async fn authenticate() -> anyhow::Result<ProtonAPISession> {
     let app_version = semver::Version::new(0, 1, 0);
     let cred_path = crate::app_paths::cred_path();
-    let cache_path = crate::app_paths::cache_path();
     let stored = load_credentials(&cred_path)?;
-    let secret_cache_repository = Arc::new(FileCacheRepository::load(cache_path)?);
+    let settings = crate::settings::Settings::load().unwrap_or_default();
+
+    std::fs::create_dir_all(crate::app_paths::app_dir())?;
+    let entity_cache = Arc::new(SqliteCacheRepository::open_file(
+        crate::app_paths::entity_cache_path(),
+        settings.entity_cache_max_size,
+    )?);
+    let secret_cache = Arc::new(SqliteCacheRepository::open_file(
+        crate::app_paths::secret_cache_path(),
+        settings.secret_cache_max_size,
+    )?);
 
     let session = if let Some(stored) = stored {
         let pb = crate::ui::spinner("Resuming stored session…");
 
-        let mut resumed = ProtonAPISession::resume(
+        let mut resumed = ProtonAPISession::resume_with_options(
             SessionId::new(stored.session_id),
             stored.username,
             UserId::new(stored.user_id),
@@ -33,7 +41,11 @@ pub async fn authenticate() -> anyhow::Result<(ProtonAPISession, Arc<FileCacheRe
             stored.is_waiting_for_second_factor_code,
             stored.password_mode,
             app_version.clone(),
-            secret_cache_repository.clone(),
+            secret_cache,
+            ProtonClientOptions {
+                entity_cache_repository: Some(entity_cache),
+                ..Default::default()
+            },
         );
 
         if let Ok((access_token, _)) = resumed.token_credential.get_tokens().await {
@@ -48,17 +60,18 @@ pub async fn authenticate() -> anyhow::Result<(ProtonAPISession, Arc<FileCacheRe
         resumed
     } else {
         println!("No credentials found, creating a new session");
-        begin_new_session(app_version.clone(), secret_cache_repository.clone()).await?
+        begin_new_session(app_version.clone(), entity_cache, secret_cache).await?
     };
 
     persist_credentials(&cred_path, &session).await?;
 
-    Ok((session, secret_cache_repository))
+    Ok(session)
 }
 
 async fn begin_new_session(
     app_version: semver::Version,
-    cache: Arc<FileCacheRepository>,
+    entity_cache: Arc<SqliteCacheRepository>,
+    secret_cache: Arc<SqliteCacheRepository>,
 ) -> anyhow::Result<ProtonAPISession> {
     let username = prompt_input("Username")?;
     let password = rpassword::prompt_password("Password: ")?;
@@ -68,7 +81,8 @@ async fn begin_new_session(
         &password,
         app_version,
         ProtonSessionOptions::new(ProtonClientOptions {
-            secret_cache_repository: Some(cache.clone()),
+            entity_cache_repository: Some(entity_cache),
+            secret_cache_repository: Some(secret_cache),
             ..Default::default()
         }),
     )
@@ -164,9 +178,18 @@ pub fn clear_credentials() -> anyhow::Result<()> {
 
 pub fn clear_all_data() -> anyhow::Result<()> {
     clear_credentials()?;
-    let cache = crate::app_paths::cache_path();
-    if cache.exists() {
-        fs::remove_file(&cache)?;
+    for path in [
+        crate::app_paths::entity_cache_path(),
+        crate::app_paths::secret_cache_path(),
+    ] {
+        if path.exists() {
+            fs::remove_file(&path)?;
+        }
+    }
+    // Remove old cache.json if present from a previous install.
+    let old_cache = crate::app_paths::cache_path();
+    if old_cache.exists() {
+        fs::remove_file(&old_cache)?;
     }
     Ok(())
 }

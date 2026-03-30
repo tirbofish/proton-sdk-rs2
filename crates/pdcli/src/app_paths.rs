@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 pub fn app_dir() -> PathBuf {
     platform_dirs::AppDirs::new(Some("pdcli"), false)
-        .map(|d| d.data_dir)
+        .map(|d| d.config_dir)
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
@@ -12,6 +12,14 @@ pub fn cred_path() -> PathBuf {
 
 pub fn cache_path() -> PathBuf {
     app_dir().join("cache.json")
+}
+
+pub fn entity_cache_path() -> PathBuf {
+    app_dir().join("entity_cache.sqlite")
+}
+
+pub fn secret_cache_path() -> PathBuf {
+    app_dir().join("secret_cache.sqlite")
 }
 
 pub fn db_path() -> PathBuf {

@@ -11,6 +11,10 @@ pub async fn pwd(state: &AppState) -> anyhow::Result<()> {
 }
 
 pub async fn ls(args: &[String], state: &AppState) -> anyhow::Result<()> {
+    // Strip --refresh / -r flag before any other processing.
+    let refresh = args.iter().any(|a| a == "--refresh" || a == "-r");
+    let args: Vec<&String> = args.iter().filter(|a| *a != "--refresh" && *a != "-r").collect();
+
     // Separate path navigation arg from glob pattern.
     // If the first arg contains no glob metacharacters, it's a path to list.
     // If it contains glob chars, it's a filter on the current directory.
@@ -41,7 +45,7 @@ pub async fn ls(args: &[String], state: &AppState) -> anyhow::Result<()> {
             return list_trash(state).await;
         }
         VfsSection::Computers if effective_cwd.components.is_empty() => {
-            return list_computers(pattern, state).await;
+            return list_computers(pattern, refresh, state).await;
         }
         VfsSection::Computers => { /* /Computers/<device>/... — fall through to normal folder ls */ }
         VfsSection::Photos
@@ -63,6 +67,7 @@ pub async fn ls(args: &[String], state: &AppState) -> anyhow::Result<()> {
 
     // For the Photos root: use album-only index, don't enumerate all photos.
     if effective_cwd.section == VfsSection::Photos && effective_cwd.components.is_empty() {
+        if refresh { state.index.unmark_indexed(&uid); }
         state.ensure_photos_root_indexed().await?;
         let entries = state.index.get_children(&uid);
         // Synthetic "All" folder — the full photo timeline.
@@ -76,6 +81,9 @@ pub async fn ls(args: &[String], state: &AppState) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if refresh {
+        state.index.unmark_indexed(&uid);
+    }
     state.ensure_children_loaded(&uid).await?;
 
     let entries = if let Some(pat) = pattern {
@@ -231,10 +239,10 @@ async fn list_trash(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn list_computers(filter: Option<&str>, state: &AppState) -> anyhow::Result<()> {
+async fn list_computers(filter: Option<&str>, refresh: bool, state: &AppState) -> anyhow::Result<()> {
     // Use the cached device list unless it's empty (first call) or --refresh is passed.
     let cached = state.devices.read().clone();
-    let devices = if !cached.is_empty() {
+    let devices = if !cached.is_empty() && !refresh {
         cached
     } else {
         let pb = crate::ui::spinner("Fetching registered computers…");

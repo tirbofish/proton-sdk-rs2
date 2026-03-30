@@ -6,8 +6,7 @@ use proton_drive_sdk::photo::ProtonPhotosClient;
 use proton_drive_sdk::volume::VolumeId;
 use proton_sdk_rs2::session::ProtonAPISession;
 use std::sync::Arc;
-
-use crate::file_cache::FileCacheRepository;
+use tokio_util::sync::CancellationToken;
 use crate::index::{IndexEntry, NodeIndex};
 use crate::settings::Settings;
 use crate::vfs::{VfsSection, VirtualPath};
@@ -31,6 +30,10 @@ pub struct AppState {
     pub photos_root_uid: NodeUid,
     pub volume_id: VolumeId,
     pub should_quit: bool,
+    /// Cancellation token for the currently-running command.
+    /// A fresh token is installed before each dispatch; commands can use it
+    /// for cooperative cancellation. The REPL loop cancels it on Ctrl+C.
+    pub cancel: CancellationToken,
     /// Cached device list — populated on first `ls /Computers` or `cd <device>`.
     pub devices: Arc<parking_lot::RwLock<Vec<Device>>>,
     /// Cached trash items — populated whenever `ls /Trash` runs.
@@ -42,7 +45,6 @@ pub struct AppState {
 impl AppState {
     pub async fn new(
         mut session: ProtonAPISession,
-        _cache: Arc<FileCacheRepository>,
     ) -> anyhow::Result<Self> {
         let pb = crate::ui::spinner("Connecting to Proton Drive…");
         let drive = Arc::new(
@@ -141,6 +143,7 @@ impl AppState {
             photos_root_uid,
             volume_id,
             should_quit: false,
+            cancel: CancellationToken::new(),
             devices: Arc::new(parking_lot::RwLock::new(initial_devices)),
             trash_items: Arc::new(parking_lot::RwLock::new(initial_trash)),
             album_uids: Arc::new(dashmap::DashSet::new()),
@@ -280,7 +283,7 @@ impl AppState {
         let folder_name = self.index.get(uid)
             .map(|e| e.name.clone())
             .unwrap_or_else(|| "folder".to_string());
-        let pb = crate::ui::spinner(format!("Fetching '{}' — not yet cached…", folder_name));
+        let pb = crate::ui::spinner(format!("Fetching '{}'…", folder_name));
         let stream = match self.drive.enumerate_folder_children(uid.clone()).await {
             Ok(s) => s,
             Err(e) => {
@@ -343,78 +346,5 @@ impl AppState {
             self.index.clone(),
             self.volume_id.clone(),
         );
-    }
-
-    /// Recursively indexes the entire MyFiles tree, skipping already-indexed folders.
-    /// Progress is persisted to the DB so an interrupted run resumes on the next call.
-    pub async fn run_full_index(&self) -> anyhow::Result<()> {
-        use futures::StreamExt;
-        use proton_drive_sdk::node::{DegradedNode, Node};
-        use proton_drive_sdk::utils::PotentialObject;
-
-        let pb = crate::ui::spinner("Indexing…");
-
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back(self.root_uid.clone());
-
-        let mut done: usize = 0;
-        while let Some(folder_uid) = queue.pop_front() {
-            if self.index.is_indexed(&folder_uid) {
-                // Still walk into already-indexed sub-folders so new children are discovered.
-                let children = self.index.get_children(&folder_uid);
-                for child in children {
-                    if child.is_folder {
-                        queue.push_back(child.uid);
-                    }
-                }
-                continue;
-            }
-
-            let folder_name = self
-                .index
-                .get(&folder_uid)
-                .map(|e| e.name.clone())
-                .unwrap_or_else(|| folder_uid.to_string());
-
-            pb.set_message(format!("Indexing '{folder_name}'… ({done} folders done)"));
-
-            let stream = match self.drive.enumerate_folder_children(folder_uid.clone()).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("on_init index: failed on '{folder_name}': {e}");
-                    continue;
-                }
-            };
-
-            tokio::pin!(stream);
-            while let Some(result) = stream.next().await {
-                let (uid, is_folder) = match &result {
-                    Ok(PotentialObject::Node(n)) => {
-                        let is_folder = matches!(n, Node::Folder(_) | Node::Album(_));
-                        (n.uid().clone(), is_folder)
-                    }
-                    Ok(PotentialObject::Degraded(d)) => {
-                        let is_folder = matches!(d, DegradedNode::Folder(_) | DegradedNode::Album(_));
-                        (d.uid().clone(), is_folder)
-                    }
-                    Err(e) => {
-                        tracing::warn!("on_init index: degraded item: {e}");
-                        continue;
-                    }
-                };
-                if let Ok(node) = result {
-                    self.index.insert_node(&node, Some(folder_uid.clone()));
-                    if is_folder {
-                        queue.push_back(uid);
-                    }
-                }
-            }
-
-            self.index.mark_indexed(&folder_uid);
-            done += 1;
-        }
-
-        pb.finish_and_clear();
-        Ok(())
     }
 }

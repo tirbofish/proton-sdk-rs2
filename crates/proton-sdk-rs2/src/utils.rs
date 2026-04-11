@@ -47,22 +47,40 @@ impl Display for ReleaseChannel {
 pub struct AppVersionConfiguration {
     /// Project name segments (e.g., "myapp", "swift_sdk").
     /// Will be normalized to lowercase with non-alphanumeric characters replaced by underscores.
+    /// 
+    /// The `android_sdk` in `external-drive-android_sdk@2.0.0-RC1+build.456`
     pub app_name: String,
     /// Major version number.
+    /// 
+    /// The `2` in `external-drive-android_sdk@2.0.0-RC1+build.456`
     pub major: u64,
     /// Minor version number.
+    /// 
+    /// The first `0` in `external-drive-android_sdk@2.0.0-RC1+build.456`
     pub minor: u64,
     /// Patch version number.
+    /// 
+    /// The second `0` in `external-drive-android_sdk@2.0.0-RC1+build.456`
     pub patch: u64,
     /// Optional build number (fourth version component).
+    /// 
+    /// The `789` in `external-drive-myapp@1.2.3.789-beta2`
     pub build_number: Option<u64>,
     /// Release channel (stable, beta, RC, alpha).
+    /// 
+    /// The `RC` in `external-drive-android_sdk@2.0.0-RC1+build.456`
     pub channel: Option<ReleaseChannel>,
     /// Optional numeric suffix for the channel (e.g., "1" in "beta1", "2.3" in "RC2.3").
+    /// 
+    /// The `1` in `external-drive-android_sdk@2.0.0-RC1+build.456`
     pub channel_suffix: Option<String>,
     /// Whether this is a development build.
+    /// 
+    /// The `dev` in `external-drive-myapp@1.0.0-dev`
     pub is_dev: bool,
     /// Optional build metadata (appears after `+`).
+    /// 
+    /// The `build.456` in `external-drive-android_sdk@2.0.0-RC1+build.456`
     pub build_metadata: Option<String>,
 }
 

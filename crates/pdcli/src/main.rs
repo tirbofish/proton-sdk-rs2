@@ -2,9 +2,12 @@ pub mod auth;
 pub mod cancellation;
 pub mod commands;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use console::style;
+use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::select;
 
 use crate::auth::ProtonAuth;
@@ -30,6 +33,8 @@ enum Commands {
     },
     /// Show current account information
     Whoami,
+    /// Clear the file download cache (keeps session)
+    ClearCache,
     /// Mount Proton Drive to a local path
     Mount {
         /// Path to mount the drive
@@ -89,7 +94,7 @@ impl ProtonDriveCommandLineInterface {
     }
 
     /// Execute a command within a cancellation context.
-    async fn execute_command(&self, command: Commands, _guard: &CancellationGuard) -> anyhow::Result<()> {
+    async fn execute_command(&self, command: Commands, guard: &CancellationGuard) -> anyhow::Result<()> {
         match command {
             Commands::Login => {
                 self.auth.login_interactive().await
@@ -120,15 +125,156 @@ impl ProtonDriveCommandLineInterface {
                 }
                 Ok(())
             }
-            Commands::Mount { path: _ } => {
+            Commands::ClearCache => {
+                crate::commands::mount::clear_cache()
+            }
+            Commands::Mount { path } => {
                 // Ensure authenticated before mounting
                 if !self.auth.ensure_authenticated().await? {
                     println!("{}", style("Authentication required. Exiting.").red());
                     return Ok(());
                 }
-                // TODO: Implement mount
-                println!("{}", style("Mount command not yet implemented.").dim());
-                Ok(())
+                
+                // Handle mount path - may need to create or clean up stale mount
+                // Try to stat the directory - if it fails with EIO/ENOTCONN, it's a stale mount
+                let path_status = std::fs::metadata(&path);
+                match &path_status {
+                    Ok(meta) if meta.is_dir() => {
+                        // Good to go
+                    }
+                    Ok(_) => {
+                        anyhow::bail!("Mount path is not a directory: {}", path.display());
+                    }
+                    Err(e) if e.raw_os_error() == Some(libc::ENOTCONN) || 
+                              e.raw_os_error() == Some(libc::EIO) => {
+                        // Transport endpoint not connected - stale FUSE mount
+                        println!("{}", style("Cleaning up stale mount...").yellow());
+                        let _ = std::process::Command::new("fusermount3")
+                            .args(["-u", "-z"])
+                            .arg(&path)
+                            .output();
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Create the directory
+                        std::fs::create_dir_all(&path)
+                            .with_context(|| format!("Failed to create mount directory: {}", path.display()))?;
+                        println!("{}", style(format!("Created mount directory: {}", path.display())).dim());
+                    }
+                    Err(e) => {
+                        anyhow::bail!("Cannot access mount path {}: {}", path.display(), e);
+                    }
+                }
+                
+                // Verify path is now accessible
+                if !path.is_dir() {
+                    anyhow::bail!("Mount path is not a directory: {}", path.display());
+                }
+                
+                // Create spinner for mount progress
+                let spinner = Arc::new(ProgressBar::new_spinner());
+                spinner.set_style(
+                    ProgressStyle::default_spinner()
+                        .template("{spinner:.cyan} {msg}")
+                        .unwrap()
+                        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+                );
+                spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+                spinner.set_message("Initializing...");
+                
+                let spinner_for_progress = spinner.clone();
+                let progress: crate::commands::mount::ProgressCallback = Box::new(move |msg| {
+                    spinner_for_progress.set_message(msg.to_string());
+                });
+                
+                // Channel to signal when mount is ready
+                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                let spinner_for_ready = spinner.clone();
+                let path_display = path.display().to_string();
+                
+                // Spawn task to wait for ready signal and show success
+                tokio::spawn(async move {
+                    if ready_rx.await.is_ok() {
+                        spinner_for_ready.finish_with_message(format!(
+                            "{} Mounted at {}",
+                            style("✓").green().bold(),
+                            style(&path_display).cyan()
+                        ));
+                        println!("{}", style("Press Ctrl+C to unmount").dim());
+                    }
+                });
+                
+                // Try to mount - may fail if keys are not unlocked
+                let mount_result = {
+                    let session_guard = self.auth.session().await
+                        .ok_or_else(|| anyhow::anyhow!("No session after authentication"))?;
+                    let session = session_guard.as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("Session is None in guard"))?;
+                    
+                    crate::commands::mount::mount(&path, session, guard.token(), Some(progress), Some(ready_tx)).await
+                };
+                
+                // Check if it failed due to locked keys
+                match &mount_result {
+                    Err(e) => {
+                        spinner.finish_and_clear();
+                        let err_str = format!("{:?}", e);
+                        if err_str.contains("none could be unlocked") || 
+                           err_str.contains("passphrase") ||
+                           err_str.contains("Unable to locate passphrase") {
+                            // Keys not unlocked - prompt for password and retry
+                            println!();
+                            println!("{}", style("Keys need to be unlocked.").yellow());
+                            
+                            if !self.auth.unlock_keys_with_password().await? {
+                                println!("{}", style("Failed to unlock keys. Exiting.").red());
+                                return Ok(());
+                            }
+                            
+                            // New spinner for retry
+                            let spinner = Arc::new(ProgressBar::new_spinner());
+                            spinner.set_style(
+                                ProgressStyle::default_spinner()
+                                    .template("{spinner:.cyan} {msg}")
+                                    .unwrap()
+                                    .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+                            );
+                            spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+                            spinner.set_message("Retrying mount...");
+                            
+                            let spinner_for_progress = spinner.clone();
+                            let progress: crate::commands::mount::ProgressCallback = Box::new(move |msg| {
+                                spinner_for_progress.set_message(msg.to_string());
+                            });
+                            
+                            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                            let spinner_for_ready = spinner.clone();
+                            let path_display = path.display().to_string();
+                            
+                            tokio::spawn(async move {
+                                if ready_rx.await.is_ok() {
+                                    spinner_for_ready.finish_with_message(format!(
+                                        "{} Mounted at {}",
+                                        style("✓").green().bold(),
+                                        style(&path_display).cyan()
+                                    ));
+                                    println!("{}", style("Press Ctrl+C to unmount").dim());
+                                }
+                            });
+                            
+                            // Retry mount with unlocked keys
+                            let session_guard = self.auth.session().await
+                                .ok_or_else(|| anyhow::anyhow!("No session"))?;
+                            let session = session_guard.as_ref()
+                                .ok_or_else(|| anyhow::anyhow!("Session is None"))?;
+                            
+                            crate::commands::mount::mount(&path, session, guard.token(), Some(progress), Some(ready_tx)).await
+                        } else {
+                            mount_result
+                        }
+                    }
+                    Ok(()) => Ok(())
+                }
             }
         }
     }
@@ -136,7 +282,25 @@ impl ProtonDriveCommandLineInterface {
 
 #[tokio::main]
 pub async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    // Configure tracing with filters to suppress noisy logs
+    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| {
+            EnvFilter::new("info")
+                // Suppress crypto-related warnings that flood logs during normal operations
+                .add_directive("pgp=error".parse().unwrap())
+                .add_directive("proton_crypto=error".parse().unwrap())
+                .add_directive("rpgp=error".parse().unwrap())
+                // Suppress account key warnings (expected when resuming without password)
+                .add_directive("proton_sdk_rs2::account=error".parse().unwrap())
+        });
+    
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(filter)
+        .try_init()
+        .ok();
 
     let cli = Cli::parse();
     let pdcli = ProtonDriveCommandLineInterface::new()?;

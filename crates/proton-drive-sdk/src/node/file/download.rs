@@ -63,6 +63,10 @@ impl FileDownloader {
                 total_downloaded += block.len() as i64;
                 on_progress(total_downloaded, total_size);
             }
+            
+            // Ensure all buffered data is flushed before returning
+            content_output_stream.flush()?;
+            
             Ok(())
         });
 

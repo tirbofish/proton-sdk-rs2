@@ -2,7 +2,7 @@
 //!
 //! Handles login, logout, and session persistence using:
 //! - `.ron` file for session tokens (access/refresh tokens, session ID)
-//! - SQLite cache for entity data
+//! - SQLite cache for entity data and passphrases
 //! - Never stores passwords
 
 use std::path::PathBuf;
@@ -18,6 +18,7 @@ use tokio::sync::RwLock;
 use proton_drive_sdk::cache::sqlite::SqliteCacheRepository;
 use proton_sdk_rs2::{
     cache::CacheRepository,
+    client::ProtonClientOptions,
     session::ProtonAPISession,
     ser::StoredCredentials,
     AppVersionConfiguration,
@@ -158,6 +159,8 @@ impl ProtonAuth {
     }
 
     /// Try to resume an existing session.
+    /// This validates session tokens but does NOT prompt for password.
+    /// Keys may not be unlocked - caller should handle that.
     pub async fn try_resume(&self) -> Result<bool> {
         let tokens = match self.load_tokens()? {
             Some(t) => t,
@@ -186,7 +189,7 @@ impl ProtonAuth {
         match session.ensure_authenticated().await {
             Ok(()) => {
                 spinner.finish_with_message(format!(
-                    "{} Resumed session for {}",
+                    "{} Session valid for {}",
                     style("✓").green().bold(),
                     style(&tokens.username).cyan()
                 ));
@@ -195,6 +198,7 @@ impl ProtonAuth {
                 let new_tokens: SessionTokens = session.to_stored_credentials().into();
                 self.save_tokens(&new_tokens)?;
                 
+                // Store session - keys may or may not be unlocked depending on cache
                 *self.session.write().await = Some(session);
                 Ok(true)
             }
@@ -204,6 +208,51 @@ impl ProtonAuth {
                     style("✗").red().bold()
                 ));
                 tracing::debug!("Session resume failed: {}", e);
+                Ok(false)
+            }
+        }
+    }
+
+    /// Prompt for password and unlock keys.
+    /// Call this when an operation fails due to locked keys.
+    pub async fn unlock_keys_with_password(&self) -> Result<bool> {
+        let mut session_guard = self.session.write().await;
+        let session = match session_guard.as_mut() {
+            Some(s) => s,
+            None => return Err(anyhow::anyhow!("No session to unlock")),
+        };
+
+        let theme = ColorfulTheme::default();
+        println!();
+        
+        let password: String = Password::with_theme(&theme)
+            .with_prompt("Password (to unlock keys)")
+            .interact()
+            .context("Failed to read password")?;
+
+        let spinner = ProgressBar::new_spinner();
+        spinner.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.cyan} {msg}")
+                .unwrap()
+        );
+        spinner.set_message("Unlocking keys...");
+        spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+
+        match session.apply_data_password(&password).await {
+            Ok(()) => {
+                spinner.finish_with_message(format!(
+                    "{} Keys unlocked",
+                    style("✓").green().bold()
+                ));
+                Ok(true)
+            }
+            Err(e) => {
+                spinner.finish_with_message(format!(
+                    "{} Failed to unlock keys: {}",
+                    style("✗").red().bold(),
+                    e
+                ));
                 Ok(false)
             }
         }
@@ -239,16 +288,20 @@ impl ProtonAuth {
         spinner.set_message("Authenticating...");
         spinner.enable_steady_tick(std::time::Duration::from_millis(80));
 
-        // Attempt authentication
+        // Create cache repository for persisting passphrases
+        let cache_repo = self.create_cache_repository()?;
+        let options = ProtonClientOptions {
+            secret_cache_repository: Some(cache_repo),
+            ..Default::default()
+        };
+
+        // Attempt authentication (this also calls apply_data_password internally if not 2FA)
         let session = ProtonAPISession::begin(
             &username,
             &password,
             self.app_version.clone(),
-            Default::default(),
+            options,
         ).await;
-
-        // Password is now out of scope and will be dropped
-        drop(password);
 
         let mut session = match session {
             Ok(s) => s,
@@ -275,7 +328,15 @@ impl ProtonAuth {
 
             session.apply_second_factor_code(code).await
                 .context("2FA verification failed")?;
+
+            // After 2FA, we need to apply the data password to unlock keys
+            spinner.set_message("Unlocking keys...");
+            session.apply_data_password(&password).await
+                .context("Failed to unlock keys")?;
         }
+
+        // Password is no longer needed, clear it
+        drop(password);
 
         spinner.finish_with_message(format!(
             "{} Logged in as {}",

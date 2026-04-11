@@ -9,9 +9,9 @@ use crate::{
     auth::DefaultAuthenticationApiClient,
     cache::{CacheRepository, InMemoryCacheRepository},
     keys::DefaultKeysApiClient,
-    protobuf::ProtonClientTlsPolicy,
     session::ProtonAPISession,
     users::DefaultUsersApiClient,
+    utils::AppVersionConfiguration,
 };
 
 pub struct ProtonClientOptions {
@@ -41,8 +41,8 @@ pub struct ProtonClientOptions {
 pub struct ProtonClientConfiguration {
     /// Base URL used for the drive API.
     pub base_url: http::Uri,
-    /// Application version reported in the `x-pm-appversion` header (e.g. `android@1.2.3`).
-    pub app_version: semver::Version,
+    /// Application version configuration used to build the `x-pm-appversion` header.
+    pub app_version: AppVersionConfiguration,
     /// `User-Agent` string sent with every request.
     pub user_agent: String,
     /// TLS verification policy in use; strict by default.
@@ -82,7 +82,7 @@ impl Default for ProtonClientOptions {
 }
 
 impl ProtonClientConfiguration {
-    pub fn new(app_version: semver::Version, options: ProtonClientOptions) -> anyhow::Result<Self> {
+    pub fn new(app_version: AppVersionConfiguration, options: ProtonClientOptions) -> anyhow::Result<Self> {
         Ok(Self {
             base_url: options.base_url.unwrap_or(ProtonApiDefaults::base_url()),
             app_version,
@@ -116,7 +116,7 @@ impl ProtonClientConfiguration {
             reqwest::Url::parse(&self.base_url.to_string())?.join(base_route_path.as_str())?;
 
         let mut default_headers = HeaderMap::new();
-        let app_version_header = Self::build_pm_app_version(self);
+        let app_version_header = self.app_version.to_string();
         log::debug!("Generated x-pm-appversion header: {}", app_version_header);
         default_headers.insert(
             "x-pm-appversion",
@@ -149,78 +149,6 @@ impl ProtonClientConfiguration {
         // TODO: Custom message handlers, retry/circuit-breaker policies, cookie container,
         // and session authorization middleware require additional middleware abstractions.
         builder.build().map_err(Into::into)
-    }
-
-    pub(crate) fn build_pm_app_version(config: &ProtonClientConfiguration) -> String {
-        let binding_segment = config
-            .bindings_language
-            .as_deref()
-            .unwrap_or("rust")
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphabetic() {
-                    c.to_ascii_lowercase()
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>()
-            .trim_matches('_')
-            .to_string();
-
-        let binding_segment = if binding_segment.is_empty() {
-            "rust".to_string()
-        } else {
-            binding_segment
-        };
-
-        let platform = format!("external-drive-{}", binding_segment);
-        let pre = config.app_version.pre.as_str();
-        let pre_lower = pre.to_ascii_lowercase();
-
-        let (channel, suffix) = if pre_lower.starts_with("alpha") {
-            (Some("alpha"), &pre[5..])
-        } else if pre_lower.starts_with("beta") {
-            (Some("beta"), &pre[4..])
-        } else if pre_lower.starts_with("rc") {
-            (Some("RC"), &pre[2..])
-        } else if pre_lower.starts_with("stable") {
-            (Some("stable"), &pre[6..])
-        } else if pre.is_empty() {
-            (None, "")
-        } else {
-            (Some("alpha"), pre)
-        };
-
-        let numeric_suffix: String = suffix
-            .chars()
-            .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
-            .collect();
-        let dev_suffix = if pre_lower.contains("dev") {
-            ".dev"
-        } else {
-            ""
-        };
-
-        let mut value = format!(
-            "{}@{}.{}.{}",
-            platform, config.app_version.major, config.app_version.minor, config.app_version.patch,
-        );
-
-        if let Some(ch) = channel {
-            value.push('-');
-            value.push_str(ch);
-            value.push_str(&numeric_suffix);
-        }
-
-        value.push_str(dev_suffix);
-
-        if !config.app_version.build.is_empty() {
-            value.push('+');
-            value.push_str(config.app_version.build.as_str());
-        }
-
-        value
     }
 }
 
@@ -302,3 +230,12 @@ impl ApiClient {
 }
 
 impl ApiClientFactory for ApiClient {}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(i32)]
+pub enum ProtonClientTlsPolicy {
+    Strict = 0,
+    NoCertificatePinning = 1,
+    NoCertificateValidation = 2,
+}

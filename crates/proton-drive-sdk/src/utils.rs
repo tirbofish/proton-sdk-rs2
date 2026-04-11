@@ -5,6 +5,7 @@ use ::serde::{Deserialize, Serialize};
 pub mod batch;
 pub mod semaphore;
 pub mod serde;
+#[cfg(feature = "thumbnail-generation")]
 pub mod thumbnail;
 
 pub struct AlternateFileNameGenerator;

@@ -1,3 +1,7 @@
+//! A wrapper for caches which force a AES-256-GCM encryption on all values.
+//!
+//! Requires the `cache-encrypted` feature to be enabled.
+
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::Context;

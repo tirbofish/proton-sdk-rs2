@@ -16,6 +16,7 @@ use crate::node::folder::{
 };
 use crate::node::secrets::{DegradedNodeSecrets, ShareAndKey};
 use crate::pgp::{PgpPrivateKey, PgpSessionKey};
+#[allow(deprecated)]
 use crate::protobuf::SignatureVerificationError;
 use crate::share::ShareId;
 use crate::utils::PotentialObject;
@@ -276,6 +277,56 @@ impl Node {
             Node::Folder(n) | Node::Album(n) => n.base.name = name,
             Node::File(n) | Node::Photo(n) => n.base.base.name = name,
         }
+    }
+}
+
+// Conversions from specific node types to the `Node` enum
+impl From<FolderNode> for Node {
+    fn from(node: FolderNode) -> Self {
+        Node::Folder(node)
+    }
+}
+
+impl From<FileNode> for Node {
+    fn from(node: FileNode) -> Self {
+        Node::File(node)
+    }
+}
+
+// Conversions to `NodeUid` for use with functions like `enumerate_folder_children`
+impl From<&Node> for NodeUid {
+    fn from(node: &Node) -> Self {
+        node.uid().clone()
+    }
+}
+
+impl From<Node> for NodeUid {
+    fn from(node: Node) -> Self {
+        node.uid().clone()
+    }
+}
+
+impl From<&FolderNode> for NodeUid {
+    fn from(node: &FolderNode) -> Self {
+        node.base.uid.clone()
+    }
+}
+
+impl From<FolderNode> for NodeUid {
+    fn from(node: FolderNode) -> Self {
+        node.base.uid
+    }
+}
+
+impl From<&FileNode> for NodeUid {
+    fn from(node: &FileNode) -> Self {
+        node.base.base.uid.clone()
+    }
+}
+
+impl From<FileNode> for NodeUid {
+    fn from(node: FileNode) -> Self {
+        node.base.base.uid
     }
 }
 
@@ -1058,6 +1109,7 @@ impl DtoToMetadataConverter {
                                         .active_revision
                                         .as_ref()
                                         .map(|r| {
+                                            #[allow(deprecated)]
                                             r.thumbnails
                                                 .iter()
                                                 .map(|t| crate::protobuf::ThumbnailHeader {

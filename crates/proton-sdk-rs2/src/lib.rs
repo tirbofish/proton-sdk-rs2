@@ -1,4 +1,20 @@
-//! start off at [`session::ProtonAPISession`]
+//! The interface to be able to talk to the Proton API (which includes drive, mail and many
+//! other applications within the suite).
+//!
+//! # Example
+//! ```
+//! use proton_sdk_rs2::{session::ProtonAPISession, AppVersionConfiguration, client::ProtonClientOptions};
+//!
+//! async fn start_session() {
+//!     // create a new api session
+//!     let session = ProtonAPISession::begin(
+//!         "eric.nobert@acme.me",
+//!         "password123",
+//!         AppVersionConfiguration::new("example-proton-sdk-rs2-app", 0, 1, 0),
+//!         ProtonClientOptions::default(),
+//!     ).await.unwrap();
+//! }
+//! ```
 pub mod ser;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -22,6 +38,8 @@ pub mod crypto {
     pub use proton_rpgp;
     pub use proton_srp;
 }
+
+pub use utils::{AppVersionConfiguration, ReleaseChannel};
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SessionId(String);

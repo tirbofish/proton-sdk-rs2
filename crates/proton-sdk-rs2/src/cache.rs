@@ -13,6 +13,18 @@ pub trait CacheRepository: Send + Sync {
     fn get_by_tags(&self, tags: Vec<String>) -> BoxStream<'_, anyhow::Result<(String, String)>>;
 }
 
+/// An in-memory cache that loses all data when the process exits.
+///
+/// This is the default cache used when no persistent storage is configured.
+/// Suitable for short-lived sessions or testing.
+///
+/// # Issue
+/// This cache is not suitable fo resumed sessions. If you call
+/// [`ProtonAPISession::from_stored_credentials`] with an `InMemoryCacheRepository`,
+/// key material (passphrases, session keys) will be missing and decryption will fail.
+///
+/// For persistent sessions, use `SqliteCacheRepository` from `proton_drive_sdk::cache::sqlite` (it supports
+/// in memory as well). 
 pub struct InMemoryCacheRepository {
     entries: DashMap<String, String>,
     key_to_tags: DashMap<String, HashSet<String>>,

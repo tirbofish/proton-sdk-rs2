@@ -9,6 +9,7 @@ use crate::auth::DefaultAuthenticationApiClient;
 use crate::keys::{DefaultKeysApiClient, KeysApiClient};
 use crate::secret::SessionSecretCache;
 use crate::ser::StoredCredentials;
+use crate::utils::AppVersionConfiguration;
 use crate::{
     PasswordMode, SessionId, UserId,
     auth::{AuthenticationApiClient, TokenCredential},
@@ -110,7 +111,7 @@ impl ProtonAPISession {
         let mut builder = reqwest::Client::builder();
         let mut default_headers = HeaderMap::new();
 
-        let app_version = ProtonClientConfiguration::build_pm_app_version(config);
+        let app_version = config.app_version.to_string();
         log::debug!("Generated x-pm-appversion header for session: {}", app_version);
         default_headers.insert("x-pm-appversion", HeaderValue::from_str(&app_version)?);
 
@@ -147,13 +148,13 @@ impl ProtonAPISession {
     /// # Arguments
     ///
     /// * `cred` – Credentials returned by a prior call to [`Self::to_stored_credentials`].
-    /// * `app_version` – The current application version, used to build the `x-pm-appversion`
+    /// * `app_version` – The current application version configuration, used to build the `x-pm-appversion`
     ///   header on every request.
     /// * `secret_cache_repository` – Repository used to cache decrypted key material for the
     ///   duration of the restored session.
     pub fn from_stored_credentials(
         cred: StoredCredentials,
-        app_version: semver::Version,
+        app_version: AppVersionConfiguration,
         secret_cache_repository: Arc<dyn CacheRepository>,
     ) -> Self {
         Self::resume(
@@ -175,7 +176,7 @@ impl ProtonAPISession {
     ///
     /// The snapshot captures the tokens that were active at the time of this call.  If the
     /// session's access token has been silently refreshed since the last explicit store, prefer
-    /// calling the async [`crate::auth::TokenCredential::get_tokens`] directly and constructing
+    /// calling the async [`TokenCredential::get_tokens`] directly and constructing
     /// [`StoredCredentials`] from those values.
     pub fn to_stored_credentials(&self) -> StoredCredentials {
         StoredCredentials::new(
@@ -196,15 +197,11 @@ impl ProtonAPISession {
     pub async fn begin(
         username: impl Into<String>,
         password: &str,
-        app_version: semver::Version,
-        mut session_options: ProtonSessionOptions,
+        app_version: AppVersionConfiguration,
+        options: ProtonClientOptions,
     ) -> anyhow::Result<ProtonAPISession> {
         let username: String = username.into();
-        if let Some(secret_repo) = session_options.secret_cache_repository.take() {
-            session_options.client.secret_cache_repository = Some(secret_repo);
-        }
-
-        let configuration = ProtonClientConfiguration::new(app_version, session_options.client)?;
+        let configuration = ProtonClientConfiguration::new(app_version, options)?;
         let auth_api_client = Self::create_authentication_api_client(&configuration)?;
         let session_init_resp = auth_api_client.initiate_session(username.clone()).await?;
 
@@ -285,7 +282,7 @@ impl ProtonAPISession {
         scopes: Vec<String>,
         is_waiting_for_second_factor_code: bool,
         password_mode: PasswordMode,
-        app_version: semver::Version,
+        app_version: AppVersionConfiguration,
         secret_cache_repository: Arc<dyn CacheRepository>,
     ) -> ProtonAPISession {
         ProtonAPISession::resume_with_options(
@@ -314,7 +311,7 @@ impl ProtonAPISession {
         scopes: Vec<String>,
         is_waiting_for_second_factor_code: bool,
         password_mode: PasswordMode,
-        app_version: semver::Version,
+        app_version: AppVersionConfiguration,
         secret_cache_repository: Arc<dyn CacheRepository>,
         mut options: ProtonClientOptions,
     ) -> ProtonAPISession {
@@ -387,7 +384,7 @@ impl ProtonAPISession {
     pub async fn end_from_token(
         id: String,
         access_token: String,
-        app_version: semver::Version,
+        app_version: AppVersionConfiguration,
         options: Option<ProtonClientOptions>,
     ) -> anyhow::Result<()> {
         let configuration =
@@ -584,23 +581,6 @@ impl ProtonAPISession {
             ));
             self.authentication_api = Some(api.clone());
             Ok(api)
-        }
-    }
-}
-
-pub struct ProtonSessionOptions {
-    pub client: ProtonClientOptions,
-    pub secret_cache_repository: Option<Arc<dyn CacheRepository>>,
-}
-
-impl ProtonSessionOptions {
-    /// Creates `ProtonSessionOptions` from the given client options, propagating the
-    /// `secret_cache_repository` field so it can be passed independently to `begin`.
-    pub fn new(client_options: ProtonClientOptions) -> Self {
-        let secret_cache_repository = client_options.secret_cache_repository.clone();
-        Self {
-            client: client_options,
-            secret_cache_repository,
         }
     }
 }

@@ -1,3 +1,7 @@
+//! [rusqlite]/SQLite based cache repositories.
+//! 
+//! The `cache-sqlite` feature is required to be enabled (is enabled by default). 
+
 use anyhow::Context;
 use futures::stream::BoxStream;
 use futures::StreamExt;

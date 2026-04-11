@@ -80,7 +80,10 @@ impl ProtonDriveClient {
 
     /// Creates a new [`ProtonDriveClient`] based on an existing [`ProtonAPISession`]. 
     /// 
-    /// The defacto initialiser. 
+    /// The defacto initialiser.
+    ///
+    /// The `uid` is an optional unique identifier for this client instance, useful for logging
+    /// and debugging. If `None`, a unique ID is auto-generated using the current timestamp.
     pub fn new(session: &ProtonAPISession, uid: Option<String>) -> anyhow::Result<Self> {
         Self::from_session_with_drive_api_clients_factory(
             session,
@@ -91,7 +94,10 @@ impl ProtonDriveClient {
 
     /// Creates a new [`ProtonDriveClient`] by ensuring that the session is authenticated. 
     /// 
-    /// Can throw an error if any issues occur with authentication. 
+    /// Can throw an error if any issues occur with authentication.
+    ///
+    /// The `uid` is an optional unique identifier for this client instance, useful for logging
+    /// and debugging. If `None`, a unique ID is auto-generated using the current timestamp.
     pub async fn new_with_preflight_auth(
         session: &mut ProtonAPISession,
         uid: Option<String>,
@@ -495,13 +501,13 @@ impl ProtonDriveClient {
     /// task; items appear in the stream as soon as each batch is ready.
     pub async fn enumerate_folder_children(
         &self,
-        folder_id: NodeUid,
+        folder_id: impl Into<NodeUid>,
     ) -> anyhow::Result<
         impl futures::Stream<Item = anyhow::Result<PotentialObject<Node, DegradedNode>>> + 'static,
     > {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let client = self.clone();
-        tokio::spawn(FolderOperations::enumerate_children_to_channel(client, folder_id, tx));
+        tokio::spawn(FolderOperations::enumerate_children_to_channel(client, folder_id.into(), tx));
         Ok(futures::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
         }))
@@ -754,11 +760,14 @@ impl ProtonDriveClient {
             .to_string();
 
         let file_data = std::fs::read(path)?;
+        #[cfg(feature = "thumbnail-generation")]
         let (thumbnails, media_info) = if media_type.starts_with("image/") {
             crate::utils::thumbnail::ThumbnailGenerator::generate_thumbnails(&file_data)
         } else {
             (Vec::new(), None)
         };
+        #[cfg(not(feature = "thumbnail-generation"))]
+        let (thumbnails, media_info): (Vec<crate::node::thumbnail::Thumbnail>, Option<crate::api::attr::MediaExtendedAttributes>) = (Vec::new(), None);
 
         let uploader = self
             .get_file_uploader(

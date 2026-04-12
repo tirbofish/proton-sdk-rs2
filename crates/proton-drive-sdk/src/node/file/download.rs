@@ -36,12 +36,20 @@ impl FileDownloader {
 
         let completion = tokio::spawn(async move {
             let release_block_listing = Box::new(|_| {});
+            tracing::debug!("Creating download state for revision_uid={}", revision_uid);
             let download_state = RevisionOperations::create_download_state(
                 &client,
-                revision_uid,
+                revision_uid.clone(),
                 release_block_listing,
             )
-            .await?;
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to create download state for {}: {:?}", revision_uid, e);
+                e
+            })?;
+
+            let num_blocks = download_state.revision_dto.blocks.len();
+            tracing::debug!("Download state created: {} blocks, size={}", num_blocks, download_state.revision_dto.revision.size);
 
             let download_state = Arc::new(download_state);
             let mut reader = RevisionOperations::open_for_reading(
@@ -54,9 +62,13 @@ impl FileDownloader {
             let mut total_downloaded = 0;
 
             loop {
-                let block = match reader.read_next_block().await? {
-                    Some(b) => b,
-                    None => break,
+                let block = match reader.read_next_block().await {
+                    Ok(Some(b)) => b,
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::error!("Failed to read block: {:?}", e);
+                        return Err(e);
+                    }
                 };
 
                 content_output_stream.write_all(&block)?;

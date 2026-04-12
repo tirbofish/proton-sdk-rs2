@@ -142,13 +142,52 @@ pub struct VolumeEventsResponse {
     pub events: Vec<VolumeEventDto>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum VolumeEventType {
+    /// Node was deleted or trashed
+    Delete = 0,
+    /// New node was created
+    Create = 1,
+    /// Node metadata was updated (name, attributes, etc.)
+    UpdateMetadata = 2,
+    /// Node content was updated (new revision)
+    UpdateContent = 3,
+}
+
+impl VolumeEventType {
+    /// Parse from raw API integer value
+    pub fn from_raw(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Delete),
+            1 => Some(Self::Create),
+            2 => Some(Self::UpdateMetadata),
+            3 => Some(Self::UpdateContent),
+            _ => None,
+        }
+    }
+    
+    /// Check if this is any kind of update event
+    pub fn is_update(&self) -> bool {
+        matches!(self, Self::UpdateMetadata | Self::UpdateContent)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct VolumeEventDto {
     #[serde(rename = "EventID")]
     pub event_id: String,
+    #[serde(rename = "EventType")]
     pub event_type: i32,
     pub link: VolumeEventLinkDto,
+}
+
+impl VolumeEventDto {
+    /// Get the parsed event type
+    pub fn event_type(&self) -> Option<VolumeEventType> {
+        VolumeEventType::from_raw(self.event_type)
+    }
 }
 
 #[derive(Debug, Deserialize)]

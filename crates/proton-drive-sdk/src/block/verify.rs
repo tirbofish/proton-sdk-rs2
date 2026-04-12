@@ -5,6 +5,7 @@ use crate::pgp::{PgpSessionKey, PgpPrivateKey};
 use crate::node::revision::RevisionUid;
 use crate::api::block::verification::{BlockVerificationApiClient, DefaultBlockVerificationApiClient};
 
+#[derive(Clone)]
 pub struct BlockVerifier {
     _session_key: PgpSessionKey,
     verification_code: Vec<u8>,

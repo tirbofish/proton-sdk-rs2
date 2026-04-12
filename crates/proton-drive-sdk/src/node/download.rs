@@ -3,7 +3,7 @@ use crate::client::ProtonDriveClient;
 use crate::node::revision::RevisionUid;
 use crate::node::transfer::TransferQueue;
 use crate::pgp::{PgpPrivateKey, PgpSessionKey};
-use log::{debug, info};
+use log::{debug, error, info};
 use proton_rpgp::{DataEncoding, Decryptor, SessionKey, pgp::crypto::sym::SymmetricKeyAlgorithm};
 use sha2::{Digest, Sha256};
 use std::io::Write;
@@ -225,16 +225,26 @@ impl BlockDownloader {
             .await?;
         let blob_bytes = response.bytes().await?;
 
+        debug!("Downloaded {} encrypted bytes", blob_bytes.len());
+
         let mut hasher = Sha256::new();
         hasher.update(&blob_bytes);
 
         let alg = SymmetricKeyAlgorithm::from(content_key.algorithm);
         let sk = SessionKey::new(&content_key.key, alg);
 
-        let result = Decryptor::default()
+        let result = match Decryptor::default()
             .with_session_key(sk)
-            .decrypt(&blob_bytes, DataEncoding::Auto)?;
+            .decrypt(&blob_bytes, DataEncoding::Auto)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Failed to decrypt block: {:?}", e);
+                return Err(FileContentsDecryptionException::WithCause(e.into()).into());
+            }
+        };
 
+        debug!("Decrypted to {} bytes", result.data.len());
         output.extend_from_slice(&result.data);
 
         Ok(hasher.finalize().to_vec())

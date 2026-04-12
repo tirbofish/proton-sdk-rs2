@@ -35,6 +35,8 @@ enum Commands {
     Whoami,
     /// Clear the file download cache (keeps session)
     ClearCache,
+    /// Clear pending uploads from queue
+    ClearPendingUploads,
     /// Mount Proton Drive to a local path
     Mount {
         /// Path to mount the drive
@@ -127,6 +129,9 @@ impl ProtonDriveCommandLineInterface {
             }
             Commands::ClearCache => {
                 crate::commands::mount::clear_cache()
+            }
+            Commands::ClearPendingUploads => {
+                crate::commands::mount::clear_pending_uploads()
             }
             Commands::Mount { path } => {
                 // Ensure authenticated before mounting
@@ -282,25 +287,17 @@ impl ProtonDriveCommandLineInterface {
 
 #[tokio::main]
 pub async fn main() -> anyhow::Result<()> {
-    // Configure tracing with filters to suppress noisy logs
+    // Configure tracing - only enabled via RUST_LOG env var
+    // Example: RUST_LOG=info pdcli mount ~/ProtonDrive
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| {
-            EnvFilter::new("info")
-                // Suppress crypto-related warnings that flood logs during normal operations
-                .add_directive("pgp=error".parse().unwrap())
-                .add_directive("proton_crypto=error".parse().unwrap())
-                .add_directive("rpgp=error".parse().unwrap())
-                // Suppress account key warnings (expected when resuming without password)
-                .add_directive("proton_sdk_rs2::account=error".parse().unwrap())
-        });
-    
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(filter)
-        .try_init()
-        .ok();
+    if let Ok(filter) = EnvFilter::try_from_default_env() {
+        tracing_subscriber::registry()
+            .with(fmt::layer())
+            .with(filter)
+            .try_init()
+            .ok();
+    }
 
     let cli = Cli::parse();
     let pdcli = ProtonDriveCommandLineInterface::new()?;

@@ -966,14 +966,21 @@ impl ProtonDriveClient {
 }
 
 fn default_block_transfer_parallelism() -> usize {
-    (std::thread::available_parallelism()
+    // Use a high default to allow multiple large files to upload concurrently.
+    // FileUploader::create acquires permits for ALL blocks upfront, so we need
+    // enough permits for several files at once (e.g., 3 × 40 blocks = 120 permits).
+    // Using 128 as minimum gives us ~132 permits in the revision_creation_semaphore.
+    let cpu_based = (std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(ProtonDriveClient::MIN_DEGREE_OF_BLOCK_TRANSFER_PARALLELISM)
         / 2)
     .clamp(
         ProtonDriveClient::MIN_DEGREE_OF_BLOCK_TRANSFER_PARALLELISM,
         ProtonDriveClient::MAX_DEGREE_OF_BLOCK_TRANSFER_PARALLELISM,
-    )
+    );
+    
+    // Ensure at least 128 for concurrent large file uploads
+    cpu_based.max(128)
 }
 
 fn generate_uid() -> String {

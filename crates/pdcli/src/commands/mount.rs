@@ -35,9 +35,10 @@ use futures_util::StreamExt;
 use globset::{Glob, GlobSetBuilder, GlobSet};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 
+use proton_drive_sdk::api::events::{VolumeEventDto, VolumeEventType};
 use proton_drive_sdk::client::ProtonDriveClient;
 use proton_drive_sdk::links::LinkId;
 use proton_drive_sdk::node::{DegradedNode, Node, NodeUid};
@@ -55,11 +56,23 @@ const TTL: Duration = Duration::from_secs(1);
 /// Root inode number (always 1 in FUSE).
 const ROOT_INODE: u64 = 1;
 
+/// Virtual folder inodes for the root-level structure.
+/// These are synthetic folders that group different Proton Drive features.
+const MYFILES_INODE: u64 = 2;
+const COMPUTERS_INODE: u64 = 3;
+const PHOTOS_INODE: u64 = 4;
+
+/// First inode available for actual Proton Drive nodes.
+const FIRST_DYNAMIC_INODE: u64 = 100;
+
 /// Default directory mode.
 const DIR_MODE: u16 = 0o755;
 
 /// Default file mode.
 const FILE_MODE: u16 = 0o644;
+
+/// Event polling interval (5 seconds for responsive updates)
+const EVENT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Check if a filename is a LibreOffice/OpenOffice lock file.
 /// Lock files have the pattern `.~lock.<filename>#`
@@ -713,7 +726,7 @@ impl DiskCache {
 }
 
 /// Pending file being written (not yet committed to Proton Drive).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PendingFile {
     /// Parent folder inode (unused but kept for debugging)
     #[allow(dead_code)]
@@ -733,6 +746,288 @@ struct PendingFile {
     dirty: bool,
 }
 
+/// Persistent upload data saved to disk for resume capability.
+/// Maximum number of retries before giving up on a persistent upload.
+const MAX_UPLOAD_RETRIES: u32 = 3;
+
+/// Check if an error message indicates a transient/network failure that should be retried.
+/// Returns true if the error is clearly a network/connection issue.
+fn is_transient_error(error_msg: &str) -> bool {
+    let transient_patterns = [
+        "error sending request",  // reqwest connection errors
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "service unavailable",
+        "503",  // Service Unavailable
+        "502",  // Bad Gateway
+        "504",  // Gateway Timeout
+        "network",
+        "dns",
+        "resolve",
+        "socket",
+        "broken pipe",
+        "connection aborted",
+        "API error 429",  // Rate limited - should retry after delay
+        "too many requests",
+    ];
+    
+    let error_lower = error_msg.to_lowercase();
+    transient_patterns.iter().any(|p| error_lower.contains(p))
+}
+
+/// Check if an error message indicates a permanent failure that should not be retried.
+/// Returns true if the upload should be removed from the pending queue.
+fn is_permanent_upload_error(error_msg: &str) -> bool {
+    // First check if it's clearly a transient error - these should always be retried
+    if is_transient_error(error_msg) {
+        return false;
+    }
+    
+    // API error codes that indicate permanent failures
+    let permanent_patterns = [
+        "API error 2500", // AlreadyExists - file with same name exists
+        "API error 2501", // DoesNotExist - parent folder doesn't exist
+        "API error 2000", // InvalidRequirements
+        "API error 2001", // InvalidValue
+        "API error 2011", // NotEnoughPermissions
+        "API error 200001", // InsufficientQuota
+        "API error 200002", // InsufficientSpace
+        "API error 200003", // MaxFileSizeForFreeUser
+        "API error 200300", // TooManyChildren
+        "API error 200301", // NestingTooDeep
+        "already exists", // Common error message pattern
+        "not enough space", // Quota errors
+        "quota exceeded", // Quota errors
+        "permission denied", // Permission errors
+    ];
+    
+    let error_lower = error_msg.to_lowercase();
+    permanent_patterns.iter().any(|p| error_lower.contains(&p.to_lowercase()))
+}
+
+/// Classify a download error and return a human-readable description and styled icon.
+/// This helps users understand whether a file is corrupted, has network issues, etc.
+fn classify_download_error(error_msg: &str) -> (&'static str, console::StyledObject<&'static str>) {
+    let error_lower = error_msg.to_lowercase();
+    
+    // Decryption/integrity failures - file is corrupted or was uploaded incorrectly
+    if error_lower.contains("invalid mdc") 
+        || error_lower.contains("mdc mismatch")
+        || error_lower.contains("decrypt")
+        || error_lower.contains("decryption")
+        || error_lower.contains("integrity") {
+        return ("corrupted - cannot decrypt", style("✗").red());
+    }
+    
+    // Session key / crypto key issues
+    if error_lower.contains("session key")
+        || error_lower.contains("wrong key")
+        || error_lower.contains("key mismatch") {
+        return ("key error - cannot decrypt", style("✗").red());
+    }
+    
+    // Signature verification failures
+    if error_lower.contains("signature")
+        || error_lower.contains("verification failed") {
+        return ("signature invalid", style("✗").red());
+    }
+    
+    // Network errors - transient, could retry
+    if is_transient_error(&error_lower) {
+        return ("network error", style("⚠").yellow());
+    }
+    
+    // Block not found / storage errors
+    if error_lower.contains("not found")
+        || error_lower.contains("404")
+        || error_lower.contains("block") {
+        return ("file missing from storage", style("✗").red());
+    }
+    
+    // Auth/permission errors
+    if error_lower.contains("unauthorized")
+        || error_lower.contains("forbidden")
+        || error_lower.contains("401")
+        || error_lower.contains("403") {
+        return ("access denied", style("✗").red());
+    }
+    
+    // Default fallback
+    ("download error", style("✗").red())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+enum PersistentUpload {
+    /// Upload a new file
+    NewFile {
+        id: String,
+        parent_uid: NodeUid,
+        name: String,
+        mime_type: String,
+        content: Vec<u8>,
+        /// Number of retry attempts
+        #[serde(default)]
+        retry_count: u32,
+        /// Timestamp when the upload was created (for stale detection)
+        #[serde(default = "default_timestamp")]
+        created_at: i64,
+    },
+    /// Upload a new revision of an existing file  
+    NewRevision {
+        id: String,
+        revision_uid: RevisionUid,
+        filename: String,
+        content: Vec<u8>,
+        /// Number of retry attempts
+        #[serde(default)]
+        retry_count: u32,
+        /// Timestamp when the upload was created (for stale detection)
+        #[serde(default = "default_timestamp")]
+        created_at: i64,
+    },
+}
+
+/// Default timestamp function for serde
+fn default_timestamp() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+impl PersistentUpload {
+    fn id(&self) -> &str {
+        match self {
+            PersistentUpload::NewFile { id, .. } => id,
+            PersistentUpload::NewRevision { id, .. } => id,
+        }
+    }
+    
+    fn name(&self) -> &str {
+        match self {
+            PersistentUpload::NewFile { name, .. } => name,
+            PersistentUpload::NewRevision { filename, .. } => filename,
+        }
+    }
+    
+    fn retry_count(&self) -> u32 {
+        match self {
+            PersistentUpload::NewFile { retry_count, .. } => *retry_count,
+            PersistentUpload::NewRevision { retry_count, .. } => *retry_count,
+        }
+    }
+    
+    fn increment_retry(&mut self) {
+        match self {
+            PersistentUpload::NewFile { retry_count, .. } => *retry_count += 1,
+            PersistentUpload::NewRevision { retry_count, .. } => *retry_count += 1,
+        }
+    }
+    
+    fn created_at(&self) -> i64 {
+        match self {
+            PersistentUpload::NewFile { created_at, .. } => *created_at,
+            PersistentUpload::NewRevision { created_at, .. } => *created_at,
+        }
+    }
+    
+    /// Check if this upload is stale (older than 24 hours)
+    fn is_stale(&self) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        let age_hours = (now - self.created_at()) / 3600;
+        age_hours > 24
+    }
+}
+
+/// Persistent upload queue that survives app restarts.
+struct PendingUploadStore {
+    store_dir: PathBuf,
+}
+
+impl PendingUploadStore {
+    fn new() -> Result<Self> {
+        let config_dir = dirs::config_dir()
+            .ok_or_else(|| anyhow::anyhow!("No config directory"))?
+            .join("pdcli")
+            .join("pending_uploads");
+        
+        std::fs::create_dir_all(&config_dir)
+            .context("Failed to create pending uploads directory")?;
+        
+        Ok(Self { store_dir: config_dir })
+    }
+    
+    /// Generate a unique ID for an upload.
+    fn generate_id() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{:x}", timestamp)
+    }
+    
+    /// Save a pending upload to disk.
+    fn save(&self, upload: &PersistentUpload) -> Result<()> {
+        let path = self.store_dir.join(format!("{}.json", upload.id()));
+        let data = serde_json::to_vec(upload)
+            .context("Failed to serialize upload")?;
+        std::fs::write(&path, data)
+            .with_context(|| format!("Failed to write upload file: {:?}", path))?;
+        tracing::debug!("Saved pending upload: {}", upload.id());
+        Ok(())
+    }
+    
+    /// Remove a completed upload from disk.
+    fn remove(&self, id: &str) -> Result<()> {
+        let path = self.store_dir.join(format!("{}.json", id));
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("Failed to remove upload file: {:?}", path))?;
+            tracing::debug!("Removed completed upload: {}", id);
+        }
+        Ok(())
+    }
+    
+    /// Load all pending uploads from disk.
+    fn load_all(&self) -> Result<Vec<PersistentUpload>> {
+        let mut uploads = Vec::new();
+        
+        if let Ok(entries) = std::fs::read_dir(&self.store_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map(|e| e == "json").unwrap_or(false) {
+                    match std::fs::read(&path) {
+                        Ok(data) => {
+                            match serde_json::from_slice::<PersistentUpload>(&data) {
+                                Ok(upload) => {
+                                    tracing::info!("Found pending upload: {} ({:?})", 
+                                        upload.id(), 
+                                        match &upload {
+                                            PersistentUpload::NewFile { name, .. } => name.clone(),
+                                            PersistentUpload::NewRevision { filename, .. } => filename.clone(),
+                                        }
+                                    );
+                                    uploads.push(upload);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to parse upload file {:?}: {}", path, e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to read upload file {:?}: {}", path, e);
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(uploads)
+    }
+}
+
 /// Write buffer for an open file handle.
 #[derive(Debug)]
 struct WriteBuffer {
@@ -748,12 +1043,37 @@ struct WriteBuffer {
     dirty: bool,
 }
 
+/// Background upload task.
+#[derive(Debug)]
+enum UploadTask {
+    /// Upload a new file
+    NewFile {
+        inode: u64,
+        pending: PendingFile,
+        /// Persistence ID for resume capability
+        persist_id: Option<String>,
+    },
+    /// Upload a new revision of an existing file
+    NewRevision {
+        inode: u64,
+        revision_uid: RevisionUid,
+        filename: String,
+        content: Vec<u8>,
+        /// Persistence ID for resume capability
+        persist_id: Option<String>,
+    },
+    /// Resume a persisted upload (no inode, was saved from previous session)
+    ResumePersisted(PersistentUpload),
+}
+
 /// Internal filesystem state.
 struct ProtonDriveFsInner {
     /// Map from inode to node
     nodes: BTreeMap<u64, FsNode>,
     /// Map from NodeUid to inode
     uid_to_inode: BTreeMap<String, u64>,
+    /// Map from LinkId to inode (for event processing)
+    link_id_to_inode: BTreeMap<String, u64>,
     /// Children mapping: parent_inode -> child_inodes
     children: BTreeMap<u64, Vec<u64>>,
     /// Set of folders whose children have been loaded
@@ -776,6 +1096,8 @@ struct ProtonDriveFsInner {
     write_buffers: BTreeMap<u64, WriteBuffer>,
     /// Mapping from file handle to inode for write tracking
     fh_to_inode: BTreeMap<u64, u64>,
+    /// Last processed event ID for polling
+    last_event_id: Option<String>,
 }
 
 impl ProtonDriveFsInner {
@@ -783,10 +1105,11 @@ impl ProtonDriveFsInner {
         Self {
             nodes: BTreeMap::new(),
             uid_to_inode: BTreeMap::new(),
+            link_id_to_inode: BTreeMap::new(),
             children: BTreeMap::new(),
             loaded_folders: std::collections::HashSet::new(),
             file_cache: BTreeMap::new(),
-            next_inode: AtomicU64::new(2), // 1 is reserved for root
+            next_inode: AtomicU64::new(FIRST_DYNAMIC_INODE), // Virtual inodes 1-99 reserved
             root_uid: None,
             volume_id: None,
             next_fh: AtomicU64::new(1),
@@ -794,6 +1117,7 @@ impl ProtonDriveFsInner {
             pending_files: BTreeMap::new(),
             write_buffers: BTreeMap::new(),
             fh_to_inode: BTreeMap::new(),
+            last_event_id: None,
         }
     }
 
@@ -814,7 +1138,11 @@ impl ProtonDriveFsInner {
 
     fn insert_node(&mut self, node: FsNode, parent_inode: Option<u64>) -> u64 {
         let uid = node.uid().clone();
+        let link_id = uid.link_id.raw().to_string();
         let inode = self.get_or_create_inode(&uid);
+        
+        // Track by link_id for event processing
+        self.link_id_to_inode.insert(link_id, inode);
         
         self.nodes.insert(inode, node);
         
@@ -828,13 +1156,19 @@ impl ProtonDriveFsInner {
 
 /// The Proton Drive FUSE filesystem.
 pub struct ProtonDriveFs {
-    inner: RwLock<ProtonDriveFsInner>,
+    inner: Arc<RwLock<ProtonDriveFsInner>>,
     client: Arc<RwLock<Option<ProtonDriveClient>>>,
     disk_cache: DiskCache,
     /// Multi-progress bar for concurrent downloads
     multi_progress: Arc<MultiProgress>,
     /// Ignore pattern manager
     ignore_manager: RwLock<IgnoreManager>,
+    /// Background upload queue sender
+    upload_tx: mpsc::UnboundedSender<UploadTask>,
+    /// Upload queue receiver (moved to background task on init)
+    upload_rx: RwLock<Option<mpsc::UnboundedReceiver<UploadTask>>>,
+    /// Persistent upload store for resume capability
+    pending_upload_store: Arc<PendingUploadStore>,
 }
 
 impl ProtonDriveFs {
@@ -843,35 +1177,809 @@ impl ProtonDriveFs {
         let ignore_manager = IgnoreManager::new()?;
         tracing::info!("Loaded global .pdclignore from {:?}", ignore_manager.global_ignore_path());
         
+        let (upload_tx, upload_rx) = mpsc::unbounded_channel();
+        let pending_upload_store = Arc::new(PendingUploadStore::new()?);
+        
         Ok(Self {
-            inner: RwLock::new(ProtonDriveFsInner::new()),
+            inner: Arc::new(RwLock::new(ProtonDriveFsInner::new())),
             client: Arc::new(RwLock::new(None)),
             disk_cache: DiskCache::new(MAX_DISK_CACHE_SIZE)?,
             multi_progress,
             ignore_manager: RwLock::new(ignore_manager),
+            upload_tx,
+            upload_rx: RwLock::new(Some(upload_rx)),
+            pending_upload_store,
         })
     }
 
     /// Initialize with a ProtonDriveClient.
     pub async fn init_with_client(&self, client: ProtonDriveClient) -> Result<()> {
         // Get the root "My Files" folder
-        let root_folder = client.get_my_files_folder().await
+        let my_files_folder = client.get_my_files_folder().await
             .context("Failed to get My Files folder")?;
 
         let mut inner = self.inner.write().await;
         
-        // Store volume ID and root UID
-        inner.volume_id = Some(root_folder.base.uid.volume_id.clone());
-        inner.root_uid = Some(root_folder.base.uid.clone());
+        // Store volume ID and root UID (pointing to My Files)
+        inner.volume_id = Some(my_files_folder.base.uid.volume_id.clone());
+        inner.root_uid = Some(my_files_folder.base.uid.clone());
         
-        // Create root node
-        let root_node = FsNode::Folder(ProtonFolderMetadata::from_folder_node(&root_folder, false));
-        inner.uid_to_inode.insert(root_folder.base.uid.to_string(), ROOT_INODE);
-        inner.nodes.insert(ROOT_INODE, root_node);
-        inner.children.insert(ROOT_INODE, Vec::new());
+        // Create virtual root folder (inode 1)
+        // This is a synthetic container that holds MyFiles, Computers, Photos
+        let now = Utc::now();
+        let dummy_volume = VolumeId::new("_virtual_".to_string());
+        
+        let virtual_root = FsNode::Folder(ProtonFolderMetadata {
+            uid: NodeUid::new(dummy_volume.clone(), LinkId::new("_root_".to_string())),
+            parent_uid: None,
+            name: String::new(), // Root has no name
+            creation_time: now,
+            trash_time: None,
+            author_email: None,
+            name_author_email: None,
+            owner_email: None,
+            owner_organisation: None,
+            is_album: false,
+        });
+        inner.nodes.insert(ROOT_INODE, virtual_root);
+        inner.children.insert(ROOT_INODE, vec![MYFILES_INODE, COMPUTERS_INODE, PHOTOS_INODE]);
+        inner.loaded_folders.insert(ROOT_INODE); // Virtual root is always "loaded"
+        
+        // Create "My Files" virtual folder (inode 2) - backed by actual Proton folder
+        let mut my_files_meta = ProtonFolderMetadata::from_folder_node(&my_files_folder, false);
+        my_files_meta.name = "My Files".to_string(); // Override the name to show "My Files"
+        let my_files_node = FsNode::Folder(my_files_meta);
+        inner.uid_to_inode.insert(my_files_folder.base.uid.to_string(), MYFILES_INODE);
+        inner.nodes.insert(MYFILES_INODE, my_files_node);
+        inner.children.insert(MYFILES_INODE, Vec::new());
+        
+        // Create "Computers" virtual folder (inode 3) - placeholder for future
+        let computers_folder = FsNode::Folder(ProtonFolderMetadata {
+            uid: NodeUid::new(dummy_volume.clone(), LinkId::new("_computers_".to_string())),
+            parent_uid: Some(NodeUid::new(dummy_volume.clone(), LinkId::new("_root_".to_string()))),
+            name: "Computers".to_string(),
+            creation_time: now,
+            trash_time: None,
+            author_email: None,
+            name_author_email: None,
+            owner_email: None,
+            owner_organisation: None,
+            is_album: false,
+        });
+        inner.nodes.insert(COMPUTERS_INODE, computers_folder);
+        inner.children.insert(COMPUTERS_INODE, Vec::new());
+        inner.loaded_folders.insert(COMPUTERS_INODE); // Empty for now
+        
+        // Create "Photos" virtual folder (inode 4) - placeholder for future
+        let photos_folder = FsNode::Folder(ProtonFolderMetadata {
+            uid: NodeUid::new(dummy_volume.clone(), LinkId::new("_photos_".to_string())),
+            parent_uid: Some(NodeUid::new(dummy_volume.clone(), LinkId::new("_root_".to_string()))),
+            name: "Photos".to_string(),
+            creation_time: now,
+            trash_time: None,
+            author_email: None,
+            name_author_email: None,
+            owner_email: None,
+            owner_organisation: None,
+            is_album: false,
+        });
+        inner.nodes.insert(PHOTOS_INODE, photos_folder);
+        inner.children.insert(PHOTOS_INODE, Vec::new());
+        inner.loaded_folders.insert(PHOTOS_INODE); // Empty for now
+        
+        drop(inner);
         
         // Store client
         *self.client.write().await = Some(client);
+        
+        // Spawn background upload processor
+        let upload_rx = self.upload_rx.write().await.take();
+        if let Some(mut rx) = upload_rx {
+            let client = self.client.clone();
+            let inner = self.inner.clone();
+            let multi_progress = self.multi_progress.clone();
+            let pending_upload_store = self.pending_upload_store.clone();
+            
+            tokio::spawn(async move {
+                // Allow up to 3 concurrent file uploads
+                const MAX_CONCURRENT_FILE_UPLOADS: usize = 3;
+                let upload_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FILE_UPLOADS));
+                
+                while let Some(task) = rx.recv().await {
+                    // Clone what we need for the spawned task
+                    let client = client.clone();
+                    let inner = inner.clone();
+                    let multi_progress = multi_progress.clone();
+                    let semaphore = upload_semaphore.clone();
+                    let pending_upload_store = pending_upload_store.clone();
+                    
+                    // Spawn each upload as a separate task so they run concurrently
+                    tokio::spawn(async move {
+                        // Acquire semaphore permit to limit concurrent uploads
+                        let _permit = semaphore.acquire().await.unwrap();
+                        
+                        let client_guard = client.read().await;
+                        let Some(client) = client_guard.as_ref() else {
+                            tracing::error!("No client for background upload");
+                            return;
+                        };
+                    
+                    match task {
+                        UploadTask::NewFile { inode, pending, persist_id } => {
+                            tracing::info!("Background uploading new file '{}' ({} bytes)", pending.name, pending.content.len());
+                            
+                            let pb = multi_progress.add(ProgressBar::new(pending.content.len() as u64));
+                            pb.set_style(
+                                ProgressStyle::default_bar()
+                                    .template("{spinner:.white.on_blue} {msg} [{bar:30.white.on_blue}] {bytes}/{total_bytes}")
+                                    .unwrap()
+                                    .progress_chars("█▓░")
+                            );
+                            pb.set_message(format!("↑ {}", pending.name));
+                            pb.enable_steady_tick(Duration::from_millis(100));
+                            
+                            let size = pending.content.len() as i64;
+                            
+                            // Helper to handle upload errors - shows appropriate message and removes on permanent error
+                            let handle_newfile_error = |persist_id: &Option<String>, name: &str, error: &anyhow::Error, pb: &ProgressBar| {
+                                let error_msg = error.to_string();
+                                if is_permanent_upload_error(&error_msg) {
+                                    pb.finish_with_message(format!("{} {} ({})", style("✗").red(), name, error_msg));
+                                    tracing::warn!(
+                                        "Permanent error for '{}': {} - removing from queue",
+                                        name, error_msg
+                                    );
+                                    if let Some(id) = persist_id {
+                                        if let Err(e) = pending_upload_store.remove(id) {
+                                            tracing::warn!("Failed to remove failed upload: {}", e);
+                                        }
+                                    }
+                                } else if is_transient_error(&error_msg) {
+                                    pb.finish_with_message(format!("{} {} (network error, will retry)", style("⚠").yellow(), name));
+                                    tracing::info!(
+                                        "Network error for '{}': {} - will retry on next mount",
+                                        name, error_msg
+                                    );
+                                    // Keep in persistent store for retry
+                                } else {
+                                    pb.finish_with_message(format!("{} {} (error, will retry)", style("⚠").yellow(), name));
+                                    tracing::warn!(
+                                        "Unknown error for '{}': {} - will retry on next mount",
+                                        name, error_msg
+                                    );
+                                    // Keep in persistent store for retry
+                                }
+                            };
+                            
+                            match client.get_file_uploader(
+                                pending.parent_uid.clone(),
+                                pending.name.clone(),
+                                pending.mime_type.clone(),
+                                size,
+                                Some(std::time::SystemTime::now()),
+                                None,
+                                None,
+                                true,
+                            ).await {
+                                Ok(uploader) => {
+                                    let pb_clone = pb.clone();
+                                    let content = pending.content.clone();
+                                    match uploader.upload_from_stream(
+                                        Box::new(std::io::Cursor::new(content.clone())),
+                                        Vec::new(),
+                                        Box::new(move |bytes, _total| {
+                                            pb_clone.set_position(bytes as u64);
+                                        }),
+                                    ).await {
+                                        Ok(node_uid) => {
+                                            pb.finish_and_clear();
+                                            
+                                            // Remove from persistence store on success
+                                            if let Some(id) = persist_id {
+                                                if let Err(e) = pending_upload_store.remove(&id) {
+                                                    tracing::warn!("Failed to remove persisted upload {}: {}", id, e);
+                                                }
+                                            }
+                                            
+                                            // Update node state
+                                            if let Ok(potential_node) = client.get_node(node_uid.clone()).await {
+                                                let mut inner = inner.write().await;
+                                                inner.pending_files.remove(&inode);
+                                                
+                                                match &potential_node {
+                                                    PotentialObject::Node(node) => {
+                                                        let fs_node = FsNode::from_node(node);
+                                                        inner.uid_to_inode.insert(node_uid.to_string(), inode);
+                                                        inner.nodes.insert(inode, fs_node);
+                                                        inner.file_cache.insert(inode, content);
+                                                    }
+                                                    PotentialObject::Degraded(degraded) => {
+                                                        let fs_node = FsNode::from_degraded(degraded);
+                                                        inner.uid_to_inode.insert(node_uid.to_string(), inode);
+                                                        inner.nodes.insert(inode, fs_node);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            handle_newfile_error(&persist_id, &pending.name, &e, &pb);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    handle_newfile_error(&persist_id, &pending.name, &e, &pb);
+                                }
+                            }
+                        }
+                        UploadTask::NewRevision { inode, revision_uid, filename, content, persist_id } => {
+                            tracing::info!("Background uploading revision for '{}' ({} bytes)", filename, content.len());
+                            
+                            let pb = multi_progress.add(ProgressBar::new(content.len() as u64));
+                            pb.set_style(
+                                ProgressStyle::default_bar()
+                                    .template("{spinner:.white.on_cyan} {msg} [{bar:30.white.on_cyan}] {bytes}/{total_bytes}")
+                                    .unwrap()
+                                    .progress_chars("█▓░")
+                            );
+                            pb.set_message(format!("↑ {}", filename));
+                            pb.enable_steady_tick(Duration::from_millis(100));
+                            
+                            let size = content.len() as i64;
+                            
+                            // Helper to handle upload errors - shows appropriate message and removes on permanent error
+                            let handle_revision_error = |persist_id: &Option<String>, name: &str, error: &anyhow::Error, pb: &ProgressBar| {
+                                let error_msg = error.to_string();
+                                if is_permanent_upload_error(&error_msg) {
+                                    pb.finish_with_message(format!("{} {} ({})", style("✗").red(), name, error_msg));
+                                    tracing::warn!(
+                                        "Permanent error for revision '{}': {} - removing from queue",
+                                        name, error_msg
+                                    );
+                                    if let Some(id) = persist_id {
+                                        if let Err(e) = pending_upload_store.remove(id) {
+                                            tracing::warn!("Failed to remove failed upload: {}", e);
+                                        }
+                                    }
+                                } else if is_transient_error(&error_msg) {
+                                    pb.finish_with_message(format!("{} {} (network error, will retry)", style("⚠").yellow(), name));
+                                    tracing::info!(
+                                        "Network error for revision '{}': {} - will retry on next mount",
+                                        name, error_msg
+                                    );
+                                    // Keep in persistent store for retry
+                                } else {
+                                    pb.finish_with_message(format!("{} {} (error, will retry)", style("⚠").yellow(), name));
+                                    tracing::warn!(
+                                        "Unknown error for revision '{}': {} - will retry on next mount",
+                                        name, error_msg
+                                    );
+                                    // Keep in persistent store for retry
+                                }
+                            };
+                            
+                            match client.get_file_revision_uploader(
+                                revision_uid,
+                                size,
+                                Some(std::time::SystemTime::now()),
+                                None,
+                                None,
+                            ).await {
+                                Ok(uploader) => {
+                                    let pb_clone = pb.clone();
+                                    let content_clone = content.clone();
+                                    match uploader.upload_from_stream(
+                                        Box::new(std::io::Cursor::new(content_clone)),
+                                        Vec::new(),
+                                        Box::new(move |bytes, _total| {
+                                            pb_clone.set_position(bytes as u64);
+                                        }),
+                                    ).await {
+                                        Ok(new_node_uid) => {
+                                            pb.finish_and_clear();
+                                            
+                                            // Remove from persistence store on success
+                                            if let Some(id) = persist_id {
+                                                if let Err(e) = pending_upload_store.remove(&id) {
+                                                    tracing::warn!("Failed to remove persisted upload {}: {}", id, e);
+                                                }
+                                            }
+                                            
+                                            // Update node state
+                                            if let Ok(potential_node) = client.get_node(new_node_uid).await {
+                                                let mut inner = inner.write().await;
+                                                match &potential_node {
+                                                    PotentialObject::Node(node) => {
+                                                        let fs_node = FsNode::from_node(node);
+                                                        inner.nodes.insert(inode, fs_node);
+                                                        inner.file_cache.insert(inode, content);
+                                                    }
+                                                    PotentialObject::Degraded(degraded) => {
+                                                        let fs_node = FsNode::from_degraded(degraded);
+                                                        inner.nodes.insert(inode, fs_node);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            handle_revision_error(&persist_id, &filename, &e, &pb);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    handle_revision_error(&persist_id, &filename, &e, &pb);
+                                }
+                            }
+                        }
+                        UploadTask::ResumePersisted(mut persisted) => {
+                            // Check if we've exceeded max retries
+                            if persisted.retry_count() >= MAX_UPLOAD_RETRIES {
+                                tracing::warn!(
+                                    "Giving up on upload '{}' after {} retries",
+                                    persisted.name(),
+                                    persisted.retry_count()
+                                );
+                                if let Err(e) = pending_upload_store.remove(persisted.id()) {
+                                    tracing::warn!("Failed to remove failed upload: {}", e);
+                                }
+                                return;
+                            }
+                            
+                            // Check if upload is stale (older than 24 hours)
+                            if persisted.is_stale() {
+                                tracing::warn!(
+                                    "Removing stale upload '{}' (created more than 24 hours ago)",
+                                    persisted.name()
+                                );
+                                if let Err(e) = pending_upload_store.remove(persisted.id()) {
+                                    tracing::warn!("Failed to remove stale upload: {}", e);
+                                }
+                                return;
+                            }
+                            
+                            // Resume a persisted upload from a previous session
+                            let (name, content_len): (String, usize) = match &persisted {
+                                PersistentUpload::NewFile { name, content, .. } => {
+                                    (name.clone(), content.len())
+                                }
+                                PersistentUpload::NewRevision { filename, content, .. } => {
+                                    (filename.clone(), content.len())
+                                }
+                            };
+                            
+                            let retry_info = if persisted.retry_count() > 0 {
+                                format!(" (retry {})", persisted.retry_count())
+                            } else {
+                                String::new()
+                            };
+                            tracing::info!("Resuming persisted upload for '{}' ({} bytes){}", name, content_len, retry_info);
+                            
+                            let pb = multi_progress.add(ProgressBar::new(content_len as u64));
+                            pb.set_style(
+                                ProgressStyle::default_bar()
+                                    .template("{spinner:.white.on_yellow} {msg} [{bar:30.white.on_yellow}] {bytes}/{total_bytes}")
+                                    .unwrap()
+                                    .progress_chars("█▓░")
+                            );
+                            pb.set_message(format!("⟳ {}", name));
+                            pb.enable_steady_tick(Duration::from_millis(100));
+                            
+                            // Helper to handle upload failure
+                            let handle_upload_error = |id: &str, name: &str, error: &anyhow::Error, persisted: &mut PersistentUpload, pb: &ProgressBar| {
+                                let error_msg = error.to_string();
+                                
+                                // Check if this is a permanent error
+                                if is_permanent_upload_error(&error_msg) {
+                                    pb.finish_with_message(format!("{} {} ({})", style("✗").red(), name, error_msg));
+                                    tracing::warn!(
+                                        "Permanent error for '{}': {} - removing from queue",
+                                        name, error_msg
+                                    );
+                                    if let Err(e) = pending_upload_store.remove(id) {
+                                        tracing::warn!("Failed to remove failed upload: {}", e);
+                                    }
+                                } else if is_transient_error(&error_msg) {
+                                    // Network/connection error - will retry
+                                    persisted.increment_retry();
+                                    pb.finish_with_message(format!(
+                                        "{} {} (network error, retry {}/{})", 
+                                        style("⚠").yellow(), name, persisted.retry_count(), MAX_UPLOAD_RETRIES
+                                    ));
+                                    tracing::info!(
+                                        "Network error for '{}': {} - will retry (attempt {}/{})",
+                                        name, error_msg, persisted.retry_count(), MAX_UPLOAD_RETRIES
+                                    );
+                                    if let Err(e) = pending_upload_store.save(persisted) {
+                                        tracing::warn!("Failed to update retry count: {}", e);
+                                    }
+                                } else {
+                                    // Unknown error - treat as transient but warn
+                                    persisted.increment_retry();
+                                    pb.finish_with_message(format!(
+                                        "{} {} (error, retry {}/{})", 
+                                        style("⚠").yellow(), name, persisted.retry_count(), MAX_UPLOAD_RETRIES
+                                    ));
+                                    tracing::warn!(
+                                        "Unknown error for '{}': {} - will retry (attempt {}/{})",
+                                        name, error_msg, persisted.retry_count(), MAX_UPLOAD_RETRIES
+                                    );
+                                    if let Err(e) = pending_upload_store.save(persisted) {
+                                        tracing::warn!("Failed to update retry count: {}", e);
+                                    }
+                                }
+                            };
+                            
+                            match persisted.clone() {
+                                PersistentUpload::NewFile { id, parent_uid, name, mime_type, content, .. } => {
+                                    let size = content.len() as i64;
+                                    match client.get_file_uploader(
+                                        parent_uid,
+                                        name.clone(),
+                                        mime_type,
+                                        size,
+                                        Some(std::time::SystemTime::now()),
+                                        None,
+                                        None,
+                                        true,
+                                    ).await {
+                                        Ok(uploader) => {
+                                            let pb_clone = pb.clone();
+                                            match uploader.upload_from_stream(
+                                                Box::new(std::io::Cursor::new(content)),
+                                                Vec::new(),
+                                                Box::new(move |bytes, _total| {
+                                                    pb_clone.set_position(bytes as u64);
+                                                }),
+                                            ).await {
+                                                Ok(_node_uid) => {
+                                                    pb.finish_and_clear();
+                                                    // Remove from persistence store on success
+                                                    if let Err(e) = pending_upload_store.remove(&id) {
+                                                        tracing::warn!("Failed to remove persisted upload {}: {}", id, e);
+                                                    }
+                                                    tracing::info!("Successfully resumed upload for '{}'", name);
+                                                }
+                                                Err(e) => {
+                                                    handle_upload_error(&id, &name, &e, &mut persisted, &pb);
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            handle_upload_error(&id, &name, &e, &mut persisted, &pb);
+                                        }
+                                    }
+                                }
+                                PersistentUpload::NewRevision { id, revision_uid, filename, content, .. } => {
+                                    let size = content.len() as i64;
+                                    match client.get_file_revision_uploader(
+                                        revision_uid,
+                                        size,
+                                        Some(std::time::SystemTime::now()),
+                                        None,
+                                        None,
+                                    ).await {
+                                        Ok(uploader) => {
+                                            let pb_clone = pb.clone();
+                                            match uploader.upload_from_stream(
+                                                Box::new(std::io::Cursor::new(content)),
+                                                Vec::new(),
+                                                Box::new(move |bytes, _total| {
+                                                    pb_clone.set_position(bytes as u64);
+                                                }),
+                                            ).await {
+                                                Ok(_new_node_uid) => {
+                                                    pb.finish_and_clear();
+                                                    // Remove from persistence store on success
+                                                    if let Err(e) = pending_upload_store.remove(&id) {
+                                                        tracing::warn!("Failed to remove persisted upload {}: {}", id, e);
+                                                    }
+                                                    tracing::info!("Successfully resumed revision upload for '{}'", filename);
+                                                }
+                                                Err(e) => {
+                                                    handle_upload_error(&id, &filename, &e, &mut persisted, &pb);
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            handle_upload_error(&id, &filename, &e, &mut persisted, &pb);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    }); // End of spawned upload task
+                }
+            });
+        }
+        
+        // Load and queue any pending uploads from previous sessions
+        match self.pending_upload_store.load_all() {
+            Ok(pending_uploads) => {
+                if !pending_uploads.is_empty() {
+                    tracing::info!("Found {} pending uploads from previous session", pending_uploads.len());
+                    for persisted in pending_uploads {
+                        // Skip stale or max-retried uploads (they'll be cleaned during actual processing)
+                        if persisted.is_stale() {
+                            tracing::warn!("Skipping stale upload '{}' (will be cleaned up)", persisted.name());
+                            continue;
+                        }
+                        if persisted.retry_count() >= MAX_UPLOAD_RETRIES {
+                            tracing::warn!("Skipping upload '{}' - exceeded max retries (will be cleaned up)", persisted.name());
+                            continue;
+                        }
+                        
+                        tracing::info!("Queueing resumed upload for '{}' (retry {})", persisted.name(), persisted.retry_count());
+                        if let Err(e) = self.upload_tx.send(UploadTask::ResumePersisted(persisted)) {
+                            tracing::error!("Failed to queue resumed upload: {}", e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load pending uploads: {}", e);
+            }
+        }
+        
+        // Start background event poller
+        {
+            let volume_id = {
+                let inner = self.inner.read().await;
+                inner.volume_id.clone()
+            };
+            
+            if let Some(volume_id) = volume_id {
+                let client = self.client.clone();
+                let inner = self.inner.clone();
+                
+                // Get the initial event ID
+                {
+                    let client_guard = client.read().await;
+                    if let Some(client) = client_guard.as_ref() {
+                        match client.get_volume_latest_event_id(volume_id.clone()).await {
+                            Ok(event_id) => {
+                                tracing::info!("Starting event polling from event ID: {}", event_id);
+                                let mut inner_guard = inner.write().await;
+                                inner_guard.last_event_id = Some(event_id);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to get latest event ID: {}", e);
+                            }
+                        }
+                    }
+                }
+                
+                tokio::spawn(async move {
+                    // Small delay before first poll to let mount complete
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tracing::info!("Event poller started, polling every {} seconds", EVENT_POLL_INTERVAL.as_secs());
+                    
+                    loop {
+                        let event_id = {
+                            let inner_guard = inner.read().await;
+                            inner_guard.last_event_id.clone()
+                        };
+                        
+                        let Some(last_event_id) = event_id else {
+                            tokio::time::sleep(EVENT_POLL_INTERVAL).await;
+                            continue;
+                        };
+                        
+                        let client_guard = client.read().await;
+                        let Some(client) = client_guard.as_ref() else {
+                            tokio::time::sleep(EVENT_POLL_INTERVAL).await;
+                            continue;
+                        };
+                        
+                        // Poll for events
+                        match client.poll_volume_events(volume_id.clone(), &last_event_id).await {
+                            Ok(response) => {
+                                let event_count = response.events.len();
+                                if event_count > 0 {
+                                    tracing::info!("Received {} events", event_count);
+                                }
+                                
+                                // Check if full refresh needed
+                                if response.refresh {
+                                    tracing::warn!("Server requested full refresh - clearing cache");
+                                    let mut inner_guard = inner.write().await;
+                                    // Clear loaded folders to force re-fetch
+                                    inner_guard.loaded_folders.clear();
+                                    // Clear file cache
+                                    inner_guard.file_cache.clear();
+                                    inner_guard.last_event_id = Some(response.event_id);
+                                    continue;
+                                }
+                                
+                                // Process each event
+                                for event in &response.events {
+                                    if let Err(e) = Self::process_event(&inner, client, event).await {
+                                        tracing::warn!("Failed to process event {}: {}", event.event_id, e);
+                                    }
+                                }
+                                
+                                // Update cursor
+                                {
+                                    let mut inner_guard = inner.write().await;
+                                    inner_guard.last_event_id = Some(response.event_id.clone());
+                                }
+                                
+                                // If more events available, poll immediately
+                                if response.more {
+                                    tracing::debug!("More events available, polling immediately");
+                                    continue;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to poll events: {}", e);
+                            }
+                        }
+                        
+                        // Wait before next poll
+                        drop(client_guard);
+                        tokio::time::sleep(EVENT_POLL_INTERVAL).await;
+                    }
+                });
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Process a single volume event
+    async fn process_event(
+        inner: &Arc<RwLock<ProtonDriveFsInner>>,
+        client: &ProtonDriveClient,
+        event: &VolumeEventDto,
+    ) -> Result<()> {
+        let link_id = event.link.link_id.raw();
+        let event_type = event.event_type();
+        tracing::info!("Processing event {:?} for link {}", event_type, link_id);
+        
+        match event_type {
+            Some(VolumeEventType::Create) => {
+                // New node created - fetch and add it immediately
+                let volume_id = {
+                    let inner_guard = inner.read().await;
+                    inner_guard.volume_id.clone()
+                };
+                
+                let Some(volume_id) = volume_id else {
+                    tracing::warn!("No volume_id available for Create event");
+                    return Ok(());
+                };
+                
+                // Fetch the new node
+                let node_uid = NodeUid::new(volume_id, event.link.link_id.clone());
+                match client.get_node(node_uid.clone()).await {
+                    Ok(potential) => {
+                        let fs_node = match &potential {
+                            PotentialObject::Node(node) => FsNode::from_node(node),
+                            PotentialObject::Degraded(degraded) => FsNode::from_degraded(degraded),
+                        };
+                        
+                        let node_name = fs_node.name().to_string();
+                        
+                        let mut inner_guard = inner.write().await;
+                        
+                        // Find or create inode for this node
+                        let inode = inner_guard.get_or_create_inode(&node_uid);
+                        
+                        // Add link_id mapping
+                        inner_guard.link_id_to_inode.insert(link_id.to_string(), inode);
+                        
+                        // Add node to nodes map
+                        inner_guard.nodes.insert(inode, fs_node);
+                        
+                        // Add to parent's children list
+                        if let Some(parent_link_id) = &event.link.parent_link_id {
+                            if let Some(&parent_inode) = inner_guard.link_id_to_inode.get(parent_link_id.raw()) {
+                                if let Some(children) = inner_guard.children.get_mut(&parent_inode) {
+                                    if !children.contains(&inode) {
+                                        children.push(inode);
+                                        tracing::info!("Added new node '{}' (inode {}) to parent {}", node_name, inode, parent_inode);
+                                    }
+                                } else {
+                                    // Parent children list doesn't exist yet
+                                    inner_guard.children.insert(parent_inode, vec![inode]);
+                                    tracing::info!("Created children list for parent {} with new node '{}' (inode {})", parent_inode, node_name, inode);
+                                }
+                            } else {
+                                // Parent not in cache yet - just invalidate so it gets loaded
+                                tracing::debug!("Parent folder not in cache, node will appear when parent is accessed");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to fetch new node {}: {}", link_id, e);
+                        // Fallback: invalidate parent folder
+                        if let Some(parent_link_id) = &event.link.parent_link_id {
+                            let mut inner_guard = inner.write().await;
+                            if let Some(&parent_inode) = inner_guard.link_id_to_inode.get(parent_link_id.raw()) {
+                                inner_guard.loaded_folders.remove(&parent_inode);
+                            }
+                        }
+                    }
+                }
+            }
+            Some(VolumeEventType::UpdateMetadata) | Some(VolumeEventType::UpdateContent) => {
+                // Node updated - refresh if we have it cached
+                let existing_inode = {
+                    let inner_guard = inner.read().await;
+                    inner_guard.link_id_to_inode.get(link_id).copied()
+                };
+                
+                if let Some(inode) = existing_inode {
+                    // Get volume_id from inner
+                    let volume_id = {
+                        let inner_guard = inner.read().await;
+                        inner_guard.volume_id.clone()
+                    };
+                    
+                    if let Some(volume_id) = volume_id {
+                        // Fetch fresh node data
+                        let node_uid = NodeUid::new(volume_id, event.link.link_id.clone());
+                        match client.get_node(node_uid.clone()).await {
+                            Ok(potential) => {
+                                let fs_node = match &potential {
+                                    PotentialObject::Node(node) => FsNode::from_node(node),
+                                    PotentialObject::Degraded(degraded) => FsNode::from_degraded(degraded),
+                                };
+                                
+                                let node_name = fs_node.name().to_string();
+                                let is_content_update = matches!(event_type, Some(VolumeEventType::UpdateContent));
+                                
+                                let mut inner_guard = inner.write().await;
+                                inner_guard.nodes.insert(inode, fs_node);
+                                
+                                // Clear file content cache for content updates
+                                if is_content_update {
+                                    inner_guard.file_cache.remove(&inode);
+                                    tracing::info!("Updated content for '{}' (inode {})", node_name, inode);
+                                } else {
+                                    tracing::info!("Updated metadata for '{}' (inode {})", node_name, inode);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to fetch updated node {}: {}", link_id, e);
+                            }
+                        }
+                    }
+                } else {
+                    tracing::debug!("Update event for unknown node {} - ignoring", link_id);
+                }
+            }
+            Some(VolumeEventType::Delete) => {
+                // Node deleted or trashed
+                let mut inner_guard = inner.write().await;
+                if let Some(&inode) = inner_guard.link_id_to_inode.get(link_id) {
+                    // Get the name before removing
+                    let node_name = inner_guard.nodes.get(&inode)
+                        .map(|n| n.name().to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    
+                    // Remove from nodes
+                    inner_guard.nodes.remove(&inode);
+                    inner_guard.file_cache.remove(&inode);
+                    inner_guard.children.remove(&inode);
+                    
+                    // Remove from parent's children list
+                    if let Some(parent_link_id) = &event.link.parent_link_id {
+                        if let Some(&parent_inode) = inner_guard.link_id_to_inode.get(parent_link_id.raw()) {
+                            if let Some(siblings) = inner_guard.children.get_mut(&parent_inode) {
+                                siblings.retain(|&i| i != inode);
+                            }
+                        }
+                    }
+                    
+                    tracing::info!("Removed '{}' (inode {}) - deleted/trashed", node_name, inode);
+                } else {
+                    tracing::debug!("Delete event for unknown node {} - ignoring", link_id);
+                }
+            }
+            None => {
+                tracing::warn!("Unknown event type '{}' for link {}", event.event_type, link_id);
+            }
+        }
         
         Ok(())
     }
@@ -972,6 +2080,16 @@ impl ProtonDriveFs {
     /// Get cached file content, downloading if necessary.
     /// Uses a two-tier cache: in-memory (fast, session-only) and disk (slower, persistent).
     async fn get_file_content(&self, inode: u64) -> Result<Vec<u8>> {
+        // First check if this is a pending file (created locally, not yet uploaded)
+        // These have fake revision UIDs like "pending-XXX~pending" and cannot be downloaded
+        {
+            let inner = self.inner.read().await;
+            if let Some(pending) = inner.pending_files.get(&inode) {
+                tracing::debug!("Returning buffered content for pending file inode {} ({} bytes)", inode, pending.content.len());
+                return Ok(pending.content.clone());
+            }
+        }
+        
         // Get file metadata to get revision UID and filename
         let (revision_uid, filename, file_size) = {
             let inner = self.inner.read().await;
@@ -980,6 +2098,12 @@ impl ProtonDriveFs {
                 _ => return Err(anyhow::anyhow!("Not a file or degraded node")),
             }
         };
+        
+        // Check if this has a pending revision UID (shouldn't reach here, but safety check)
+        if revision_uid.revision_id.raw().starts_with("pending-") {
+            tracing::warn!("File inode {} has pending revision UID but no pending content", inode);
+            return Ok(Vec::new());
+        }
 
         // Skip downloading lock files - these are LibreOffice/OpenOffice temp files
         // that should not be auto-fetched by file managers
@@ -1044,8 +2168,10 @@ impl ProtonDriveFs {
         pb.enable_steady_tick(Duration::from_millis(100));
 
         // Create a file downloader
+        tracing::debug!("Creating file downloader for revision_uid={}", revision_uid);
         let downloader = client.get_file_downloader(revision_uid.clone()).await
             .context("Failed to create file downloader")?;
+        tracing::debug!("File downloader created successfully");
 
         // Download to a shared buffer using Arc<Mutex<Vec<u8>>>
         let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1080,12 +2206,26 @@ impl ProtonDriveFs {
         drop(client_guard);
         
         // Wait for download to complete
-        controller.completion.await
-            .context("Download task failed")?
+        let download_result = controller.completion.await;
+        match &download_result {
+            Ok(Ok(())) => {},
+            Ok(Err(e)) => {
+                let error_msg = e.to_string();
+                let (error_type, style_fn) = classify_download_error(&error_msg);
+                tracing::error!("Download failed for inode {}: {:?}", inode, e);
+                pb.abandon_with_message(format!("{} {} ({})", style_fn, filename, error_type));
+            }
+            Err(e) => {
+                tracing::error!("Download task panicked for inode {}: {:?}", inode, e);
+                pb.abandon_with_message(format!("{} {} (task panic)", style("✗").red(), filename));
+            }
+        }
+        download_result
+            .context("Download task panicked")?
             .context("Download failed")?;
 
         // Finish progress bar
-        pb.finish_with_message(format!("{} {}", style("✓").green(), filename));
+        pb.finish_and_clear();
 
         // Extract the content
         let content = Arc::try_unwrap(buffer)
@@ -1213,7 +2353,7 @@ impl ProtonDriveFs {
             }),
         ).await?;
 
-        pb.finish_with_message(format!("{} {}", style("✓").green(), pending.name));
+        pb.finish_and_clear();
 
         // Fetch the uploaded node to get full metadata
         let potential_node = client.get_node(node_uid.clone()).await?;
@@ -1300,7 +2440,7 @@ impl ProtonDriveFs {
                 }),
             ).await?;
 
-            pb.finish_with_message(format!("{} {}", style("✓").green(), filename));
+            pb.finish_and_clear();
 
             // Update the node with new revision info
             let potential_node = client.get_node(new_node_uid).await?;
@@ -1324,6 +2464,94 @@ impl ProtonDriveFs {
             let mut inner = self.inner.write().await;
             if let Some(buf) = inner.write_buffers.get_mut(&fh) {
                 buf.dirty = false;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Queue a write buffer for background upload (non-blocking).
+    /// Returns immediately after queuing, upload happens asynchronously.
+    async fn queue_write_buffer(&self, fh: u64) -> Result<()> {
+        let (inode, content, is_new) = {
+            let inner = self.inner.read().await;
+            match inner.write_buffers.get(&fh) {
+                Some(buf) if buf.dirty => (buf.inode, buf.content.clone(), buf.is_new),
+                _ => return Ok(()), // Not dirty, nothing to do
+            }
+        };
+
+        // Mark buffer as clean immediately (data is now "committed" to upload queue)
+        {
+            let mut inner = self.inner.write().await;
+            if let Some(buf) = inner.write_buffers.get_mut(&fh) {
+                buf.dirty = false;
+            }
+            // Also update the cache so subsequent reads see the new content
+            inner.file_cache.insert(inode, content.clone());
+        }
+
+        if is_new {
+            // Queue upload of new file
+            let pending = {
+                let inner = self.inner.read().await;
+                inner.pending_files.get(&inode).cloned()
+            };
+            
+            if let Some(pending) = pending {
+                // Persist the upload for resume capability
+                let persist_id = PendingUploadStore::generate_id();
+                let persist_upload = PersistentUpload::NewFile {
+                    id: persist_id.clone(),
+                    parent_uid: pending.parent_uid.clone(),
+                    name: pending.name.clone(),
+                    mime_type: pending.mime_type.clone(),
+                    content: pending.content.clone(),
+                    retry_count: 0,
+                    created_at: chrono::Utc::now().timestamp(),
+                };
+                if let Err(e) = self.pending_upload_store.save(&persist_upload) {
+                    tracing::warn!("Failed to persist upload: {}", e);
+                }
+                
+                let _ = self.upload_tx.send(UploadTask::NewFile { 
+                    inode, 
+                    pending,
+                    persist_id: Some(persist_id),
+                });
+                tracing::info!("Queued new file upload for inode {}", inode);
+            }
+        } else {
+            // Queue revision upload
+            let revision_uid = self.get_revision_uid(inode).await;
+            let filename = {
+                let inner = self.inner.read().await;
+                inner.nodes.get(&inode).map(|n| n.name().to_string()).unwrap_or_default()
+            };
+            
+            if let Some(revision_uid) = revision_uid {
+                // Persist the upload for resume capability
+                let persist_id = PendingUploadStore::generate_id();
+                let persist_upload = PersistentUpload::NewRevision {
+                    id: persist_id.clone(),
+                    revision_uid: revision_uid.clone(),
+                    filename: filename.clone(),
+                    content: content.clone(),
+                    retry_count: 0,
+                    created_at: chrono::Utc::now().timestamp(),
+                };
+                if let Err(e) = self.pending_upload_store.save(&persist_upload) {
+                    tracing::warn!("Failed to persist upload: {}", e);
+                }
+                
+                let _ = self.upload_tx.send(UploadTask::NewRevision {
+                    inode,
+                    revision_uid,
+                    filename: filename.clone(),
+                    content,
+                    persist_id: Some(persist_id),
+                });
+                tracing::info!("Queued revision upload for '{}' (inode {})", filename, inode);
             }
         }
 
@@ -1520,6 +2748,12 @@ impl Filesystem for ProtonDriveFs {
                 inode, filename, proc_name, uses_noatime, is_write_mode
             );
             
+            // Check if this is a pending file (created locally, not yet uploaded)
+            let is_pending = {
+                let inner = self.inner.read().await;
+                inner.pending_files.contains_key(&inode)
+            };
+            
             // Pre-download the file content during open() to ensure correct file size.
             // This is critical because:
             // 1. getattr returns "claimed" size from Proton metadata (may be wrong)
@@ -1527,11 +2761,17 @@ impl Filesystem for ProtonDriveFs {
             // 3. They then only read that many bytes
             // 4. If claimed size < actual size, file appears truncated/corrupt
             // By downloading here, we update metadata with the real size before any reads.
-            let existing_content = if !is_truncate {
+            // SKIP this for pending files - they have no remote content to download.
+            let existing_content = if is_pending {
+                // Pending file - use buffered content, no download needed
+                let inner = self.inner.read().await;
+                inner.pending_files.get(&inode)
+                    .map(|p| p.content.clone())
+            } else if !is_truncate {
                 match self.get_file_content(inode).await {
                     Ok(content) => Some(content),
                     Err(e) => {
-                        tracing::error!("Failed to pre-download file during open: {}", e);
+                        tracing::error!("Failed to pre-download file during open: {:?}", e);
                         return Err(Errno::from(libc::EIO));
                     }
                 }
@@ -1581,6 +2821,22 @@ impl Filesystem for ProtonDriveFs {
     ) -> fuse3::Result<ReplyData> {
         tracing::info!("FUSE read: inode={}, fh={}, offset={}, size={}, uid={}, gid={}, pid={}",
             inode, fh, offset, size, req.uid, req.gid, req.pid);
+        
+        // First check if this is a pending file (created locally, not yet uploaded)
+        {
+            let inner = self.inner.read().await;
+            if let Some(pending) = inner.pending_files.get(&inode) {
+                let content = &pending.content;
+                let offset = offset as usize;
+                let size = size as usize;
+                if offset >= content.len() {
+                    return Ok(ReplyData { data: Bytes::new() });
+                }
+                let end = std::cmp::min(offset + size, content.len());
+                tracing::debug!("Returning {} bytes from pending file (inode={})", end - offset, inode);
+                return Ok(ReplyData { data: Bytes::copy_from_slice(&content[offset..end]) });
+            }
+        }
         
         // Check if this is a thumbnailing request (opened with O_NOATIME)
         let is_thumbnailing = self.inner.read().await.noatime_handles.contains(&fh);
@@ -1838,9 +3094,9 @@ impl Filesystem for ProtonDriveFs {
         tracing::debug!("FUSE release: inode={}, fh={}, flags={:#x}, flush={}, uid={}, gid={}, pid={}",
             inode, fh, flags, flush, req.uid, req.gid, req.pid);
         
-        // Flush any pending writes
-        if let Err(e) = self.upload_write_buffer(fh).await {
-            tracing::error!("Failed to flush writes on release: {}", e);
+        // Queue any pending writes for background upload (non-blocking)
+        if let Err(e) = self.queue_write_buffer(fh).await {
+            tracing::error!("Failed to queue writes on release: {}", e);
             // Don't return error - release must succeed
         }
         
@@ -2357,10 +3613,11 @@ impl Filesystem for ProtonDriveFs {
         tracing::debug!("FUSE flush: inode={}, fh={}, uid={}, gid={}, pid={}",
             inode, fh, req.uid, req.gid, req.pid);
 
-        // Upload any pending writes
-        self.upload_write_buffer(fh).await
+        // Queue upload for background processing (non-blocking)
+        // The file is considered "saved" once it's in the upload queue
+        self.queue_write_buffer(fh).await
             .map_err(|e| {
-                tracing::error!("Failed to flush writes: {}", e);
+                tracing::error!("Failed to queue writes: {}", e);
                 Errno::from(libc::EIO)
             })?;
 
@@ -2377,7 +3634,7 @@ impl Filesystem for ProtonDriveFs {
         tracing::debug!("FUSE fsync: inode={}, fh={}, uid={}, gid={}, pid={}",
             inode, fh, req.uid, req.gid, req.pid);
 
-        // Upload any pending writes
+        // fsync should wait for upload to complete (blocking for durability)
         self.upload_write_buffer(fh).await
             .map_err(|e| {
                 tracing::error!("Failed to sync writes: {}", e);
@@ -2653,6 +3910,89 @@ pub fn clear_cache() -> Result<()> {
         style("✓").green().bold(),
         file_count,
         humanize_size(total_size)
+    ));
+    
+    Ok(())
+}
+
+/// Clear all pending uploads from the queue.
+/// 
+/// This removes all uploads that were waiting to be retried,
+/// including those that failed with errors.
+pub fn clear_pending_uploads() -> Result<()> {
+    use console::style;
+    use indicatif::{ProgressBar, ProgressStyle};
+    
+    let pending_dir = dirs::config_dir()
+        .context("Could not determine config directory")?
+        .join("pdcli")
+        .join("pending_uploads");
+    
+    if !pending_dir.exists() {
+        println!("{}", style("No pending uploads.").yellow());
+        return Ok(());
+    }
+    
+    // Count files and gather info
+    let mut file_count = 0u64;
+    let mut upload_names: Vec<String> = Vec::new();
+    
+    if let Ok(entries) = std::fs::read_dir(&pending_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "json").unwrap_or(false) {
+                if let Ok(metadata) = entry.metadata() {
+                    if metadata.is_file() {
+                        file_count += 1;
+                        
+                        // Try to read the file name from the JSON
+                        if let Ok(data) = std::fs::read(&path) {
+                            if let Ok(upload) = serde_json::from_slice::<PersistentUpload>(&data) {
+                                upload_names.push(upload.name().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    if file_count == 0 {
+        println!("{}", style("No pending uploads.").yellow());
+        return Ok(());
+    }
+    
+    // Show what will be cleared
+    println!();
+    println!("{}", style("Pending uploads to be cleared:").bold());
+    for name in &upload_names {
+        println!("  {} {}", style("•").dim(), name);
+    }
+    println!();
+    
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} {msg}")
+            .unwrap()
+    );
+    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+    spinner.set_message(format!("Clearing {} pending uploads...", file_count));
+    
+    // Remove all files in pending uploads directory
+    if let Ok(entries) = std::fs::read_dir(&pending_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "json").unwrap_or(false) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    
+    spinner.finish_with_message(format!(
+        "{} Cleared {} pending uploads",
+        style("✓").green().bold(),
+        file_count
     ));
     
     Ok(())

@@ -1,6 +1,7 @@
 use crate::api::block::BlockUploadPreparationRequest;
 use crate::api::file::thumbnail::ThumbnailCreationRequest;
 use crate::author::Author;
+use crate::block::upload::BlockUploadResult;
 use crate::client::ProtonDriveClient;
 use crate::error::ProtonDriveError;
 use crate::links::LinkId;
@@ -16,7 +17,9 @@ use crate::protobuf::ThumbnailHeader;
 use crate::revision::RevisionId;
 use crate::utils::PotentialObject;
 use crate::volume::VolumeId;
+use anyhow::Context;
 use chrono::{DateTime, Utc};
+use futures::stream::{FuturesUnordered, StreamExt};
 use proton_rpgp::AsPublicKeyRef;
 use proton_rpgp::DataEncoding;
 use proton_rpgp::Encryptor;
@@ -28,6 +31,7 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
+use tokio::sync::Mutex;
 
 pub const REVISION_WRITER_DEFAULT_BLOCK_SIZE: usize = 4 * 1024 * 1024;
 
@@ -193,6 +197,7 @@ impl RevisionOperations {
             block_sizes: Vec::new(),
             thumbnail_digests: Vec::new(),
             sha1_hasher: sha1::Sha1::default(),
+            precomputed_sha1: None,
             expected_size,
             last_modification_time,
             additional_metadata,
@@ -205,15 +210,21 @@ impl RevisionOperations {
         revision_uid: RevisionUid,
         release_block_listing_action: Box<dyn Fn(i32) + Send + Sync>,
     ) -> anyhow::Result<DownloadState> {
+        tracing::debug!("Getting node metadata for revision_uid={}", revision_uid);
         let _node_metadata = crate::node::operations::NodeOperations::get_node(
             client,
             revision_uid.node_uid.clone(),
         )
-        .await?;
+        .await
+        .context("Failed to get node metadata")?;
+        
+        tracing::debug!("Getting secrets for node_uid={}", revision_uid.node_uid);
         let secrets =
             crate::node::file::FileOperations::get_secrets(client, revision_uid.node_uid.clone())
-                .await?;
+                .await
+                .context("Failed to get file secrets")?;
 
+        tracing::debug!("Getting revision blocks for revision_id={}", revision_uid.revision_id.raw());
         let revision_response = client
             .api()
             .files()
@@ -225,7 +236,15 @@ impl RevisionOperations {
                 Some(crate::node::download::DEFAULT_BLOCK_PAGE_SIZE),
                 false,
             )
-            .await?;
+            .await
+            .context("Failed to get revision from API")?;
+
+        tracing::debug!(
+            "Download state created for revision {:?}: {} blocks, size={}",
+            revision_uid.revision_id,
+            revision_response.revision.blocks.len(),
+            revision_response.revision.revision.size
+        );
 
         release_block_listing_action(1);
 
@@ -262,6 +281,8 @@ pub struct RevisionWriter {
     block_sizes: Vec<i32>,
     thumbnail_digests: Vec<u8>,
     sha1_hasher: sha1::Sha1,
+    /// Pre-computed SHA1 hash from pipelined write (set by producer task)
+    precomputed_sha1: Option<[u8; 20]>,
     expected_size: i64,
     last_modification_time: Option<DateTime<Utc>>,
     additional_metadata: Option<Vec<AdditionalMetadataProperty>>,
@@ -269,60 +290,245 @@ pub struct RevisionWriter {
 }
 
 impl RevisionWriter {
+    /// Maximum number of blocks being uploaded concurrently.
+    /// Matches the TypeScript SDK's MAX_UPLOADING_BLOCKS = 5.
+    const MAX_CONCURRENT_UPLOADS: usize = 5;
+    
+    /// Maximum number of pre-encrypted blocks buffered ahead of uploads.
+    /// Matches the TypeScript SDK's MAX_BUFFERED_BLOCKS = 15.
+    const MAX_BUFFERED_BLOCKS: usize = 15;
+
     #[tracing::instrument(skip(self, content_stream, on_progress))]
     pub async fn write(
         &mut self,
         mut content_stream: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         on_progress: Arc<dyn Fn(i64, i64) + Send + Sync>,
     ) -> anyhow::Result<()> {
-        tracing::debug!(expected_size = self.expected_size, "Starting write");
-        let mut buffer = vec![0u8; self.target_block_size];
+        use crate::block::upload::EncryptedBlock;
+        use tokio::sync::mpsc;
+        
+        tracing::debug!(expected_size = self.expected_size, "Starting pipelined write");
+        
+        // Channel to buffer encrypted blocks between producer (encryption) and consumer (upload)
+        let (tx, mut rx) = mpsc::channel::<(EncryptedBlock, i32)>(Self::MAX_BUFFERED_BLOCKS);
+        
+        // Shared state for collecting results
+        let uploaded_bytes = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let block_results: Arc<Mutex<Vec<(i32, BlockUploadResult, i32)>>> = Arc::new(Mutex::new(Vec::new()));
+        
+        // Clone what we need for the producer task
+        let client = self.client.clone();
+        let draft = self.draft.clone();
+        let target_block_size = self.target_block_size;
+        
+        // Producer task: reads blocks, encrypts them, sends to channel
+        // Returns (block_count, sha1_hash)
+        let producer = tokio::spawn(async move {
+            let mut buffer = vec![0u8; target_block_size];
+            let mut current_block = 1i32;
+            let mut sha1_hasher = sha1::Sha1::default();
 
-        loop {
-            let mut n = 0;
-            while n < self.target_block_size {
-                let read_bytes = content_stream.read(&mut buffer[n..]).await?;
-                if read_bytes == 0 {
+            loop {
+                // Read a full block (or whatever remains)
+                let mut n = 0;
+                while n < target_block_size {
+                    let read_bytes = content_stream.read(&mut buffer[n..]).await?;
+                    if read_bytes == 0 {
+                        break;
+                    }
+                    n += read_bytes;
+                }
+
+                if n == 0 {
                     break;
                 }
-                n += read_bytes;
+
+                let block_data = buffer[..n].to_vec();
+                let block_size = n as i32;
+                
+                // Update SHA1 hash (sequential, in order)
+                sha1::Digest::update(&mut sha1_hasher, &block_data);
+
+                // Encrypt the block (CPU-bound work done in producer)
+                let encrypted_block = client
+                    .block_uploader()
+                    .encrypt_block(&draft, current_block, &block_data)?;
+
+                tracing::trace!(
+                    block = current_block,
+                    plain_size = n,
+                    encrypted_size = encrypted_block.encrypted_data.len(),
+                    "Block encrypted, sending to upload queue"
+                );
+
+                // Send to upload queue (will block if buffer is full - backpressure)
+                if tx.send((encrypted_block, block_size)).await.is_err() {
+                    // Receiver dropped, upload failed
+                    return Err(anyhow::anyhow!("Upload task terminated unexpectedly"));
+                }
+
+                current_block += 1;
             }
 
-            if n == 0 {
+            // Finalize the SHA1 hash
+            let sha1_final: [u8; 20] = sha1::Digest::finalize(sha1_hasher).into();
+            
+            tracing::debug!(blocks_encrypted = current_block - 1, "Producer finished");
+            Ok::<(i32, [u8; 20]), anyhow::Error>((current_block - 1, sha1_final))
+        });
+        
+        // Consumer: receives encrypted blocks and uploads them in parallel
+        let mut upload_futures: FuturesUnordered<tokio::task::JoinHandle<anyhow::Result<(i32, BlockUploadResult, i32)>>> = FuturesUnordered::new();
+        let mut producer_done = false;
+        
+        loop {
+            // Try to receive more encrypted blocks while we have upload capacity
+            while !producer_done && upload_futures.len() < Self::MAX_CONCURRENT_UPLOADS {
+                match rx.try_recv() {
+                    Ok((encrypted_block, block_size)) => {
+                        let block_number = encrypted_block.block_number;
+                        let plain_size = encrypted_block.plain_size;
+                        
+                        // Spawn upload task
+                        let client = self.client.clone();
+                        let draft = self.draft.clone();
+                        let on_progress = on_progress.clone();
+                        let expected_size = self.expected_size;
+                        let uploaded_bytes = uploaded_bytes.clone();
+
+                        let handle = tokio::spawn(async move {
+                            let result = client
+                                .block_uploader()
+                                .upload_encrypted_block(&client, &draft, encrypted_block)
+                                .await?;
+
+                            // Update progress
+                            let new_total = uploaded_bytes.fetch_add(plain_size as i64, std::sync::atomic::Ordering::SeqCst) 
+                                + plain_size as i64;
+                            on_progress(new_total, expected_size);
+
+                            Ok((block_number, result, block_size))
+                        });
+
+                        upload_futures.push(handle);
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        // No blocks ready, break to wait for uploads or new blocks
+                        break;
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        producer_done = true;
+                        break;
+                    }
+                }
+            }
+
+            // If we have no upload capacity or no blocks ready, wait for an upload to complete
+            // or for the channel to have data
+            if upload_futures.is_empty() && producer_done {
+                // All done
                 break;
             }
+            
+            if upload_futures.is_empty() {
+                // No uploads in progress, wait for producer to send a block
+                match rx.recv().await {
+                    Some((encrypted_block, block_size)) => {
+                        let block_number = encrypted_block.block_number;
+                        let plain_size = encrypted_block.plain_size;
+                        
+                        let client = self.client.clone();
+                        let draft = self.draft.clone();
+                        let on_progress = on_progress.clone();
+                        let expected_size = self.expected_size;
+                        let uploaded_bytes = uploaded_bytes.clone();
 
-            let block_data = &buffer[..n];
-            sha1::Digest::update(&mut self.sha1_hasher, block_data);
-
-            let on_block_progress: Box<dyn Fn(i64) + Send + Sync> = Box::new({
-                let on_progress = on_progress.clone();
-                let current_total = self.total_written;
-                let expected_size = self.expected_size;
-                move |progress| {
-                    on_progress(current_total + progress, expected_size);
+                        let handle = tokio::spawn(async move {
+                            let result = client
+                                .block_uploader()
+                                .upload_encrypted_block(&client, &draft, encrypted_block)
+                                .await?;
+                            let new_total = uploaded_bytes.fetch_add(plain_size as i64, std::sync::atomic::Ordering::SeqCst) 
+                                + plain_size as i64;
+                            on_progress(new_total, expected_size);
+                            Ok((block_number, result, block_size))
+                        });
+                        upload_futures.push(handle);
+                    }
+                    None => {
+                        producer_done = true;
+                    }
                 }
-            });
+            } else {
+                // Wait for either an upload to complete or a new block to be ready
+                tokio::select! {
+                    Some(result) = upload_futures.next() => {
+                        let (block_num, upload_result, size) = result??;
+                        block_results.lock().await.push((block_num, upload_result, size));
+                        (self.release_blocks_action)(1);
+                    }
+                    block_opt = rx.recv(), if !producer_done && upload_futures.len() < Self::MAX_CONCURRENT_UPLOADS => {
+                        match block_opt {
+                            Some((encrypted_block, block_size)) => {
+                                let block_number = encrypted_block.block_number;
+                                let plain_size = encrypted_block.plain_size;
+                                
+                                let client = self.client.clone();
+                                let draft = self.draft.clone();
+                                let on_progress = on_progress.clone();
+                                let expected_size = self.expected_size;
+                                let uploaded_bytes = uploaded_bytes.clone();
 
-            let result = self
-                .client
-                .block_uploader()
-                .upload_content(
-                    &self.client,
-                    &self.draft,
-                    self.block_number,
-                    block_data,
-                    Some(&on_block_progress),
-                )
-                .await?;
-
-            self.digests.extend_from_slice(&result.sha256_digest);
-            self.block_sizes.push(n as i32);
-            self.total_written += n as i64;
-            self.block_number += 1;
-
-            (self.release_blocks_action)(1);
+                                let handle = tokio::spawn(async move {
+                                    let result = client
+                                        .block_uploader()
+                                        .upload_encrypted_block(&client, &draft, encrypted_block)
+                                        .await?;
+                                    let new_total = uploaded_bytes.fetch_add(plain_size as i64, std::sync::atomic::Ordering::SeqCst) 
+                                        + plain_size as i64;
+                                    on_progress(new_total, expected_size);
+                                    Ok((block_number, result, block_size))
+                                });
+                                upload_futures.push(handle);
+                            }
+                            None => {
+                                producer_done = true;
+                            }
+                        }
+                    }
+                }
+            }
         }
+
+        // Wait for producer to finish and check for errors
+        let (blocks_encrypted, sha1_hash) = producer.await??;
+        
+        // Store the precomputed SHA1 hash from the producer
+        self.precomputed_sha1 = Some(sha1_hash);
+
+        // Sort results by block number and collect digests/sizes in order
+        let mut results = block_results.lock().await;
+        results.sort_by_key(|(block_num, _, _)| *block_num);
+
+        tracing::debug!(
+            "Collected {} block upload results, block numbers: {:?}",
+            results.len(),
+            results.iter().map(|(n, _, _)| *n).collect::<Vec<_>>()
+        );
+
+        for (_, result, size) in results.iter() {
+            self.digests.extend_from_slice(&result.sha256_digest);
+            self.block_sizes.push(*size);
+            self.total_written += *size as i64;
+        }
+        self.block_number = blocks_encrypted + 1;
+
+        tracing::debug!(
+            blocks = blocks_encrypted,
+            total_written = self.total_written,
+            "Pipelined write complete"
+        );
+
         Ok(())
     }
     pub async fn upload_thumbnails(
@@ -411,7 +617,8 @@ impl RevisionWriter {
             total_written = self.total_written,
             blocks = self.block_sizes.len(),
             thumbnail_digests = self.thumbnail_digests.len(),
-            content_digests = self.digests.len(),
+            content_digests_bytes = self.digests.len(),
+            block_sizes = ?self.block_sizes,
             "Committing revision"
         );
         let signer = Signer::default().with_signing_key(&self.draft.signing_key.0);
@@ -424,7 +631,12 @@ impl RevisionWriter {
             signer.sign_detached(&manifest, DataEncoding::Armored)?,
         )?);
 
-        let sha1_digest = self.sha1_hasher.clone().finalize().to_vec();
+        // Use precomputed SHA1 from pipelined write, or fall back to hasher
+        let sha1_digest = if let Some(hash) = self.precomputed_sha1 {
+            hash.to_vec()
+        } else {
+            self.sha1_hasher.clone().finalize().to_vec()
+        };
         let mut additional_metadata = std::collections::HashMap::new();
         if let Some(meta) = &self.additional_metadata {
             for prop in meta {
@@ -468,6 +680,11 @@ impl RevisionWriter {
                 request,
             )
             .await?;
+
+        tracing::info!(
+            revision_id = %self.draft.uid.revision_id.raw(),
+            "Revision committed successfully"
+        );
 
         Ok(())
     }

@@ -8,11 +8,9 @@ You can check it out [here](https://github.com/tirbofish/proton-sdk-rs)
 > [!WARNING]
 > This port is not an official product of Proton, nor is it made by Proton. It is a community project. 
 > 
-> Despite this project being open-source (and anyone can check the contents), there can be bugs and issues that
-> may cause data loss, so always be aware of this issue. 
+> Despite this project being open-source (and anyone can check the contents), there can be bugs and issues that may cause data loss, so always be aware of this issue. 
 > 
-> Passwords are not saved, but instead tokens are saved to the config. Even so, it is dependent on how the app (not the SDK) uses the
-> tokens. 
+> Passwords are not saved, but instead tokens are saved to the config. Even so, it is dependent on how the app (not the SDK) uses the tokens. There are helpers available for any developers wanting to store their credentials safely. 
 
 # todo
 

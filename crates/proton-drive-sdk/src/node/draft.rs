@@ -9,6 +9,7 @@ use proton_rpgp::{AsPublicKeyRef, DataEncoding, Encryptor, Signer};
 use proton_sdk_rs2::protobuf::Address;
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct RevisionDraft {
     pub uid: RevisionUid,
     pub file_key: PgpPrivateKey,

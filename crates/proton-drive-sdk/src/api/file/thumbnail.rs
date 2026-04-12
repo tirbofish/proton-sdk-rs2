@@ -10,6 +10,7 @@ pub struct ThumbnailBlock {
     #[serde(rename = "BareURL")]
     pub bare_url: String,
 
+    #[serde(rename = "Token")]
     pub token: String,
 }
 

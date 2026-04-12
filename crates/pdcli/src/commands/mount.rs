@@ -27,7 +27,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use console::style;
 use fuse3::raw::prelude::*;
-use fuse3::raw::reply::{ReplyCopyFileRange, ReplyCreated, ReplyWrite};
+use fuse3::raw::reply::{ReplyCopyFileRange, ReplyCreated, ReplyWrite, ReplyXAttr};
 use fuse3::{Errno, MountOptions, SetAttr};
 use futures_util::stream;
 use futures_util::stream::Stream;
@@ -72,10 +72,160 @@ const FILE_MODE: u16 = 0o644;
 /// Event polling interval (5 seconds for responsive updates)
 const EVENT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Maximum age for a cached thumbnail to be considered valid (24 hours)
+const THUMBNAIL_CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
+/// Check if a valid freedesktop.org thumbnail already exists for the given file.
+/// Returns true if both "normal" and "large" thumbnails exist and are recent enough.
+fn has_cached_thumbnail(file_path: &Path, _mtime_secs: i64) -> bool {
+    let file_uri = path_to_file_uri(file_path);
+    let uri_md5 = format!("{:x}", md5::compute(file_uri.as_bytes()));
+    
+    let Some(cache_dir) = dirs::cache_dir() else {
+        return false;
+    };
+    let cache_dir = cache_dir.join("thumbnails");
+    
+    // Check both sizes - if either is missing or stale, we should refresh
+    for size_name in ["large", "normal"] {
+        let thumb_path = cache_dir.join(size_name).join(format!("{}.png", uri_md5));
+        
+        if !thumb_path.exists() {
+            return false;
+        }
+        
+        // Check if the thumbnail is recent enough
+        if let Ok(meta) = std::fs::metadata(&thumb_path) {
+            if let Ok(modified) = meta.modified() {
+                if modified.elapsed().unwrap_or(Duration::MAX) > THUMBNAIL_CACHE_MAX_AGE {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        
+        // Optionally verify Thumb::MTime matches, but for performance we skip this
+        // since the file hasn't changed if mtime matches what Nautilus will check
+    }
+    
+    tracing::trace!("Thumbnail cache hit for {:?}", file_path);
+    true
+}
+
 /// Check if a filename is a LibreOffice/OpenOffice lock file.
 /// Lock files have the pattern `.~lock.<filename>#`
 fn is_lock_file(filename: &str) -> bool {
     filename.starts_with(".~lock.") && filename.ends_with('#')
+}
+
+/// Plant a Proton Drive thumbnail into the freedesktop.org thumbnail cache.
+/// Nautilus checks `~/.cache/thumbnails/large/` before trying to generate thumbnails.
+/// If a valid thumbnail exists there with correct Thumb::URI and Thumb::MTime metadata,
+/// Nautilus will use it and never attempt to open the file for thumbnail generation.
+///
+/// `file_uri` should be like "file:///home/user/ProtonDrive/MyFiles/photo.jpg"
+/// `mtime_secs` is the Unix timestamp of the file's modification time
+/// `thumbnail_data` is the raw image data (JPEG or PNG) from Proton Drive
+fn plant_freedesktop_thumbnail(
+    file_path: &Path,
+    mtime_secs: i64,
+    thumbnail_data: &[u8],
+) -> Result<()> {
+    use png::{BitDepth, ColorType, Encoder};
+    use std::io::BufWriter;
+
+    // Build proper file:// URI with percent encoding per freedesktop spec
+    // The URI must use percent-encoding for special characters
+    let file_uri = path_to_file_uri(file_path);
+    
+    tracing::info!("Planting thumbnail for URI: {}", file_uri);
+
+    // Compute MD5 of the URI - this is the cache key per freedesktop spec
+    let uri_md5 = format!("{:x}", md5::compute(file_uri.as_bytes()));
+
+    // Get thumbnail cache directory
+    let cache_dir = dirs::cache_dir()
+        .context("Could not find cache directory")?
+        .join("thumbnails");
+
+    // Plant in both "large" (256x256) and "normal" (128x128) directories
+    // Nautilus may check either depending on view settings
+    for (size_name, max_size) in [("large", 256u32), ("normal", 128u32)] {
+        let thumb_dir = cache_dir.join(size_name);
+        std::fs::create_dir_all(&thumb_dir)
+            .context("Failed to create thumbnail cache directory")?;
+
+        let thumb_path = thumb_dir.join(format!("{}.png", uri_md5));
+
+        // Skip if thumbnail already exists and is recent
+        if thumb_path.exists() {
+            if let Ok(meta) = std::fs::metadata(&thumb_path) {
+                if let Ok(modified) = meta.modified() {
+                    if modified.elapsed().unwrap_or(Duration::MAX) < Duration::from_secs(3600) {
+                        tracing::trace!("Thumbnail already exists and is recent: {:?}", thumb_path);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Decode the image
+        let img = image::load_from_memory(thumbnail_data)
+            .context("Failed to decode thumbnail image")?;
+
+        // Resize to target size if needed
+        let thumbnail = if img.width() > max_size || img.height() > max_size {
+            img.thumbnail(max_size, max_size)
+        } else {
+            img.clone()
+        };
+
+        // Convert to RGBA8
+        let rgba = thumbnail.to_rgba8();
+        let (width, height) = rgba.dimensions();
+
+        // Write PNG with required freedesktop metadata chunks
+        let file = std::fs::File::create(&thumb_path)
+            .context("Failed to create thumbnail file")?;
+        let writer = BufWriter::new(file);
+
+        let mut encoder = Encoder::new(writer, width, height);
+        encoder.set_color(ColorType::Rgba);
+        encoder.set_depth(BitDepth::Eight);
+
+        // Add the required tEXt chunks per freedesktop thumbnail spec
+        // Nautilus validates Thumb::URI and Thumb::MTime to ensure the thumbnail is valid
+        encoder.add_text_chunk("Thumb::URI".to_string(), file_uri.clone())?;
+        encoder.add_text_chunk("Thumb::MTime".to_string(), mtime_secs.to_string())?;
+
+        let mut writer = encoder.write_header()
+            .context("Failed to write PNG header")?;
+        writer.write_image_data(&rgba)
+            .context("Failed to write PNG data")?;
+        writer.finish()
+            .context("Failed to finish PNG")?;
+
+        // Set restrictive permissions (0600) per spec
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&thumb_path, std::fs::Permissions::from_mode(0o600));
+        }
+
+        tracing::info!("Planted {} thumbnail: {:?}", size_name, thumb_path);
+    }
+
+    Ok(())
+}
+
+/// Convert a file path to a file:// URI.
+/// Per GNOME's implementation, the URI does NOT use percent-encoding
+/// for normal path characters - only the file:// prefix is added.
+fn path_to_file_uri(path: &Path) -> String {
+    format!("file://{}", path.display())
 }
 
 /// The .pdclignore filename constant
@@ -120,6 +270,9 @@ Desktop.ini
 *.backup
 \#*\#
 .#*
+
+# LibreOffice/OpenOffice lock files
+.~lock.*#
 
 # Log files
 *.log
@@ -250,6 +403,11 @@ impl IgnoreManager {
             return false;
         }
         
+        // Always ignore LibreOffice/OpenOffice lock files regardless of patterns
+        if is_lock_file(filename) {
+            return true;
+        }
+        
         self.global_patterns.is_match(filename)
     }
 
@@ -341,6 +499,8 @@ pub struct ProtonFileMetadata {
     pub is_photo: bool,
     /// Photo capture time (for photos only)
     pub capture_time: Option<DateTime<Utc>>,
+    /// Server-side thumbnail ID (if available)
+    pub thumbnail_id: Option<String>,
 }
 
 impl ProtonFileMetadata {
@@ -367,6 +527,23 @@ impl ProtonFileMetadata {
             content_sha1: revision.claimed_digests.sha1.clone(),
             is_photo,
             capture_time,
+            // Get the small thumbnail ID if available (prefer type=1 (Thumbnail) over type=2 (Preview))
+            // The protobuf-generated ThumbnailHeader uses i32 for type, where 1=Thumbnail, 2=Preview
+            thumbnail_id: {
+                let thumb = revision.thumbnails
+                    .iter()
+                    .find(|t| t.r#type == 1) // ThumbnailType::Thumbnail
+                    .or_else(|| revision.thumbnails.first());
+                if thumb.is_some() {
+                    tracing::debug!(
+                        "File '{}' has {} thumbnail(s), using {:?}",
+                        node.base.base.name,
+                        revision.thumbnails.len(),
+                        thumb.map(|t| &t.id)
+                    );
+                }
+                thumb.map(|t| t.id.clone())
+            },
         }
     }
 }
@@ -453,6 +630,15 @@ impl FsNode {
             FsNode::File(f) => &f.uid,
             FsNode::Folder(f) => &f.uid,
             FsNode::Degraded(d) => &d.uid,
+        }
+    }
+
+    /// Get the parent node's UID
+    pub fn parent_uid(&self) -> Option<&NodeUid> {
+        match self {
+            FsNode::File(f) => f.parent_uid.as_ref(),
+            FsNode::Folder(f) => f.parent_uid.as_ref(),
+            FsNode::Degraded(d) => d.parent_uid.as_ref(),
         }
     }
 
@@ -644,6 +830,11 @@ impl DiskCache {
         self.cache_dir.join(filename)
     }
 
+    /// Check if content is cached without reading it.
+    fn contains(&self, revision_uid: &RevisionUid) -> bool {
+        self.cache_path(revision_uid).exists()
+    }
+
     /// Try to get cached content for a revision.
     fn get(&self, revision_uid: &RevisionUid) -> Option<Vec<u8>> {
         let path = self.cache_path(revision_uid);
@@ -723,6 +914,103 @@ impl DiskCache {
     }
 }
 
+/// Maximum memory cache size (128 MB)
+const MAX_MEMORY_CACHE_SIZE: usize = 128 * 1024 * 1024;
+/// Maximum file size to cache in memory (16 MB) - larger files go straight to disk
+const MAX_MEMORY_CACHE_ITEM_SIZE: usize = 16 * 1024 * 1024;
+/// Maximum number of entries in memory cache
+const MAX_MEMORY_CACHE_ENTRIES: usize = 1000;
+
+/// Bounded LRU memory cache for file content.
+/// Only caches files smaller than MAX_MEMORY_CACHE_ITEM_SIZE.
+/// Evicts oldest entries when total size exceeds MAX_MEMORY_CACHE_SIZE.
+struct MemoryCache {
+    cache: lru::LruCache<u64, Vec<u8>>,
+    current_size: usize,
+}
+
+impl MemoryCache {
+    fn new() -> Self {
+        Self {
+            cache: lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_MEMORY_CACHE_ENTRIES).unwrap()
+            ),
+            current_size: 0,
+        }
+    }
+
+    /// Get cached content for an inode.
+    fn get(&mut self, inode: &u64) -> Option<&Vec<u8>> {
+        self.cache.get(inode)
+    }
+
+    /// Get cached content without promoting it in LRU order (read-only).
+    fn peek(&self, inode: &u64) -> Option<&Vec<u8>> {
+        self.cache.peek(inode)
+    }
+
+    /// Check if content is cached without promoting it in LRU order.
+    fn contains(&self, inode: &u64) -> bool {
+        self.cache.contains(inode)
+    }
+
+    /// Store content in the cache. Returns false if content is too large.
+    fn put(&mut self, inode: u64, content: Vec<u8>) -> bool {
+        let content_size = content.len();
+        
+        // Don't cache files larger than the item size limit
+        if content_size > MAX_MEMORY_CACHE_ITEM_SIZE {
+            // Use trace level - this fires on every read for large disk-cached files
+            tracing::trace!(
+                "Not caching inode {} in memory: size {} exceeds limit {}",
+                inode, content_size, MAX_MEMORY_CACHE_ITEM_SIZE
+            );
+            return false;
+        }
+
+        // If this item already exists, remove it first to update size tracking
+        if let Some(old) = self.cache.pop(&inode) {
+            self.current_size = self.current_size.saturating_sub(old.len());
+        }
+
+        // Evict entries until we have space
+        while self.current_size + content_size > MAX_MEMORY_CACHE_SIZE {
+            if let Some((evicted_inode, evicted_content)) = self.cache.pop_lru() {
+                self.current_size = self.current_size.saturating_sub(evicted_content.len());
+                tracing::debug!(
+                    "Evicted inode {} from memory cache (freed {} bytes, current_size={})",
+                    evicted_inode, evicted_content.len(), self.current_size
+                );
+            } else {
+                break; // Cache is empty but still can't fit - shouldn't happen
+            }
+        }
+
+        self.current_size += content_size;
+        self.cache.put(inode, content);
+        true
+    }
+
+    /// Remove an inode from the cache.
+    fn remove(&mut self, inode: &u64) {
+        if let Some(content) = self.cache.pop(inode) {
+            self.current_size = self.current_size.saturating_sub(content.len());
+        }
+    }
+
+    /// Clear all cached content.
+    fn clear(&mut self) {
+        self.cache.clear();
+        self.current_size = 0;
+    }
+
+    /// Get current memory usage.
+    #[allow(dead_code)]
+    fn memory_usage(&self) -> usize {
+        self.current_size
+    }
+}
+
 /// Pending file being written (not yet committed to Proton Drive).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PendingFile {
@@ -742,6 +1030,9 @@ struct PendingFile {
     creation_time: DateTime<Utc>,
     /// Whether content has been modified since last upload
     dirty: bool,
+    /// If true, this file is local-only (e.g., lock file) and should not be uploaded
+    #[serde(default)]
+    local_only: bool,
 }
 
 /// Persistent upload data saved to disk for resume capability.
@@ -1076,8 +1367,8 @@ struct ProtonDriveFsInner {
     children: BTreeMap<u64, Vec<u64>>,
     /// Set of folders whose children have been loaded
     loaded_folders: std::collections::HashSet<u64>,
-    /// File content cache: inode -> decrypted content
-    file_cache: BTreeMap<u64, Vec<u8>>,
+    /// Bounded LRU memory cache for file content
+    file_cache: MemoryCache,
     /// Next inode number to allocate
     next_inode: AtomicU64,
     /// Root folder NodeUid
@@ -1086,8 +1377,7 @@ struct ProtonDriveFsInner {
     volume_id: Option<VolumeId>,
     /// Next file handle to allocate
     next_fh: AtomicU64,
-    /// File handles opened with O_NOATIME (likely thumbnailing)
-    noatime_handles: std::collections::HashSet<u64>,
+
     /// Pending files being created (inode -> PendingFile)
     pending_files: BTreeMap<u64, PendingFile>,
     /// Write buffers for open file handles (fh -> WriteBuffer)
@@ -1106,12 +1396,12 @@ impl ProtonDriveFsInner {
             link_id_to_inode: BTreeMap::new(),
             children: BTreeMap::new(),
             loaded_folders: std::collections::HashSet::new(),
-            file_cache: BTreeMap::new(),
+            file_cache: MemoryCache::new(),
             next_inode: AtomicU64::new(FIRST_DYNAMIC_INODE), // Virtual inodes 1-99 reserved
             root_uid: None,
             volume_id: None,
             next_fh: AtomicU64::new(1),
-            noatime_handles: std::collections::HashSet::new(),
+
             pending_files: BTreeMap::new(),
             write_buffers: BTreeMap::new(),
             fh_to_inode: BTreeMap::new(),
@@ -1150,6 +1440,37 @@ impl ProtonDriveFsInner {
         
         inode
     }
+
+    /// Build the relative path from MyFiles root to a node.
+    /// Returns a path like "folder/subfolder/file.jpg" for a file,
+    /// or None if the path cannot be built (node not found).
+    fn build_relative_path(&self, inode: u64) -> Option<PathBuf> {
+        let mut path_components = Vec::new();
+        let mut current_inode = inode;
+        
+        // Walk up the hierarchy until we reach MYFILES_INODE
+        while current_inode != MYFILES_INODE && current_inode != ROOT_INODE {
+            let node = self.nodes.get(&current_inode)?;
+            path_components.push(node.name().to_string());
+            
+            // Get parent inode
+            let parent_uid = node.parent_uid()?;
+            current_inode = *self.uid_to_inode.get(&parent_uid.to_string())?;
+        }
+        
+        // Reverse to get path from root to file
+        path_components.reverse();
+        
+        if path_components.is_empty() {
+            return None;
+        }
+        
+        let mut path = PathBuf::new();
+        for component in path_components {
+            path.push(component);
+        }
+        Some(path)
+    }
 }
 
 /// The Proton Drive FUSE filesystem.
@@ -1167,11 +1488,13 @@ pub struct ProtonDriveFs {
     upload_rx: RwLock<Option<mpsc::UnboundedReceiver<UploadTask>>>,
     /// Persistent upload store for resume capability
     pending_upload_store: Arc<PendingUploadStore>,
+    /// Mount path for constructing file URIs (used for thumbnail caching)
+    mount_path: PathBuf,
 }
 
 impl ProtonDriveFs {
     /// Create a new filesystem instance.
-    pub fn new(multi_progress: Arc<MultiProgress>) -> Result<Self> {
+    pub fn new(multi_progress: Arc<MultiProgress>, mount_path: &Path) -> Result<Self> {
         let ignore_manager = IgnoreManager::new()?;
         tracing::info!("Loaded global .pdclignore from {:?}", ignore_manager.global_ignore_path());
         
@@ -1187,6 +1510,7 @@ impl ProtonDriveFs {
             upload_tx,
             upload_rx: RwLock::new(Some(upload_rx)),
             pending_upload_store,
+            mount_path: mount_path.to_path_buf(),
         })
     }
 
@@ -1228,6 +1552,8 @@ impl ProtonDriveFs {
         my_files_meta.name = "MyFiles".to_string(); // Override the name to show "MyFiles"
         let my_files_node = FsNode::Folder(my_files_meta);
         inner.uid_to_inode.insert(my_files_folder.base.uid.to_string(), MYFILES_INODE);
+        // Also add to link_id_to_inode so event processing can find it
+        inner.link_id_to_inode.insert(my_files_folder.base.uid.link_id.raw().to_string(), MYFILES_INODE);
         inner.nodes.insert(MYFILES_INODE, my_files_node);
         inner.children.insert(MYFILES_INODE, Vec::new());
         
@@ -1336,7 +1662,7 @@ impl ProtonDriveFs {
                                         }),
                                     ).await {
                                         Ok(node_uid) => {
-                                            pb.finish_and_clear();
+                                            pb.finish_with_message(format!("{} {}", style("✓").green(), pending.name));
                                             
                                             // Remove from persistence store on success
                                             if let Some(id) = persist_id {
@@ -1355,7 +1681,7 @@ impl ProtonDriveFs {
                                                         let fs_node = FsNode::from_node(node);
                                                         inner.uid_to_inode.insert(node_uid.to_string(), inode);
                                                         inner.nodes.insert(inode, fs_node);
-                                                        inner.file_cache.insert(inode, content);
+                                                        inner.file_cache.put(inode, content);
                                                     }
                                                     PotentialObject::Degraded(degraded) => {
                                                         let fs_node = FsNode::from_degraded(degraded);
@@ -1439,7 +1765,7 @@ impl ProtonDriveFs {
                                         }),
                                     ).await {
                                         Ok(new_node_uid) => {
-                                            pb.finish_and_clear();
+                                            pb.finish_with_message(format!("{} {}", style("✓").green(), filename));
                                             
                                             // Remove from persistence store on success
                                             if let Some(id) = persist_id {
@@ -1455,7 +1781,7 @@ impl ProtonDriveFs {
                                                     PotentialObject::Node(node) => {
                                                         let fs_node = FsNode::from_node(node);
                                                         inner.nodes.insert(inode, fs_node);
-                                                        inner.file_cache.insert(inode, content);
+                                                        inner.file_cache.put(inode, content);
                                                     }
                                                     PotentialObject::Degraded(degraded) => {
                                                         let fs_node = FsNode::from_degraded(degraded);
@@ -1595,7 +1921,7 @@ impl ProtonDriveFs {
                                                 }),
                                             ).await {
                                                 Ok(_node_uid) => {
-                                                    pb.finish_and_clear();
+                                                    pb.finish_with_message(format!("{} {}", style("✓").green(), name));
                                                     // Remove from persistence store on success
                                                     if let Err(e) = pending_upload_store.remove(&id) {
                                                         tracing::warn!("Failed to remove persisted upload {}: {}", id, e);
@@ -1631,7 +1957,7 @@ impl ProtonDriveFs {
                                                 }),
                                             ).await {
                                                 Ok(_new_node_uid) => {
-                                                    pb.finish_and_clear();
+                                                    pb.finish_with_message(format!("{} {}", style("✓").green(), filename));
                                                     // Remove from persistence store on success
                                                     if let Err(e) = pending_upload_store.remove(&id) {
                                                         tracing::warn!("Failed to remove persisted upload {}: {}", id, e);
@@ -1950,6 +2276,11 @@ impl ProtonDriveFs {
 
     /// Load children of a folder if not already loaded.
     async fn ensure_children_loaded(&self, inode: u64) -> Result<()> {
+        // Validate inode
+        if inode == 0 {
+            return Err(anyhow::anyhow!("Invalid inode 0"));
+        }
+        
         // Check if already loaded
         {
             let inner = self.inner.read().await;
@@ -1964,40 +2295,184 @@ impl ProtonDriveFs {
             match inner.nodes.get(&inode) {
                 Some(FsNode::Folder(f)) => f.uid.clone(),
                 Some(FsNode::Degraded(d)) if !d.is_file => d.uid.clone(),
-                _ => return Err(anyhow::anyhow!("Not a folder")),
+                Some(other) => {
+                    tracing::error!("ensure_children_loaded: inode {} is not a folder, it's a {:?}", inode, other.file_type());
+                    return Err(anyhow::anyhow!("Not a folder"));
+                }
+                None => {
+                    tracing::error!("ensure_children_loaded: inode {} not found in nodes", inode);
+                    return Err(anyhow::anyhow!("Node not found"));
+                }
+            }
+        };
+        
+        tracing::debug!("Loading children for folder {} (uid={})", inode, folder_uid);
+
+        // Get children stream - release client lock immediately after creating stream.
+        // The stream is 'static and uses internal channels, so it doesn't need the lock held.
+        let children_stream = {
+            let client = self.client.read().await;
+            let client = client.as_ref().ok_or_else(|| anyhow::anyhow!("No client"))?;
+            match client.enumerate_folder_children(folder_uid.clone()).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    tracing::error!("Failed to enumerate children for folder {} (uid={}): {}", inode, folder_uid, e);
+                    return Err(e.context("Failed to enumerate children"));
+                }
             }
         };
 
-        // Get client
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or_else(|| anyhow::anyhow!("No client"))?;
-
-        // Enumerate children
-        let mut children_stream = pin!(client.enumerate_folder_children(folder_uid.clone()).await
-            .context("Failed to enumerate children")?);
-
-        let mut child_inodes = Vec::new();
-        
+        // Collect all children first (this does network I/O but doesn't hold any locks)
+        let mut fs_nodes = Vec::new();
+        let mut children_stream = pin!(children_stream);
+        let mut child_count = 0;
         while let Some(result) = children_stream.next().await {
-            let potential = result.context("Failed to fetch child")?;
-            
-            let fs_node = match &potential {
-                PotentialObject::Node(node) => FsNode::from_node(node),
-                PotentialObject::Degraded(degraded) => FsNode::from_degraded(degraded),
-            };
-            
-            let child_inode = {
-                let mut inner = self.inner.write().await;
-                inner.insert_node(fs_node, None)
-            };
-            child_inodes.push(child_inode);
+            match result {
+                Ok(potential) => {
+                    let fs_node = match &potential {
+                        PotentialObject::Node(node) => FsNode::from_node(node),
+                        PotentialObject::Degraded(degraded) => FsNode::from_degraded(degraded),
+                    };
+                    fs_nodes.push(fs_node);
+                    child_count += 1;
+                }
+                Err(e) => {
+                    tracing::error!("Failed to fetch child {} for folder {}: {}", child_count, inode, e);
+                    // Continue loading other children instead of failing entirely
+                    continue;
+                }
+            }
         }
+        
+        tracing::debug!("Loaded {} children for folder {}", child_count, inode);
+
+        // Now batch insert all children in a single write lock
+        let child_inodes: Vec<u64> = {
+            let mut inner = self.inner.write().await;
+            fs_nodes.into_iter()
+                .map(|fs_node| inner.insert_node(fs_node, None))
+                .collect()
+        };
+
+        // Collect files with thumbnails for background fetching
+        let files_with_thumbnails: Vec<(u64, NodeUid, String, i64, PathBuf)> = {
+            let inner = self.inner.read().await;
+            let mut files = Vec::new();
+            let mut files_without_thumbs = 0;
+            let mut cached_thumbs = 0;
+            for &child_inode in &child_inodes {
+                if let Some(FsNode::File(file_meta)) = inner.nodes.get(&child_inode) {
+                    // Only process files with thumbnails
+                    if let Some(ref thumb_id) = file_meta.thumbnail_id {
+                        // Get the modification time for the thumbnail cache key
+                        let mtime_secs = file_meta.modification_time
+                            .unwrap_or(file_meta.creation_time)
+                            .timestamp();
+                        
+                        // Build the relative path for this file
+                        if let Some(rel_path) = inner.build_relative_path(child_inode) {
+                            // Check if thumbnail is already cached locally
+                            let full_path = self.mount_path.join("MyFiles").join(&rel_path);
+                            if has_cached_thumbnail(&full_path, mtime_secs) {
+                                cached_thumbs += 1;
+                                continue;
+                            }
+                            
+                            files.push((
+                                child_inode,
+                                file_meta.uid.clone(),
+                                thumb_id.clone(),
+                                mtime_secs,
+                                rel_path,
+                            ));
+                        }
+                    } else {
+                        files_without_thumbs += 1;
+                    }
+                }
+            }
+            if cached_thumbs > 0 || files_without_thumbs > 0 || !files.is_empty() {
+                tracing::debug!(
+                    "Folder has {} files needing thumbnails, {} cached, {} without",
+                    files.len(), cached_thumbs, files_without_thumbs
+                );
+            }
+            files
+        };
 
         // Mark folder as loaded and store children
         {
             let mut inner = self.inner.write().await;
             inner.children.insert(inode, child_inodes);
             inner.loaded_folders.insert(inode);
+        }
+
+        // Spawn background task to fetch and plant thumbnails in parallel
+        if !files_with_thumbnails.is_empty() {
+            let client = self.client.clone();
+            let mount_path = self.mount_path.clone();
+            let count = files_with_thumbnails.len();
+            
+            tracing::debug!("Spawning thumbnail fetch task for {} files", count);
+            
+            tokio::spawn(async move {
+                use futures_util::stream::StreamExt;
+                
+                // Limit concurrent thumbnail fetches to avoid overwhelming the API
+                const MAX_CONCURRENT_THUMBNAILS: usize = 4;
+                
+                let results = futures_util::stream::iter(files_with_thumbnails)
+                    .map(|(inode, node_uid, thumb_id, mtime_secs, rel_path)| {
+                        let client = client.clone();
+                        let mount_path = mount_path.clone();
+                        async move {
+                            // Build the full file path
+                            let full_path = mount_path.join("MyFiles").join(&rel_path);
+                            
+                            // Try to fetch the thumbnail from Proton Drive
+                            let thumbnail_data = {
+                                let client_guard = client.read().await;
+                                if let Some(ref c) = *client_guard {
+                                    match c.fetch_thumbnail(node_uid.clone(), thumb_id.clone()).await {
+                                        Ok(data) => Some(data),
+                                        Err(e) => {
+                                            tracing::debug!(
+                                                "Failed to fetch thumbnail for inode {} ({}): {}",
+                                                inode, rel_path.display(), e
+                                            );
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    None
+                                }
+                            };
+                            
+                            // Plant the thumbnail in the freedesktop cache
+                            if let Some(data) = thumbnail_data {
+                                if let Err(e) = plant_freedesktop_thumbnail(&full_path, mtime_secs, &data) {
+                                    tracing::debug!(
+                                        "Failed to plant thumbnail for {}: {}",
+                                        rel_path.display(), e
+                                    );
+                                    false
+                                } else {
+                                    true
+                                }
+                            } else {
+                                false
+                            }
+                        }
+                    })
+                    .buffer_unordered(MAX_CONCURRENT_THUMBNAILS)
+                    .collect::<Vec<bool>>()
+                    .await;
+                
+                let planted = results.iter().filter(|&&x| x).count();
+                if planted > 0 {
+                    tracing::info!("Planted {}/{} thumbnails", planted, count);
+                }
+            });
         }
 
         Ok(())
@@ -2081,7 +2556,7 @@ impl ProtonDriveFs {
         {
             let mut inner = self.inner.write().await;
             if let Some(content) = inner.file_cache.get(&inode).cloned() {
-                tracing::debug!("Cache hit (memory) for inode {}", inode);
+                tracing::trace!("Cache hit (memory) for inode {}", inode);
                 // Ensure metadata size matches cached content size
                 let actual_size = content.len() as u64;
                 if actual_size != file_size {
@@ -2095,12 +2570,12 @@ impl ProtonDriveFs {
 
         // Check persistent disk cache second
         if let Some(content) = self.disk_cache.get(&revision_uid) {
-            tracing::debug!("Cache hit (disk) for inode {}", inode);
-            // Also store in memory cache for faster subsequent access
+            tracing::trace!("Cache hit (disk) for inode {}", inode);
+            // Store in memory cache for faster subsequent access if small enough
             // And update the file size to match actual cached content
             {
                 let mut inner = self.inner.write().await;
-                inner.file_cache.insert(inode, content.clone());
+                inner.file_cache.put(inode, content.clone());
                 // Ensure metadata size matches cached content size
                 let actual_size = content.len() as u64;
                 if actual_size != file_size {
@@ -2188,8 +2663,8 @@ impl ProtonDriveFs {
             .context("Download task panicked")?
             .context("Download failed")?;
 
-        // Finish progress bar
-        pb.finish_and_clear();
+        // Finish progress bar with completion message
+        pb.finish_with_message(format!("{} {}", style("✓").green(), filename));
 
         // Extract the content
         let content = Arc::try_unwrap(buffer)
@@ -2219,10 +2694,10 @@ impl ProtonDriveFs {
             tracing::warn!("Failed to write to disk cache: {:?}", e);
         }
 
-        // Store in memory cache
+        // Store in memory cache if small enough
         {
             let mut inner = self.inner.write().await;
-            inner.file_cache.insert(inode, content.clone());
+            inner.file_cache.put(inode, content.clone());
         }
 
         Ok(content)
@@ -2276,6 +2751,15 @@ impl ProtonDriveFs {
                 .ok_or_else(|| anyhow::anyhow!("No pending file for inode {}", inode))?
         };
 
+        // Don't upload local-only files (e.g., lock files)
+        if pending.local_only {
+            tracing::debug!("Skipping upload for local-only file: {}", pending.name);
+            // Return a fake NodeUid for local-only files
+            let inner = self.inner.read().await;
+            let volume_id = inner.volume_id.clone().unwrap_or_else(|| VolumeId::new("local".to_string()));
+            return Ok(NodeUid::new(volume_id, LinkId::new(format!("local-{}", inode))));
+        }
+
         let client_guard = self.client.read().await;
         let client = client_guard.as_ref()
             .ok_or_else(|| anyhow::anyhow!("No client"))?;
@@ -2317,7 +2801,7 @@ impl ProtonDriveFs {
             }),
         ).await?;
 
-        pb.finish_and_clear();
+        pb.finish_with_message(format!("{} {}", style("✓").green(), pending.name));
 
         // Fetch the uploaded node to get full metadata
         let potential_node = client.get_node(node_uid.clone()).await?;
@@ -2333,7 +2817,7 @@ impl ProtonDriveFs {
                 inner.uid_to_inode.insert(node_uid.to_string(), inode);
                 inner.nodes.insert(inode, fs_node);
                 // Update cache with uploaded content
-                inner.file_cache.insert(inode, pending.content);
+                inner.file_cache.put(inode, pending.content);
             }
             PotentialObject::Degraded(degraded) => {
                 let fs_node = FsNode::from_degraded(degraded);
@@ -2404,7 +2888,7 @@ impl ProtonDriveFs {
                 }),
             ).await?;
 
-            pb.finish_and_clear();
+            pb.finish_with_message(format!("{} {}", style("✓").green(), filename));
 
             // Update the node with new revision info
             let potential_node = client.get_node(new_node_uid).await?;
@@ -2414,7 +2898,7 @@ impl ProtonDriveFs {
                 PotentialObject::Node(node) => {
                     let fs_node = FsNode::from_node(node);
                     inner.nodes.insert(inode, fs_node);
-                    inner.file_cache.insert(inode, content);
+                    inner.file_cache.put(inode, content);
                 }
                 PotentialObject::Degraded(degraded) => {
                     let fs_node = FsNode::from_degraded(degraded);
@@ -2452,7 +2936,7 @@ impl ProtonDriveFs {
                 buf.dirty = false;
             }
             // Also update the cache so subsequent reads see the new content
-            inner.file_cache.insert(inode, content.clone());
+            inner.file_cache.put(inode, content.clone());
         }
 
         if is_new {
@@ -2463,27 +2947,32 @@ impl ProtonDriveFs {
             };
             
             if let Some(pending) = pending {
-                // Persist the upload for resume capability
-                let persist_id = PendingUploadStore::generate_id();
-                let persist_upload = PersistentUpload::NewFile {
-                    id: persist_id.clone(),
-                    parent_uid: pending.parent_uid.clone(),
-                    name: pending.name.clone(),
-                    mime_type: pending.mime_type.clone(),
-                    content: pending.content.clone(),
-                    retry_count: 0,
-                    created_at: chrono::Utc::now().timestamp(),
-                };
-                if let Err(e) = self.pending_upload_store.save(&persist_upload) {
-                    tracing::warn!("Failed to persist upload: {}", e);
+                // Skip upload for local-only files (e.g., lock files)
+                if pending.local_only {
+                    tracing::debug!("Skipping upload for local-only file: {}", pending.name);
+                } else {
+                    // Persist the upload for resume capability
+                    let persist_id = PendingUploadStore::generate_id();
+                    let persist_upload = PersistentUpload::NewFile {
+                        id: persist_id.clone(),
+                        parent_uid: pending.parent_uid.clone(),
+                        name: pending.name.clone(),
+                        mime_type: pending.mime_type.clone(),
+                        content: pending.content.clone(),
+                        retry_count: 0,
+                        created_at: chrono::Utc::now().timestamp(),
+                    };
+                    if let Err(e) = self.pending_upload_store.save(&persist_upload) {
+                        tracing::warn!("Failed to persist upload: {}", e);
+                    }
+                    
+                    let _ = self.upload_tx.send(UploadTask::NewFile { 
+                        inode, 
+                        pending,
+                        persist_id: Some(persist_id),
+                    });
+                    tracing::info!("Queued new file upload for inode {}", inode);
                 }
-                
-                let _ = self.upload_tx.send(UploadTask::NewFile { 
-                    inode, 
-                    pending,
-                    persist_id: Some(persist_id),
-                });
-                tracing::info!("Queued new file upload for inode {}", inode);
             }
         } else {
             // Queue revision upload
@@ -2543,7 +3032,7 @@ impl ProtonDriveFs {
                     if let Some(node) = inner.nodes.get(&child_inode) {
                         if node.name() == PDCLIGNORE_FILENAME {
                             // Found a .pdclignore file, try to get its content
-                            if let Some(cached) = inner.file_cache.get(&child_inode) {
+                            if let Some(cached) = inner.file_cache.peek(&child_inode) {
                                 found_content = Some(String::from_utf8_lossy(cached).to_string());
                             }
                             break;
@@ -2634,9 +3123,39 @@ impl Filesystem for ProtonDriveFs {
         let (inode, child) = self.find_child(parent, name).await
             .ok_or_else(Errno::new_not_exist)?;
 
+        // Build base attributes
+        let mut attr = child.attr(inode);
+        
+        // Override size with actual cached content size when available.
+        // Server's claimed_size can differ from actual decrypted content size.
+        if !child.is_dir() {
+            let inner = self.inner.read().await;
+            let claimed_size = attr.size;
+            
+            if let Some(pending) = inner.pending_files.get(&inode) {
+                attr.size = pending.content.len() as u64;
+                attr.blocks = (attr.size + 4095) / 4096;
+            } else if let Some(content) = inner.file_cache.peek(&inode) {
+                attr.size = content.len() as u64;
+                attr.blocks = (attr.size + 4095) / 4096;
+            } else if let FsNode::File(f) = &child {
+                if let Some(content) = self.disk_cache.get(&f.revision_uid) {
+                    attr.size = content.len() as u64;
+                    attr.blocks = (attr.size + 4095) / 4096;
+                }
+            }
+            
+            if attr.size != claimed_size {
+                tracing::debug!(
+                    "lookup inode {}: using actual size={} instead of claimed={}",
+                    inode, attr.size, claimed_size
+                );
+            }
+        }
+
         Ok(ReplyEntry {
             ttl: TTL,
-            attr: child.attr(inode),
+            attr,
             generation: 0,
         })
     }
@@ -2648,15 +3167,69 @@ impl Filesystem for ProtonDriveFs {
         fh: Option<u64>,
         flags: u32,
     ) -> fuse3::Result<ReplyAttr> {
-        tracing::info!("FUSE getattr: inode={}, fh={:?}, flags={:#x}, uid={}, gid={}, pid={}",
+        tracing::trace!("FUSE getattr: inode={}, fh={:?}, flags={:#x}, uid={}, gid={}, pid={}",
             inode, fh, flags, req.uid, req.gid, req.pid);
         
         let node = self.get_node(inode).await
             .ok_or_else(Errno::new_not_exist)?;
 
+        // Build base attributes from node metadata
+        let mut attr = node.attr(inode);
+        
+        // Override size with actual cached content size when available.
+        // Server's claimed_size can differ from actual decrypted content size,
+        // which causes apps like LibreOffice to report "corrupted" files.
+        if !node.is_dir() {
+            let inner = self.inner.read().await;
+            let claimed_size = attr.size;
+            
+            // Check pending files first (locally created, not yet uploaded)
+            if let Some(pending) = inner.pending_files.get(&inode) {
+                let actual_size = pending.content.len() as u64;
+                tracing::debug!(
+                    "getattr inode {}: using pending file size={} (claimed={})",
+                    inode, actual_size, claimed_size
+                );
+                attr.size = actual_size;
+                attr.blocks = (actual_size + 4095) / 4096;
+            }
+            // Check memory cache
+            else if let Some(content) = inner.file_cache.peek(&inode) {
+                let actual_size = content.len() as u64;
+                tracing::debug!(
+                    "getattr inode {}: using memory cache size={} (claimed={})",
+                    inode, actual_size, claimed_size
+                );
+                attr.size = actual_size;
+                attr.blocks = (actual_size + 4095) / 4096;
+            }
+            // Check disk cache
+            else if let FsNode::File(f) = &node {
+                if let Some(content) = self.disk_cache.get(&f.revision_uid) {
+                    let actual_size = content.len() as u64;
+                    tracing::debug!(
+                        "getattr inode {}: using disk cache size={} (claimed={})",
+                        inode, actual_size, claimed_size
+                    );
+                    attr.size = actual_size;
+                    attr.blocks = (actual_size + 4095) / 4096;
+                } else {
+                    tracing::debug!(
+                        "getattr inode {}: using claimed_size={} (no cache found)",
+                        inode, claimed_size
+                    );
+                }
+            } else {
+                tracing::debug!(
+                    "getattr inode {}: using claimed_size={} (not a file node)",
+                    inode, claimed_size
+                );
+            }
+        }
+
         Ok(ReplyAttr {
             ttl: TTL,
-            attr: node.attr(inode),
+            attr,
         })
     }
 
@@ -2681,18 +3254,8 @@ impl Filesystem for ProtonDriveFs {
         let is_write_mode = (flags & o_wronly) != 0 || (flags & o_rdwr) != 0;
         let is_truncate = (flags & o_trunc) != 0;
         
-        // Get the filename for extension checking
+        // Get the filename for logging
         let filename = node.name();
-        
-        // Detect thumbnailing/preview requests:
-        // O_NOATIME (0x40000) is ONLY used by thumbnail generators and file manager previews.
-        // Normal applications opening files do NOT use this flag.
-        // When you double-click a file, the viewer app opens it without O_NOATIME.
-        let uses_noatime = (flags & O_NOATIME) != 0;
-        let is_thumbnailer = is_thumbnailer_process(req.pid);
-        
-        // Block ALL O_NOATIME requests - they're never from legitimate user opens
-        let should_block = uses_noatime || is_thumbnailer;
         
         // Log process info for debugging
         let comm_path = format!("/proc/{}/comm", req.pid);
@@ -2700,71 +3263,96 @@ impl Filesystem for ProtonDriveFs {
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
         
-        if should_block {
-            tracing::debug!(
-                "Blocking preview/thumbnail request: inode={}, file={}, process={} (pid {}), O_NOATIME={}",
-                inode, filename, proc_name, req.pid, uses_noatime
-            );
-            self.inner.write().await.noatime_handles.insert(fh);
-        } else {
-            tracing::debug!(
-                "Allowing open: inode={}, file={}, process={}, O_NOATIME={}, write_mode={}",
-                inode, filename, proc_name, uses_noatime, is_write_mode
-            );
-            
-            // Check if this is a pending file (created locally, not yet uploaded)
-            let is_pending = {
+        // Block known thumbnail generator processes from opening uncached files.
+        // This prevents thumbnails from downloading entire files.
+        // The is_cached check allows thumbnailers to read already-cached content.
+        if is_thumbnailer_process(&proc_name, req.pid) && !is_write_mode {
+            let is_cached = {
                 let inner = self.inner.read().await;
-                inner.pending_files.contains_key(&inode)
+                if inner.file_cache.contains(&inode) {
+                    true
+                } else if let Some(FsNode::File(f)) = inner.nodes.get(&inode) {
+                    self.disk_cache.contains(&f.revision_uid)
+                } else {
+                    false
+                }
             };
             
-            // Pre-download the file content during open() to ensure correct file size.
-            // This is critical because:
-            // 1. getattr returns "claimed" size from Proton metadata (may be wrong)
-            // 2. Applications call stat() after open() to get file size
-            // 3. They then only read that many bytes
-            // 4. If claimed size < actual size, file appears truncated/corrupt
-            // By downloading here, we update metadata with the real size before any reads.
-            // SKIP this for pending files - they have no remote content to download.
+            if !is_cached {
+                tracing::debug!(
+                    "Blocking thumbnailer from uncached file: inode={}, file={}, process={} (pid {})",
+                    inode, filename, proc_name, req.pid
+                );
+                // Return permission denied - thumbnailer will show generic icon
+                return Err(Errno::from(libc::EACCES));
+            }
+            tracing::debug!(
+                "Allowing thumbnailer to read cached file: inode={}, file={}, process={}",
+                inode, filename, proc_name
+            );
+        }
+        
+        tracing::debug!(
+            "Opening file: inode={}, file={}, process={} (pid {}), write_mode={}",
+            inode, filename, proc_name, req.pid, is_write_mode
+        );
+            
+        // Check if this is a pending file (created locally, not yet uploaded)
+        let is_pending = {
+            let inner = self.inner.read().await;
+            inner.pending_files.contains_key(&inode)
+        };
+        
+        // Set up write buffer if opened for writing.
+        // For O_TRUNC we start fresh; otherwise we need existing content.
+        // Don't pre-download for read-only opens - read() will fetch on-demand.
+        if is_write_mode {
             let existing_content = if is_pending {
-                // Pending file - use buffered content, no download needed
                 let inner = self.inner.read().await;
                 inner.pending_files.get(&inode)
                     .map(|p| p.content.clone())
-            } else if !is_truncate {
-                match self.get_file_content(inode).await {
-                    Ok(content) => Some(content),
-                    Err(e) => {
-                        tracing::error!("Failed to pre-download file during open: {:?}", e);
-                        return Err(Errno::from(libc::EIO));
+                    .unwrap_or_default()
+            } else if is_truncate {
+                Vec::new()
+            } else {
+                // For write mode, we need to fetch the existing content.
+                // Check cache first to avoid blocking download.
+                let cache_content = {
+                    let inner = self.inner.read().await;
+                    inner.file_cache.peek(&inode).cloned()
+                };
+                
+                if let Some(content) = cache_content {
+                    content
+                } else {
+                    // Need to download - this could timeout for large files
+                    // but write mode requires existing content
+                    match self.get_file_content(inode).await {
+                        Ok(content) => content,
+                        Err(e) => {
+                            tracing::error!("Failed to fetch file content for write: {:?}", e);
+                            return Err(Errno::from(libc::EIO));
+                        }
                     }
                 }
-            } else {
-                // O_TRUNC means start fresh
-                Some(Vec::new())
             };
             
-            // Set up write buffer if opened for writing
-            if is_write_mode {
-                let mut inner = self.inner.write().await;
-                let content = existing_content.clone().unwrap_or_default();
-                
-                inner.write_buffers.insert(fh, WriteBuffer {
-                    inode,
-                    is_new: false,
-                    offset: 0,
-                    content: if is_truncate { Vec::new() } else { content },
-                    dirty: is_truncate, // Truncated files are dirty
-                });
-                inner.fh_to_inode.insert(fh, inode);
-                
-                // If truncating, update the file size
-                if is_truncate {
-                    if let Some(FsNode::File(f)) = inner.nodes.get_mut(&inode) {
-                        f.size = 0;
-                    }
-                    inner.file_cache.insert(inode, Vec::new());
+            let mut inner = self.inner.write().await;
+            inner.write_buffers.insert(fh, WriteBuffer {
+                inode,
+                is_new: false,
+                offset: 0,
+                content: existing_content,
+                dirty: is_truncate, // Truncated files are dirty
+            });
+            inner.fh_to_inode.insert(fh, inode);
+            
+            // If truncating, update the file size
+            if is_truncate {
+                if let Some(FsNode::File(f)) = inner.nodes.get_mut(&inode) {
+                    f.size = 0;
                 }
+                inner.file_cache.put(inode, Vec::new());
             }
         }
         
@@ -2783,7 +3371,7 @@ impl Filesystem for ProtonDriveFs {
         offset: u64,
         size: u32,
     ) -> fuse3::Result<ReplyData> {
-        tracing::info!("FUSE read: inode={}, fh={}, offset={}, size={}, uid={}, gid={}, pid={}",
+        tracing::trace!("FUSE read: inode={}, fh={}, offset={}, size={}, uid={}, gid={}, pid={}",
             inode, fh, offset, size, req.uid, req.gid, req.pid);
         
         // First check if this is a pending file (created locally, not yet uploaded)
@@ -2802,43 +3390,8 @@ impl Filesystem for ProtonDriveFs {
             }
         }
         
-        // Check if this is a thumbnailing request (opened with O_NOATIME)
-        let is_thumbnailing = self.inner.read().await.noatime_handles.contains(&fh);
-        
-        // For thumbnailing requests, only serve cached content to avoid network downloads
-        if is_thumbnailing {
-            // Check memory cache first
-            if let Some(content) = self.inner.read().await.file_cache.get(&inode).cloned() {
-                let offset = offset as usize;
-                let size = size as usize;
-                if offset >= content.len() {
-                    return Ok(ReplyData { data: Bytes::new() });
-                }
-                let end = std::cmp::min(offset + size, content.len());
-                return Ok(ReplyData { data: Bytes::copy_from_slice(&content[offset..end]) });
-            }
-            
-            // Check disk cache
-            if let Some(revision_uid) = self.get_revision_uid(inode).await {
-                if let Some(content) = self.disk_cache.get(&revision_uid) {
-                    let offset = offset as usize;
-                    let size = size as usize;
-                    if offset >= content.len() {
-                        return Ok(ReplyData { data: Bytes::new() });
-                    }
-                    let end = std::cmp::min(offset + size, content.len());
-                    // Also store in memory cache
-                    self.inner.write().await.file_cache.insert(inode, content.clone());
-                    return Ok(ReplyData { data: Bytes::copy_from_slice(&content[offset..end]) });
-                }
-            }
-            
-            // Not cached - return empty for thumbnailing to avoid network download
-            tracing::debug!("Skipping download for thumbnailing request (inode={})", inode);
-            return Ok(ReplyData { data: Bytes::new() });
-        }
-        
         // Normal read - download file content (cached)
+        // Always serve content for any read request to ensure MIME detection works correctly
         let content = match self.get_file_content(inode).await {
             Ok(c) => c,
             Err(e) => {
@@ -2916,11 +3469,20 @@ impl Filesystem for ProtonDriveFs {
 
         if let Some(children) = inner.children.get(&inode) {
             for (i, &child_inode) in children.iter().enumerate() {
+                // Validate inode - must be non-zero
+                if child_inode == 0 {
+                    continue;
+                }
                 if let Some(child) = inner.nodes.get(&child_inode) {
+                    let child_name = child.name();
+                    // Validate the name - FUSE doesn't allow empty names, NUL bytes, or slashes
+                    if child_name.is_empty() || child_name.contains('\0') || child_name.contains('/') {
+                        continue;
+                    }
                     entries.push(Ok(DirectoryEntry {
                         inode: child_inode,
                         kind: child.file_type(),
-                        name: OsString::from(child.name()),
+                        name: OsString::from(child_name),
                         offset: (i + 3) as i64,
                     }));
                 }
@@ -2928,7 +3490,7 @@ impl Filesystem for ProtonDriveFs {
         }
 
         Ok(ReplyDirectory {
-            entries: stream::iter(entries.into_iter().skip(offset as usize)),
+            entries: stream::iter(entries.into_iter().skip(offset.max(0) as usize)),
         })
     }
 
@@ -2944,18 +3506,24 @@ impl Filesystem for ProtonDriveFs {
             parent, fh, offset, lock_owner, req.uid, req.gid, req.pid);
         
         // Ensure children are loaded
-        self.ensure_children_loaded(parent).await
-            .map_err(|e| {
-                tracing::error!("Failed to load children: {}", e);
-                Errno::new_not_exist()
-            })?;
+        if let Err(e) = self.ensure_children_loaded(parent).await {
+            tracing::error!("Failed to load children for inode {}: {}", parent, e);
+            return Err(Errno::new_not_exist());
+        }
+        tracing::debug!("Children loaded for inode {}", parent);
         
         let inner = self.inner.read().await;
         
-        let node = inner.nodes.get(&parent)
-            .ok_or_else(Errno::new_not_exist)?;
+        let node = match inner.nodes.get(&parent) {
+            Some(n) => n,
+            None => {
+                tracing::error!("Node {} not found in readdirplus", parent);
+                return Err(Errno::new_not_exist());
+            }
+        };
 
         if !node.is_dir() {
+            tracing::error!("Node {} is not a directory in readdirplus", parent);
             return Err(Errno::new_is_not_dir());
         }
 
@@ -2977,7 +3545,7 @@ impl Filesystem for ProtonDriveFs {
             .map(|n| n.attr(grandparent_inode))
             .unwrap_or(parent_attr);
 
-        let mut entries = vec![
+        let mut entries: Vec<fuse3::Result<DirectoryEntryPlus>> = vec![
             Ok(DirectoryEntryPlus {
                 inode: parent,
                 generation: 0,
@@ -3001,21 +3569,55 @@ impl Filesystem for ProtonDriveFs {
         ];
 
         if let Some(children) = inner.children.get(&parent) {
+            tracing::debug!("Building entries for {} children", children.len());
             for (i, &child_inode) in children.iter().enumerate() {
+                // Validate inode - must be non-zero
+                if child_inode == 0 {
+                    tracing::error!("Child has invalid inode 0, skipping");
+                    continue;
+                }
+                
                 if let Some(child) = inner.nodes.get(&child_inode) {
+                    let child_name = child.name();
+                    // Validate the name - FUSE doesn't allow empty names or names with NUL bytes
+                    if child_name.is_empty() {
+                        tracing::warn!("Skipping child {} with empty name", child_inode);
+                        continue;
+                    }
+                    if child_name.contains('\0') {
+                        tracing::warn!("Skipping child {} with NUL byte in name: {:?}", child_inode, child_name);
+                        continue;
+                    }
+                    // FUSE names must not contain '/'
+                    if child_name.contains('/') {
+                        tracing::warn!("Skipping child {} with slash in name: {:?}", child_inode, child_name);
+                        continue;
+                    }
+                    
                     entries.push(Ok(DirectoryEntryPlus {
                         inode: child_inode,
                         generation: 0,
                         kind: child.file_type(),
-                        name: OsString::from(child.name()),
+                        name: OsString::from(child_name),
                         offset: (i + 3) as i64,
                         attr: child.attr(child_inode),
                         entry_ttl: TTL,
                         attr_ttl: TTL,
                     }));
+                } else {
+                    tracing::warn!("Child inode {} not found in nodes", child_inode);
                 }
             }
+        } else {
+            tracing::debug!("No children for inode {}", parent);
         }
+        
+        // Release the lock before returning
+        drop(inner);
+        
+        let num_entries = entries.len();
+        let skip = offset as usize;
+        tracing::debug!("Returning {} entries (skipping {})", num_entries.saturating_sub(skip), skip);
 
         Ok(ReplyDirectoryPlus {
             entries: stream::iter(entries.into_iter().skip(offset as usize)),
@@ -3023,7 +3625,7 @@ impl Filesystem for ProtonDriveFs {
     }
 
     async fn access(&self, req: Request, inode: u64, mask: u32) -> fuse3::Result<()> {
-        tracing::info!("FUSE access: inode={}, mask={:#o}, uid={}, gid={}, pid={}",
+        tracing::trace!("FUSE access: inode={}, mask={:#o}, uid={}, gid={}, pid={}",
             inode, mask, req.uid, req.gid, req.pid);
         let _ = self.get_node(inode).await
             .ok_or_else(Errno::new_not_exist)?;
@@ -3033,17 +3635,79 @@ impl Filesystem for ProtonDriveFs {
     async fn statfs(&self, req: Request, inode: u64) -> fuse3::Result<ReplyStatFs> {
         tracing::info!("FUSE statfs: inode={}, uid={}, gid={}, pid={}",
             inode, req.uid, req.gid, req.pid);
-        // TODO: Get actual stats from Proton Drive API (storage quota, etc.)
+        
+        // Get actual storage info from Proton Drive API
+        let (used_bytes, max_bytes) = {
+            let client = self.client.read().await;
+            
+            if let Some(client) = client.as_ref() {
+                match client.get_user_storage_info().await {
+                    Ok((used, max)) => (used as u64, max as u64),
+                    Err(e) => {
+                        tracing::warn!("Failed to get storage stats: {}", e);
+                        (0, 15 * 1024 * 1024 * 1024u64) // Default 15GB
+                    }
+                }
+            } else {
+                (0, 15 * 1024 * 1024 * 1024u64) // Default values
+            }
+        };
+        
+        let block_size = 4096u64;
+        let total_blocks = max_bytes / block_size;
+        let used_blocks = used_bytes / block_size;
+        let free_blocks = total_blocks.saturating_sub(used_blocks);
+        
         Ok(ReplyStatFs {
-            blocks: 1024 * 1024 * 1024, // 4TB virtual
-            bfree: 512 * 1024 * 1024,   // 2TB free
-            bavail: 512 * 1024 * 1024,
+            blocks: total_blocks,
+            bfree: free_blocks,
+            bavail: free_blocks,
             files: 1_000_000,
             ffree: 500_000,
-            bsize: 4096,
+            bsize: block_size as u32,
             namelen: 255,
-            frsize: 4096,
+            frsize: block_size as u32,
         })
+    }
+
+    async fn getxattr(
+        &self,
+        req: Request,
+        inode: u64,
+        name: &OsStr,
+        size: u32,
+    ) -> fuse3::Result<ReplyXAttr> {
+        tracing::debug!("FUSE getxattr: inode={}, name={:?}, size={}, uid={}, gid={}, pid={}",
+            inode, name, size, req.uid, req.gid, req.pid);
+
+        // Don't support extended attributes - return ENODATA for all requests
+        // This avoids EINVAL errors when the kernel doesn't like our response format
+        Err(Errno::from(libc::ENODATA))
+    }
+
+    async fn listxattr(
+        &self,
+        req: Request,
+        inode: u64,
+        size: u32,
+    ) -> fuse3::Result<ReplyXAttr> {
+        tracing::debug!("FUSE listxattr: inode={}, size={}, uid={}, gid={}, pid={}",
+            inode, size, req.uid, req.gid, req.pid);
+
+        // Verify the inode exists
+        let inner = self.inner.read().await;
+        if !inner.nodes.contains_key(&inode) {
+            return Err(Errno::new_not_exist());
+        }
+        drop(inner);
+
+        // Return empty list - we don't support extended attributes
+        // This avoids EINVAL errors with the ReplyXAttr response
+        if size == 0 {
+            Ok(ReplyXAttr::Size(0))
+        } else {
+            Ok(ReplyXAttr::Data(Bytes::new()))
+        }
     }
 
     async fn release(
@@ -3067,7 +3731,6 @@ impl Filesystem for ProtonDriveFs {
         // Clean up state
         {
             let mut inner = self.inner.write().await;
-            inner.noatime_handles.remove(&fh);
             inner.write_buffers.remove(&fh);
             inner.fh_to_inode.remove(&fh);
         }
@@ -3157,10 +3820,17 @@ impl Filesystem for ProtonDriveFs {
         tracing::info!("FUSE create: parent={}, name={}, flags={:#x}, uid={}, gid={}, pid={}",
             parent, name_str, flags, req.uid, req.gid, req.pid);
 
-        // Check if the file name should be ignored (but allow .pdclignore files)
-        if self.is_ignored(parent, &name_str).await {
+        // Check if this is a lock file - allow it locally but don't upload
+        let is_local_only = is_lock_file(&name_str);
+        
+        // Check if the file name should be ignored (but allow lock files locally)
+        if !is_local_only && self.is_ignored(parent, &name_str).await {
             tracing::warn!("File '{}' matches .pdclignore pattern, rejecting creation", name_str);
             return Err(Errno::from(libc::EPERM));
+        }
+        
+        if is_local_only {
+            tracing::debug!("Creating local-only file (lock file): {}", name_str);
         }
 
         // Get parent folder UID
@@ -3192,6 +3862,7 @@ impl Filesystem for ProtonDriveFs {
             content: Vec::new(),
             creation_time: now,
             dirty: false,
+            local_only: is_local_only,
         };
 
         // Allocate inode and file handle
@@ -3229,6 +3900,7 @@ impl Filesystem for ProtonDriveFs {
                 content_sha1: None,
                 is_photo: false,
                 capture_time: None,
+                thumbnail_id: None, // New files don't have thumbnails yet
             };
             
             let fs_node = FsNode::File(file_meta);
@@ -3629,7 +4301,7 @@ impl Filesystem for ProtonDriveFs {
             if new_size == 0 {
                 // Truncate to zero - clear the file cache
                 let mut inner = self.inner.write().await;
-                inner.file_cache.insert(inode, Vec::new());
+                inner.file_cache.put(inode, Vec::new());
                 if let Some(FsNode::File(f)) = inner.nodes.get_mut(&inode) {
                     f.size = 0;
                 }
@@ -3740,71 +4412,318 @@ impl Filesystem for ProtonDriveFs {
     }
 }
 
-/// O_NOATIME flag value (0x40000) - used by thumbnail generators
-const O_NOATIME: u32 = 0x40000;
-
 /// FOPEN_DIRECT_IO flag (1 << 0) - bypass page cache for this open file.
 /// This ensures the kernel doesn't cache file size from getattr, which may differ
 /// from the actual downloaded size. Without this, files may appear truncated.
 const FOPEN_DIRECT_IO: u32 = 1 << 0;
 
-/// Check if a PID is a known thumbnailer/preview process.
-/// Returns true if the process should be blocked from downloading.
-/// Only blocks actual thumbnailer processes, not legitimate viewers.
-fn is_thumbnailer_process(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
+/// Check if a process is a known thumbnailer/preview process.
+/// Returns true if the process should be blocked from downloading large files.
+fn is_thumbnailer_process(proc_name: &str, pid: u32) -> bool {
+    let name = proc_name.to_lowercase();
+    
+    // FIRST: Block anything with "thumbnailer" or "thumbnail" in the name
+    // This catches evince-thumbnailer, papers-thumbnailer, totem-video-thumbnailer, etc.
+    // Check this BEFORE the allowed list to prevent thumbnailer variants from being allowed
+    if name.contains("thumbnailer") || name.contains("thumbnail") {
+        tracing::debug!("Blocking thumbnailer process: {}", proc_name);
+        return true;
     }
     
-    // Only block actual thumbnailer binaries - be conservative!
-    // Do NOT block image viewers like eog, loupe, gwenview, etc.
-    const THUMBNAILER_EXACT: &[&str] = &[
-        "gnome-desktop-thu",  // gnome-desktop-thumbnailer (truncated at 15 chars)
-        "evince-thumbnailer",
-        "totem-video-thumb",
+    // Known thumbnailer process names (may be truncated to 15 chars)
+    const THUMBNAILER_NAMES: &[&str] = &[
+        "gnome-desktop-thu",  // gnome-desktop-thumbnailer
         "gdk-pixbuf-thumbn",
+        "gdk-pixbuf-thumb",
+        "evince-thumbnaile",
+        "papers-thumbnaile", // Papers PDF thumbnailer
+        "totem-video-thumb",
         "gs-thumbnailer",
         "raw-thumbnailer",
         "tumbler",
+        "tumblerd",
         "tracker-extract",
-        "tracker-miner",
+        "tracker-miner-fs",
+        "ffmpegthumbnailer",
+        "kio_thumbnail",
     ];
     
-    // Check /proc/pid/comm first (fast path)
-    let comm_path = format!("/proc/{}/comm", pid);
-    if let Ok(comm) = std::fs::read_to_string(&comm_path) {
-        let comm = comm.trim().to_lowercase();
-        
-        // Only block if name contains "thumbnailer" or "thumbnail"
-        if comm.contains("thumbnailer") || comm.contains("thumbnail") {
-            tracing::debug!("Blocking thumbnailer (comm): {} (pid {})", comm, pid);
+    for pattern in THUMBNAILER_NAMES {
+        if name == *pattern || name.starts_with(pattern) {
+            tracing::debug!("Blocking known thumbnailer: {} (matched {})", proc_name, pattern);
             return true;
         }
+    }
+    
+    // Explicitly allow known document viewers - NEVER block these
+    const ALLOWED_PROCESSES: &[&str] = &[
+        "papers",       // GNOME's new PDF viewer
+        "evince",       // GNOME's old PDF viewer
+        "okular",
+        "xreader",
+        "atril",
+        "zathura",
+        "mupdf",
+        "qpdfview",
+        "libreoffice",
+        "soffice.bin",
+        "lowriter",
+        "localc",
+        "loimpress",
+        "gimp",
+        "inkscape",
+        "eog",
+        "firefox",
+        "chromium",
+        "chrome",
+        "code",
+    ];
+    
+    for allowed in ALLOWED_PROCESSES {
+        if name == *allowed || name.starts_with(allowed) {
+            return false;
+        }
+    }
+    
+    // GNOME's GLib threadpool workers have names like "pool-1", "pool-56", etc.
+    // These are used for both thumbnail generation AND legitimate app operations.
+    // We check the parent process to distinguish:
+    // - If parent is systemd → block (GNOME thumbnail service runs as systemd user unit)
+    // - If parent is a document viewer (evince, okular) → allow (legitimate)
+    if name.starts_with("pool-") && pid > 0 {
+        // Get full parent chain for debugging
+        let (parent_name, grandparent_name) = get_parent_process_chain(pid);
+        tracing::debug!(
+            "Pool thread detected: proc={}, pid={}, parent={:?}, grandparent={:?}",
+            proc_name, pid, parent_name, grandparent_name
+        );
         
-        // Check exact matches for known thumbnailers
-        for pattern in THUMBNAILER_EXACT {
-            if comm == *pattern {
-                tracing::debug!("Blocking thumbnailer (exact): {} (pid {})", comm, pid);
+        // Check both parent and grandparent - threads can be nested
+        let parents_to_check: Vec<String> = [parent_name, grandparent_name]
+            .into_iter()
+            .flatten()
+            .map(|s| s.to_lowercase())
+            .collect();
+        
+        if parents_to_check.is_empty() {
+            tracing::debug!("Pool thread: no parents found, allowing");
+            return false;
+        }
+        
+        // Allow if any parent is a known document viewer
+        const ALLOWED_PARENTS: &[&str] = &[
+            "evince",
+            "papers",        // GNOME's new PDF viewer (replaces Evince)
+            "okular", 
+            "xreader",
+            "atril",
+            "zathura",
+            "mupdf",
+            "qpdfview",
+            "libreoffice",
+            "soffice",
+            "lowriter",
+            "localc",
+            "loimpress",
+            "gimp",
+            "inkscape",
+            "eog",           // GNOME image viewer
+            "gpicview",
+            "feh",
+            "firefox",
+            "chromium",
+            "chrome",
+            "code",          // VS Code
+            "gedit",
+            "kate",
+            "vlc",
+            "mpv",
+            "totem",         // GNOME Videos (but not totem-video-thumbnailer)
+        ];
+        
+        for parent in &parents_to_check {
+            for allowed in ALLOWED_PARENTS {
+                if parent.contains(allowed) {
+                    tracing::debug!("Pool thread: parent {} is allowed (document viewer)", parent);
+                    return false;
+                }
+            }
+        }
+        
+        // Block if parent is systemd - this is GNOME's thumbnail service
+        // running as a systemd user unit (gnome-desktop-thumbnailer.service)
+        for parent in &parents_to_check {
+            if parent == "systemd" {
+                tracing::debug!("Pool thread: parent is systemd (thumbnail service), blocking");
+                return true;
+            }
+        }
+        
+        // Block if any parent is a file manager or shell (likely thumbnailing)
+        const BLOCKED_PARENTS: &[&str] = &[
+            "nautilus",
+            "dolphin",
+            "thunar",
+            "pcmanfm",
+            "nemo",
+            "caja",
+            "gnome-shell",
+            "gjs",
+            "tracker",
+        ];
+        
+        for parent in &parents_to_check {
+            for blocked in BLOCKED_PARENTS {
+                if parent.contains(blocked) {
+                    tracing::debug!("Pool thread: parent {} is blocked (file manager)", parent);
+                    return true;
+                }
+            }
+        }
+        
+        // For unknown parents, allow by default (assume legitimate use)
+        tracing::debug!("Pool thread: unknown parents {:?}, allowing", parents_to_check);
+        return false;
+    }
+    
+    // Check /proc/pid/cmdline for thumbnailer arguments
+    // This catches processes that are explicitly running with thumbnail flags
+    if pid > 0 {
+        let cmdline_path = format!("/proc/{}/cmdline", pid);
+        if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
+            let cmdline = cmdline.replace('\0', " ").to_lowercase();
+            if cmdline.contains("--thumbnail") || 
+               cmdline.contains("-thumbnail") ||
+               cmdline.contains("thumbnailer") {
                 return true;
             }
         }
     }
     
-    // Check /proc/pid/cmdline for thumbnailer arguments
-    let cmdline_path = format!("/proc/{}/cmdline", pid);
-    if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
-        let cmdline = cmdline.replace('\0', " ").to_lowercase();
-        // Block if being used specifically for thumbnailing
-        if cmdline.contains("--thumbnail") || 
-           cmdline.contains("-thumbnail") ||
-           cmdline.contains("thumbnailer") {
-            tracing::debug!("Blocking thumbnailer (cmdline): {} (pid {})", 
-                cmdline.chars().take(80).collect::<String>(), pid);
-            return true;
+    false
+}
+
+/// Get the name of a process's parent and grandparent.
+fn get_parent_process_chain(pid: u32) -> (Option<String>, Option<String>) {
+    // Read /proc/pid/status to get PPid
+    let status_path = format!("/proc/{}/status", pid);
+    let status = match std::fs::read_to_string(&status_path) {
+        Ok(s) => s,
+        Err(_) => return (None, None),
+    };
+    
+    let ppid: u32 = match status.lines()
+        .find(|line| line.starts_with("PPid:"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+    {
+        Some(p) if p > 0 => p,
+        _ => return (None, None),
+    };
+    
+    // Read parent's comm
+    let comm_path = format!("/proc/{}/comm", ppid);
+    let parent_name = std::fs::read_to_string(&comm_path)
+        .ok()
+        .map(|s| s.trim().to_string());
+    
+    // Also get grandparent
+    let grandparent_name = {
+        let parent_status_path = format!("/proc/{}/status", ppid);
+        if let Ok(parent_status) = std::fs::read_to_string(&parent_status_path) {
+            if let Some(gppid) = parent_status.lines()
+                .find(|line| line.starts_with("PPid:"))
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                if gppid > 0 {
+                    let gp_comm_path = format!("/proc/{}/comm", gppid);
+                    std::fs::read_to_string(&gp_comm_path)
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
         }
+    };
+    
+    (parent_name, grandparent_name)
+}
+
+/// Add a bookmark to GTK's bookmarks file so it appears in Nautilus/Files sidebar.
+fn add_gtk_bookmark(path: &std::path::Path, name: &str) {
+    let bookmarks_path = match dirs::config_dir() {
+        Some(config) => config.join("gtk-3.0").join("bookmarks"),
+        None => return,
+    };
+    
+    let uri = format!("file://{}", path.display());
+    let bookmark_line = format!("{} {}", uri, name);
+    
+    // Read existing bookmarks
+    let existing = std::fs::read_to_string(&bookmarks_path).unwrap_or_default();
+    
+    // Check if already bookmarked
+    if existing.lines().any(|line| line.starts_with(&uri)) {
+        return;
     }
     
-    false
+    // Append new bookmark
+    let new_content = if existing.is_empty() || existing.ends_with('\n') {
+        format!("{}{}\n", existing, bookmark_line)
+    } else {
+        format!("{}\n{}\n", existing, bookmark_line)
+    };
+    
+    // Ensure directory exists
+    if let Some(parent) = bookmarks_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    
+    if let Err(e) = std::fs::write(&bookmarks_path, new_content) {
+        tracing::warn!("Failed to add GTK bookmark: {}", e);
+    } else {
+        tracing::info!("Added Proton Drive to GTK bookmarks");
+    }
+}
+
+/// Remove a bookmark from GTK's bookmarks file on unmount.
+fn remove_gtk_bookmark(path: &std::path::Path) {
+    let bookmarks_path = match dirs::config_dir() {
+        Some(config) => config.join("gtk-3.0").join("bookmarks"),
+        None => return,
+    };
+    
+    let uri = format!("file://{}", path.display());
+    
+    let existing = match std::fs::read_to_string(&bookmarks_path) {
+        Ok(content) => content,
+        Err(_) => return,
+    };
+    
+    // Filter out our bookmark
+    let new_content: String = existing
+        .lines()
+        .filter(|line| !line.starts_with(&uri))
+        .collect::<Vec<_>>()
+        .join("\n");
+    
+    let new_content = if new_content.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", new_content)
+    };
+    
+    if let Err(e) = std::fs::write(&bookmarks_path, new_content) {
+        tracing::warn!("Failed to remove GTK bookmark: {}", e);
+    } else {
+        tracing::info!("Removed Proton Drive from GTK bookmarks");
+    }
 }
 
 /// Progress callback type for mount status updates.
@@ -3998,13 +4917,26 @@ pub async fn mount(
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
 
+    // Check if allow_other is enabled in /etc/fuse.conf
+    let allow_other_enabled = std::fs::read_to_string("/etc/fuse.conf")
+        .map(|content| {
+            content.lines().any(|line| {
+                let trimmed = line.trim();
+                trimmed == "user_allow_other" && !trimmed.starts_with('#')
+            })
+        })
+        .unwrap_or(false);
+
     let mut mount_options = MountOptions::default();
     mount_options
         .fs_name("proton-drive")
         .force_readdir_plus(true)
         .uid(uid)
         .gid(gid);
-        // Removed read_only - now supports write operations
+    
+    if allow_other_enabled {
+        mount_options.allow_other(true);
+    }
 
     report("Connecting to Proton Drive...");
 
@@ -4018,7 +4950,7 @@ pub async fn mount(
     let multi_progress = Arc::new(MultiProgress::new());
 
     // Create and initialize filesystem
-    let fs = ProtonDriveFs::new(multi_progress.clone())
+    let fs = ProtonDriveFs::new(multi_progress.clone(), mount_path)
         .context("Failed to create filesystem")?;
     fs.init_with_client(client).await
         .context("Failed to initialize filesystem")?;
@@ -4037,7 +4969,9 @@ pub async fn mount(
         let _ = tx.send(());
     }
 
+    // Add GTK bookmark so it appears in Nautilus/Files sidebar immediately
     let mount_path_owned = mount_path.to_owned();
+    add_gtk_bookmark(&mount_path_owned, "Proton Drive");
 
     tokio::select! {
         res = mount_handle => {
@@ -4049,6 +4983,9 @@ pub async fn mount(
             // MountHandle will be dropped here, triggering unmount
         }
     }
+
+    // Remove bookmark on unmount
+    remove_gtk_bookmark(&mount_path_owned);
 
     // Give FUSE time to finish cleanup
     tokio::time::sleep(Duration::from_millis(300)).await;

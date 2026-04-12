@@ -17,8 +17,16 @@ use crate::cancellation::{CancellationStack, CancellationGuard, spawn_ctrlc_hand
 #[command(name = "pdcli")]
 #[command(about = "Proton Drive CLI", long_about = None)]
 struct Cli {
+    /// Clear the file download cache (keeps session)
+    #[arg(long)]
+    clear_cache: bool,
+
+    /// Clear pending uploads from queue
+    #[arg(long)]
+    clear_pending_uploads: bool,
+
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -33,10 +41,6 @@ enum Commands {
     },
     /// Show current account information
     Whoami,
-    /// Clear the file download cache (keeps session)
-    ClearCache,
-    /// Clear pending uploads from queue
-    ClearPendingUploads,
     /// Mount Proton Drive to a local path
     Mount {
         /// Path to mount the drive
@@ -126,12 +130,6 @@ impl ProtonDriveCommandLineInterface {
                     }
                 }
                 Ok(())
-            }
-            Commands::ClearCache => {
-                crate::commands::mount::clear_cache()
-            }
-            Commands::ClearPendingUploads => {
-                crate::commands::mount::clear_pending_uploads()
             }
             Commands::Mount { path } => {
                 // Ensure authenticated before mounting
@@ -300,6 +298,22 @@ pub async fn main() -> anyhow::Result<()> {
     }
 
     let cli = Cli::parse();
+
+    // Handle standalone flags first
+    if cli.clear_cache {
+        return crate::commands::mount::clear_cache();
+    }
+    if cli.clear_pending_uploads {
+        return crate::commands::mount::clear_pending_uploads();
+    }
+
+    // Require a subcommand if no flags given
+    let Some(command) = cli.command else {
+        use clap::CommandFactory;
+        Cli::command().print_help()?;
+        return Ok(());
+    };
+
     let pdcli = ProtonDriveCommandLineInterface::new()?;
     
     // Spawn the Ctrl+C handler
@@ -310,7 +324,7 @@ pub async fn main() -> anyhow::Result<()> {
     
     // Run the command with cancellation support
     select! {
-        result = pdcli.run(cli.command) => {
+        result = pdcli.run(command) => {
             result
         }
         _ = root.cancelled() => {

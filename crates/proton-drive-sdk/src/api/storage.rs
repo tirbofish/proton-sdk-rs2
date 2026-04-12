@@ -150,7 +150,11 @@ impl StorageApiClient for DefaultStorageApiClient {
         let builder = self
             .storage_client
             .get(bare_url)
-            .header("pm-storage-token", token);
+            .header("pm-storage-token", token)
+            // Disable automatic decompression - the blob is already encrypted,
+            // not compressed, but some servers/proxies may send misleading
+            // Content-Encoding headers causing reqwest to fail decoding
+            .header("Accept-Encoding", "identity");
 
         let builder = self.add_auth_headers(builder).await?;
 

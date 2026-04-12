@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use anyhow::Context;
+
 use crate::account::{AccountClient, AccountClientAdapter};
 use crate::api::DriveApiClients;
 use crate::api::{DefaultDriveApiClientsFactory, DriveApiClientsFactory};
@@ -348,6 +350,11 @@ impl ProtonDriveClient {
         &self.api
     }
 
+    /// Returns the user's storage quota information (used_space, max_space) in bytes.
+    pub async fn get_user_storage_info(&self) -> anyhow::Result<(i64, i64)> {
+        self.account.get_user_storage_info().await
+    }
+
     /// Lists the direct children of a folder, or the root "My Files" folder if `parent_link_id` is `None`.
     /// Fetches, decrypts and returns all items up-front, collecting the stream into a `Vec`.
     pub async fn list_children(
@@ -442,33 +449,59 @@ impl ProtonDriveClient {
     ) -> anyhow::Result<Vec<u8>> {
         use proton_rpgp::{DataEncoding, Decryptor, SessionKey, pgp::crypto::sym::SymmetricKeyAlgorithm};
 
-        let secrets = FileOperations::get_secrets(self, node_uid.clone()).await?;
+        let secrets = FileOperations::get_secrets(self, node_uid.clone()).await
+            .context("Failed to get file secrets for thumbnail")?;
         let volume_id = node_uid.volume_id.clone();
 
         let resp = self
             .api()
             .files()
             .get_thumbnail_blocks(volume_id, vec![thumbnail_id.clone()])
-            .await?;
+            .await
+            .context("Failed to get thumbnail block info from server")?;
 
+        tracing::debug!(
+            "Looking for thumbnail_id='{}' in {} blocks: {:?}",
+            thumbnail_id,
+            resp.blocks.len(),
+            resp.blocks.iter().map(|b| b.thumbnail_id.as_str()).collect::<Vec<_>>()
+        );
+
+        let available_ids: Vec<String> = resp.blocks.iter().map(|b| b.thumbnail_id.clone()).collect();
         let block = resp
             .blocks
             .into_iter()
             .find(|b| b.thumbnail_id == thumbnail_id)
-            .ok_or_else(|| anyhow::anyhow!("thumbnail block not returned by server"))?;
+            .ok_or_else(|| anyhow::anyhow!("thumbnail block not returned by server: requested '{}' but got {:?}", 
+                thumbnail_id, available_ids))?;
+
+        tracing::debug!(
+            "Downloading thumbnail from {} (token len={})",
+            block.bare_url,
+            block.token.len()
+        );
 
         let response = self
             .api()
             .storage()
             .get_blob_stream(&block.bare_url, &block.token)
-            .await?;
-        let blob_bytes = response.bytes().await?;
+            .await
+            .context("Failed to initiate thumbnail blob download")?;
+
+        let content_length = response.content_length();
+        tracing::debug!("Thumbnail response content_length={:?}, status={}", content_length, response.status());
+
+        let blob_bytes = response.bytes().await
+            .context("Failed to read thumbnail blob bytes")?;
+        
+        tracing::debug!("Read {} bytes from thumbnail blob", blob_bytes.len());
 
         let alg = SymmetricKeyAlgorithm::from(secrets.content_key.algorithm);
         let sk = SessionKey::new(&secrets.content_key.key, alg);
         let result = Decryptor::default()
             .with_session_key(sk)
-            .decrypt(&blob_bytes, DataEncoding::Auto)?;
+            .decrypt(&blob_bytes, DataEncoding::Auto)
+            .context("Failed to decrypt thumbnail")?;
 
         Ok(result.data)
     }

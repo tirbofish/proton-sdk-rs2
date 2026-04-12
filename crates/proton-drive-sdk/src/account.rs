@@ -58,6 +58,7 @@ pub trait AccountClient: Send + Sync {
     ) -> anyhow::Result<Vec<PrivateKey>>;
     async fn get_address_public_keys(&self, email_address: &str) -> anyhow::Result<Vec<PublicKey>>;
     async fn get_user_keys(&self) -> anyhow::Result<Vec<PrivateKey>>;
+    async fn get_user_storage_info(&self) -> anyhow::Result<(i64, i64)>;
 }
 
 pub struct AccountClientAdapter {
@@ -104,5 +105,9 @@ impl AccountClient for AccountClientAdapter {
 
     async fn get_user_keys(&self) -> anyhow::Result<Vec<PrivateKey>> {
         self.client.get_user_keys().await
+    }
+
+    async fn get_user_storage_info(&self) -> anyhow::Result<(i64, i64)> {
+        self.client.get_user_storage_info().await
     }
 }

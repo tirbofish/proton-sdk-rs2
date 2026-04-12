@@ -1,6 +1,7 @@
 pub mod photos;
 pub mod thumbnail;
 
+use anyhow::Context;
 use crate::api::ApiResponse;
 use crate::api::block::{BlockUploadPreparationRequest, BlockUploadPreparationResponse};
 use crate::api::file::thumbnail::{ThumbnailBlockListRequest, ThumbnailBlockListResponse};
@@ -382,15 +383,31 @@ impl FilesApiClient for DefaultFilesApiClient {
         let url = self
             .base_url
             .join(&format!("volumes/{}/thumbnails", volume_id.raw()))?;
+        
+        tracing::debug!("Fetching thumbnail blocks: url={}, thumbnail_ids={:?}", url, thumbnail_ids);
+        
         let builder = self
             .client
             .post(url)
-            .json(&ThumbnailBlockListRequest { thumbnail_ids });
+            .json(&ThumbnailBlockListRequest { thumbnail_ids: thumbnail_ids.clone() });
         let builder = self.add_auth_headers(builder).await?;
-        Ok(builder
-            .send()
-            .await?
-            .json::<ThumbnailBlockListResponse>()
-            .await?)
+        let response = builder.send().await?;
+        
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_else(|_| "<failed to read body>".to_string());
+        
+        if !status.is_success() {
+            tracing::warn!("Thumbnail blocks API returned error: status={}, body={}", status, body_text);
+            anyhow::bail!("Thumbnail blocks API failed with status {}: {}", status, body_text);
+        }
+        
+        tracing::debug!("Thumbnail blocks API response: {}", body_text);
+        
+        let parsed: ThumbnailBlockListResponse = serde_json::from_str(&body_text)
+            .with_context(|| format!("Failed to parse thumbnail blocks response: {}", body_text))?;
+        
+        tracing::debug!("Parsed {} thumbnail blocks", parsed.blocks.len());
+        
+        Ok(parsed)
     }
 }

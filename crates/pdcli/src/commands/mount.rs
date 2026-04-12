@@ -59,8 +59,6 @@ const ROOT_INODE: u64 = 1;
 /// Virtual folder inodes for the root-level structure.
 /// These are synthetic folders that group different Proton Drive features.
 const MYFILES_INODE: u64 = 2;
-const COMPUTERS_INODE: u64 = 3;
-const PHOTOS_INODE: u64 = 4;
 
 /// First inode available for actual Proton Drive nodes.
 const FIRST_DYNAMIC_INODE: u64 = 100;
@@ -1222,50 +1220,16 @@ impl ProtonDriveFs {
             is_album: false,
         });
         inner.nodes.insert(ROOT_INODE, virtual_root);
-        inner.children.insert(ROOT_INODE, vec![MYFILES_INODE, COMPUTERS_INODE, PHOTOS_INODE]);
+        inner.children.insert(ROOT_INODE, vec![MYFILES_INODE]);
         inner.loaded_folders.insert(ROOT_INODE); // Virtual root is always "loaded"
         
-        // Create "My Files" virtual folder (inode 2) - backed by actual Proton folder
+        // Create "MyFiles" virtual folder (inode 2) - backed by actual Proton folder
         let mut my_files_meta = ProtonFolderMetadata::from_folder_node(&my_files_folder, false);
-        my_files_meta.name = "My Files".to_string(); // Override the name to show "My Files"
+        my_files_meta.name = "MyFiles".to_string(); // Override the name to show "MyFiles"
         let my_files_node = FsNode::Folder(my_files_meta);
         inner.uid_to_inode.insert(my_files_folder.base.uid.to_string(), MYFILES_INODE);
         inner.nodes.insert(MYFILES_INODE, my_files_node);
         inner.children.insert(MYFILES_INODE, Vec::new());
-        
-        // Create "Computers" virtual folder (inode 3) - placeholder for future
-        let computers_folder = FsNode::Folder(ProtonFolderMetadata {
-            uid: NodeUid::new(dummy_volume.clone(), LinkId::new("_computers_".to_string())),
-            parent_uid: Some(NodeUid::new(dummy_volume.clone(), LinkId::new("_root_".to_string()))),
-            name: "Computers".to_string(),
-            creation_time: now,
-            trash_time: None,
-            author_email: None,
-            name_author_email: None,
-            owner_email: None,
-            owner_organisation: None,
-            is_album: false,
-        });
-        inner.nodes.insert(COMPUTERS_INODE, computers_folder);
-        inner.children.insert(COMPUTERS_INODE, Vec::new());
-        inner.loaded_folders.insert(COMPUTERS_INODE); // Empty for now
-        
-        // Create "Photos" virtual folder (inode 4) - placeholder for future
-        let photos_folder = FsNode::Folder(ProtonFolderMetadata {
-            uid: NodeUid::new(dummy_volume.clone(), LinkId::new("_photos_".to_string())),
-            parent_uid: Some(NodeUid::new(dummy_volume.clone(), LinkId::new("_root_".to_string()))),
-            name: "Photos".to_string(),
-            creation_time: now,
-            trash_time: None,
-            author_email: None,
-            name_author_email: None,
-            owner_email: None,
-            owner_organisation: None,
-            is_album: false,
-        });
-        inner.nodes.insert(PHOTOS_INODE, photos_folder);
-        inner.children.insert(PHOTOS_INODE, Vec::new());
-        inner.loaded_folders.insert(PHOTOS_INODE); // Empty for now
         
         drop(inner);
         

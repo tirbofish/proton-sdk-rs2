@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 readme.workspace = true
 authors.workspace = true
+description = "A rusty way to create sessions for the Proton suite"
 
 [dependencies]
 semver.workspace = true

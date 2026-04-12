@@ -4,6 +4,6 @@ fn main() {
     config.extern_path(".google.protobuf.Any", "crate::utils::Any");
     config.type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]");
     config
-        .compile_protos(&["../../protos/proton.sdk.proto"], &["../../protos"])
+        .compile_protos(&["proton.sdk.proto"], &["."])
         .unwrap();
 }

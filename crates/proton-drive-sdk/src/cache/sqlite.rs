@@ -73,9 +73,10 @@ impl CacheRepository for SqliteCacheRepository {
         let max = self.max_cache_size;
 
         if let Some(max_size) = max {
-            let count: usize = conn
+            let count: i64 = conn
                 .query_row("SELECT COUNT(*) FROM Entries", [], |row| row.get(0))
                 .context("Failed to count entries")?;
+            let count = count as usize;
 
             if count >= max_size {
                 let key_exists: bool = conn

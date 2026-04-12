@@ -11,14 +11,18 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.dependencies]
+proton-srp = { version = "0.8", features = ["pgpinternal"]}
+proton-crypto = { version = "0.12" }
+proton-rpgp = { version = "0.3" }
+proton-sdk-rs2 = { version = "0.1", path = "crates/proton-sdk-rs2" }
+
 semver = { version = "1.0", features = ["serde"] }
 anyhow = "1.0"
-prost-build = "0.11"
-prost = "0.11"
-prost-types = "0.11"
+prost-build = "0.14"
+prost = "0.14"
+prost-types = "0.14"
 reqwest = { version = "0.13", features = ["json"] }
-proton-srp = { git = "https://github.com/ProtonMail/proton-crypto-rs", features = ["pgpinternal"]}
-tokio = { version = "1.50", features = ["full"] }
+tokio = { version = "1.51", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 log = "0.4"
@@ -28,27 +32,26 @@ http = "1.4"
 async-trait = "0.1"
 base64 = "0.22"
 futures = "0.3"
-proton-crypto = { version = "*", registry = "proton" }
 ron = "0.12"
 chrono = { version = "0.4", features = ["serde"]}
-proton-rpgp = { git = "https://github.com/ProtonMail/proton-crypto-rs" }
 bytes = "1.11"
 bitflags = "2.11"
-sha2 = "0.11.0-rc.5"
-sha1 = "0.10.6"
-hmac = "0.13.0-rc.5"
+sha2 = "0.11"
+sha1 = "0.11"
+hmac = "0.13"
 hex = "0.4.3"
 serde_with = "3.18.0"
 serde_repr = "0.1.20"
-reqwest-middleware = { version = "0.5.1", features = ["json", "multipart"] }
-rand = "0.8.5"
-smallvec = "1.15.1"
-thiserror = "2.0.18"
-tracing = "0.1.44"
+reqwest-middleware = { version = "0.5", features = ["json", "multipart"] }
+rand = "0.10"
+smallvec = "1.15"
+thiserror = "2.0"
+tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-parking_lot = { version = "0.12.5", features = ["deadlock_detection"] }
-mime_guess = "2.0.5"
-image = { version = "0.25.5", features = ["png", "jpeg", "webp"] }
-rpassword = "7.4.0"
-rusqlite = { version = "0.32", features = ["bundled"] }
+parking_lot = { version = "0.12", features = ["deadlock_detection"] }
+mime_guess = "2.0"
+image = { version = "0.25", features = ["png", "jpeg", "webp"] }
+rpassword = "7.4"
+rusqlite = { version = "0.39", features = ["bundled"] }
 aes-gcm = "0.10"
+keyring = { version = "3.6", features = ["linux-native", "sync-secret-service", "windows-native", "apple-native"] }

@@ -6,9 +6,10 @@ license.workspace = true
 repository.workspace = true
 readme.workspace = true
 authors.workspace = true
+description = "Interface with the Proton Drive client"
 
 [dependencies]
-proton-sdk-rs2 = { path = "../proton-sdk-rs2" }
+proton-sdk-rs2.workspace = true
 
 proton-crypto.workspace = true
 reqwest.workspace = true
@@ -43,18 +44,22 @@ mime_guess.workspace = true
 image = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 aes-gcm = { workspace = true, optional = true }
-keyring = { version = "3.6", features = ["linux-native", "sync-secret-service", "windows-native", "apple-native"], optional = true }
+keyring = { workspace = true, optional = true }
 
 [build-dependencies]
 prost-build.workspace = true
 
 [features]
 default = ["cache-sqlite", "thumbnail-generation"]
+
 # SQLite-backed cache repository
 cache-sqlite = ["rusqlite"]
+
 # AES-256-GCM encrypted cache repository decorator
 cache-encrypted = ["aes-gcm"]
-# System keyring storage for secrets (experimental)
+
+# System keyring storage for secrets
 cache-keyring = ["keyring"]
+
 # Thumbnail generation from images
 thumbnail-generation = ["image"]

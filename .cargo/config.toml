@@ -1,2 +1,0 @@
-[registries]
-proton = { index = "sparse+https://rust-registry.proton.me/index/" }

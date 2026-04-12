@@ -314,19 +314,19 @@ pub mod any_serde_helper {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Default)]
 pub struct Timestamp {
     pub seconds: i64,
     pub nanos: i32,
 }
 
 impl prost::Message for Timestamp {
-    fn encode_raw<B: prost::bytes::BufMut>(&self, _buf: &mut B) {}
-    fn merge_field<B: prost::bytes::Buf>(
+    fn encode_raw(&self, _buf: &mut impl prost::bytes::BufMut) {}
+    fn merge_field(
         &mut self,
         _tag: u32,
         _wire_type: prost::encoding::WireType,
-        _buf: &mut B,
+        _buf: &mut impl prost::bytes::Buf,
         _ctx: prost::encoding::DecodeContext,
     ) -> Result<(), prost::DecodeError> {
         Ok(())
@@ -337,19 +337,19 @@ impl prost::Message for Timestamp {
     fn clear(&mut self) {}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Default)]
 pub struct Any {
     pub type_url: String,
     pub value: Vec<u8>,
 }
 
 impl prost::Message for Any {
-    fn encode_raw<B: prost::bytes::BufMut>(&self, _buf: &mut B) {}
-    fn merge_field<B: prost::bytes::Buf>(
+    fn encode_raw(&self, _buf: &mut impl prost::bytes::BufMut) {}
+    fn merge_field(
         &mut self,
         _tag: u32,
         _wire_type: prost::encoding::WireType,
-        _buf: &mut B,
+        _buf: &mut impl prost::bytes::Buf,
         _ctx: prost::encoding::DecodeContext,
     ) -> Result<(), prost::DecodeError> {
         Ok(())

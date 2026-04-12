@@ -1,7 +1,7 @@
 use crate::pgp::PgpPrivateKey;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use proton_rpgp::{KeyGenerationType, KeyGenerator};
-use rand::RngCore;
+use rand::RngExt;
 use sha2::{Digest, Sha256};
 use std::io::{self, Read, Write};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -17,7 +17,7 @@ impl CryptoGenerator {
     /// Generates a base64-encoded passphrase from 32 random bytes.
     pub fn generate_passphrase() -> String {
         let mut random_bytes = [0u8; PASSPHRASE_RANDOM_BYTES_LENGTH];
-        rand::thread_rng().fill_bytes(&mut random_bytes);
+        rand::rng().fill(&mut random_bytes);
         STANDARD.encode(random_bytes)
     }
 
@@ -34,7 +34,7 @@ impl CryptoGenerator {
     /// Generates a new PGP session key.
     pub fn generate_session_key() -> crate::pgp::PgpSessionKey {
         let mut key = vec![0u8; 32];
-        rand::thread_rng().fill_bytes(&mut key);
+        rand::rng().fill(&mut key[..]);
         crate::pgp::PgpSessionKey {
             algorithm: 9, // AES256
             key,
@@ -44,7 +44,7 @@ impl CryptoGenerator {
     /// Generates a new folder hash key.
     pub fn generate_folder_hash_key() -> Vec<u8> {
         let mut key = vec![0u8; FOLDER_HASH_KEY_LENGTH];
-        rand::thread_rng().fill_bytes(&mut key);
+        rand::rng().fill(&mut key[..]);
         key
     }
 }

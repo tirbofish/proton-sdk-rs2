@@ -7,8 +7,7 @@
 //! use proton_sdk_rs2::AppVersionConfiguration;
 //! use proton_sdk_rs2::client::ProtonClientOptions;
 //! use proton_sdk_rs2::session::ProtonAPISession;
-//! use futures::StreamExt;
-//! use std::pin::pin;
+//! use proton_drive_sdk::futures::StreamExt;
 //!
 //! #[tokio::main]
 //! async fn main() {
@@ -26,7 +25,7 @@
 //!     // now you can do all your drive functions
 //!     let folder_node = client.get_my_files_folder().await.unwrap();
 //!
-//!     let mut children = pin!(client.enumerate_folder_children(&folder_node).await.unwrap());
+//!     let mut children = client.enumerate_folder_children(&folder_node).await.unwrap().boxed();
 //!     while let Some(child) = children.next().await {
 //!         let _node = child.unwrap();
 //!     }
@@ -57,6 +56,8 @@ pub mod volume_operations;
 pub mod photo;
 
 pub use proton_sdk_rs2;
+
+pub use futures; // re-export since streams are heavily used
 
 pub mod protobuf {
     include!(concat!(env!("OUT_DIR"), "/proton.drive.sdk.rs"));

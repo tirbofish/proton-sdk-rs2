@@ -8,6 +8,6 @@ fn main() {
     config.extern_path(".proton.sdk", "::proton_sdk_rs2::protobuf");
     config.type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]");
     config
-        .compile_protos(&["../../protos/proton.drive.sdk.proto"], &["../../protos"])
+        .compile_protos(&["proton.drive.sdk.proto"], &["."])
         .unwrap();
 }

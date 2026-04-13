@@ -142,12 +142,14 @@ impl ProtonClientConfiguration {
             builder = builder.timeout(total_request_timeout);
         }
 
+        builder = builder
+            .pool_max_idle_per_host(10)
+            .pool_idle_timeout(std::time::Duration::from_secs(90));
+
         if !matches!(self.tls_policy, ProtonClientTlsPolicy::Strict) {
             builder = builder.danger_accept_invalid_certs(true);
         }
 
-        // TODO: Custom message handlers, retry/circuit-breaker policies, cookie container,
-        // and session authorization middleware require additional middleware abstractions.
         builder.build().map_err(Into::into)
     }
 }

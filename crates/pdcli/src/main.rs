@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod cancellation;
 pub mod fs;
+pub mod index;
 pub mod thumbnail;
 pub mod mount;
 
@@ -17,7 +18,8 @@ use crate::cancellation::{CancellationStack, CancellationGuard, spawn_ctrlc_hand
 
 #[derive(Parser)]
 #[command(name = "pdcli")]
-#[command(about = "Proton Drive CLI", long_about = None)]
+#[command(version)]
+#[command(about = "Proton Drive Command Line Interface (pdcli)", long_about = None)]
 struct Cli {
     /// Clear the file download cache (keeps session)
     #[arg(long)]
@@ -48,6 +50,16 @@ enum Commands {
         /// Path to mount the drive
         path: PathBuf,
     },
+    /// Download files for offline access
+    Hydrate {
+        /// Path within MyFiles to hydrate (e.g., "Documents" or "Photos/2024")
+        path: String,
+        /// Recursively hydrate all subdirectories
+        #[arg(short, long)]
+        recursive: bool,
+    },
+    /// Show offline index status
+    Status,
 }
 
 /// The main CLI application with hierarchical cancellation support.
@@ -281,7 +293,94 @@ impl ProtonDriveCommandLineInterface {
                     Ok(()) => Ok(())
                 }
             }
+            Commands::Hydrate { path, recursive } => {
+                // Ensure authenticated before hydrating
+                if !self.auth.ensure_authenticated().await? {
+                    println!("{}", style("Authentication required. Exiting.").red());
+                    return Ok(());
+                }
+
+                // Open the index
+                let index_path = dirs::config_dir()
+                    .context("Could not determine config directory")?
+                    .join("pdcli")
+                    .join("index.db");
+                let index = std::sync::Arc::new(crate::index::OfflineIndex::open(&index_path)?);
+
+                println!();
+                println!("  {} {}", style("Hydrating:").bold(), style(&path).cyan());
+                if recursive {
+                    println!("  {} recursive", style("Mode:").bold());
+                }
+                println!();
+
+                // Get the session and drive client
+                let session_guard = self.auth.session().await
+                    .ok_or_else(|| anyhow::anyhow!("No session after authentication"))?;
+                let session = session_guard.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Session is None in guard"))?;
+
+                // Create drive client
+                let drive_client = proton_drive_sdk::client::ProtonDriveClient::new(session, None)
+                    .context("Failed to create drive client")?;
+
+                // Hydrate the path
+                crate::mount::hydrate(&drive_client, &index, &path, recursive, guard.token()).await?;
+
+                println!();
+                println!("{}", style("Hydration complete!").green().bold());
+
+                Ok(())
+            }
+            Commands::Status => {
+                // Open the index
+                let index_path = dirs::config_dir()
+                    .context("Could not determine config directory")?
+                    .join("pdcli")
+                    .join("index.db");
+
+                if !index_path.exists() {
+                    println!("{}", style("No index found. Run 'pdcli mount' first.").yellow());
+                    return Ok(());
+                }
+
+                let index = crate::index::OfflineIndex::open(&index_path)?;
+                let stats = index.stats()?;
+
+                println!();
+                println!("  {}", style("Offline Index Status").bold().cyan());
+                println!();
+                println!("  {} {}", style("Indexed nodes:").bold(), stats.node_count);
+                println!("    {} files, {} folders", stats.file_count, stats.folder_count);
+                println!();
+                println!("  {} {}", style("Offline files:").bold(), stats.offline_count);
+                println!("    {} total", format_size(stats.offline_size));
+                println!();
+                println!("  {} {}", style("Pending changes:").bold(), stats.mutation_count);
+                if stats.mutation_count > 0 {
+                    println!("    (will sync automatically when mounted)");
+                }
+                println!();
+
+                Ok(())
+            }
         }
+    }
+}
+
+fn format_size(bytes: i64) -> String {
+    const KB: i64 = 1024;
+    const MB: i64 = KB * 1024;
+    const GB: i64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} bytes", bytes)
     }
 }
 

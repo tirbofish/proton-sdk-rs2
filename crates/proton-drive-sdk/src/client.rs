@@ -745,6 +745,35 @@ impl ProtonDriveClient {
         Ok(())
     }
 
+    /// Deletes any draft revisions for the given file.
+    /// This is useful for cleaning up abandoned drafts before creating a new revision.
+    /// Returns the number of drafts deleted.
+    pub async fn delete_draft_revisions(&self, node_uid: NodeUid) -> anyhow::Result<usize> {
+        let resp = self
+            .api()
+            .files()
+            .get_revisions(node_uid.volume_id.clone(), node_uid.link_id.clone())
+            .await?;
+
+        let mut deleted = 0;
+        for dto in resp.revisions {
+            if dto.state == RevisionState::Draft {
+                let revision_uid = RevisionUid::new(node_uid.clone(), dto.id);
+                match self.delete_revision(revision_uid).await {
+                    Ok(()) => {
+                        deleted += 1;
+                        tracing::info!("Deleted draft revision for {:?}", node_uid);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to delete draft revision: {}", e);
+                    }
+                }
+            }
+        }
+
+        Ok(deleted)
+    }
+
     /// Downloads the active revision of a file node and writes it to `path` on disk.
     /// `on_progress` is called with (bytes_written, total_bytes) as data arrives.
     pub async fn download_to_file(

@@ -3,18 +3,24 @@ use crate::client::ProtonDriveClient;
 use crate::node::revision::RevisionUid;
 use crate::node::transfer::TransferQueue;
 use crate::pgp::{PgpPrivateKey, PgpSessionKey};
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use log::{debug, error, info};
 use proton_rpgp::{DataEncoding, Decryptor, SessionKey, pgp::crypto::sym::SymmetricKeyAlgorithm};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicI32, Ordering};
 use std::time::Duration;
 use tokio::sync::watch;
 
 pub const MIN_BLOCK_INDEX: i32 = 1;
 pub const DEFAULT_BLOCK_PAGE_SIZE: i32 = 10;
+
+pub const MAX_CONCURRENT_DOWNLOADS: usize = 5;
+pub const MAX_BUFFERED_DOWNLOAD_BLOCKS: usize = 10;
 
 #[derive(Debug, thiserror::Error)]
 #[error("File authenticity check failed: {message}")]
@@ -368,5 +374,171 @@ impl RevisionReader {
         (self.release_block_listing)(1);
 
         Ok(Some(block_data))
+    }
+
+    /// Download all blocks in parallel and write them to the output stream in order.
+    /// This is significantly faster than sequential downloads for files with many blocks.
+    ///
+    /// The method downloads up to `MAX_CONCURRENT_DOWNLOADS` blocks simultaneously,
+    /// buffers them, and writes them to the output stream in the correct order.
+    pub async fn read_all_blocks_parallel<W: std::io::Write + Send + ?Sized>(
+        &self,
+        output: &mut W,
+        on_progress: impl Fn(i64, i64) + Send + Sync,
+    ) -> anyhow::Result<()> {
+        let total_blocks = self.state.revision_dto.blocks.len();
+        if total_blocks == 0 {
+            return Ok(());
+        }
+
+        let total_size = self.state.revision_dto.revision.size;
+        let content_key = self.state.content_key.clone();
+        
+        // Track which block we're downloading next and which we're writing next
+        let next_download_index = Arc::new(AtomicI32::new(1));
+        let mut next_write_index: i32 = 1;
+        let mut bytes_written: i64 = 0;
+        
+        // Buffer for out-of-order blocks awaiting write
+        let mut buffered_blocks: BTreeMap<i32, (Vec<u8>, Vec<u8>)> = BTreeMap::new();
+        
+        // Active downloads
+        let mut download_futures: FuturesUnordered<tokio::task::JoinHandle<anyhow::Result<(i32, Vec<u8>, Vec<u8>)>>> = 
+            FuturesUnordered::new();
+        
+        // Start initial batch of downloads
+        while download_futures.len() < MAX_CONCURRENT_DOWNLOADS 
+            && next_download_index.load(Ordering::SeqCst) <= total_blocks as i32 
+        {
+            let idx = next_download_index.fetch_add(1, Ordering::SeqCst);
+            if idx > total_blocks as i32 {
+                break;
+            }
+            
+            let block_dto = &self.state.revision_dto.blocks[(idx - 1) as usize];
+            let client = self.client.clone();
+            let bare_url = block_dto.bare_url.clone();
+            let token = block_dto.token.clone();
+            let ck = content_key.clone();
+            
+            let handle = tokio::spawn(async move {
+                Self::download_and_decrypt_block(&client, idx, &bare_url, &token, &ck).await
+            });
+            download_futures.push(handle);
+        }
+        
+        // Process downloads as they complete
+        while !download_futures.is_empty() || next_write_index <= total_blocks as i32 {
+            // Wait for a download to complete
+            if let Some(result) = download_futures.next().await {
+                let (block_idx, data, digest) = result??;
+                
+                debug!(
+                    "Block {} downloaded ({} bytes), next_write={}",
+                    block_idx, data.len(), next_write_index
+                );
+                
+                // Start a new download if there are more blocks
+                let next_idx = next_download_index.fetch_add(1, Ordering::SeqCst);
+                if next_idx <= total_blocks as i32 {
+                    let block_dto = &self.state.revision_dto.blocks[(next_idx - 1) as usize];
+                    let client = self.client.clone();
+                    let bare_url = block_dto.bare_url.clone();
+                    let token = block_dto.token.clone();
+                    let ck = content_key.clone();
+                    
+                    let handle = tokio::spawn(async move {
+                        Self::download_and_decrypt_block(&client, next_idx, &bare_url, &token, &ck).await
+                    });
+                    download_futures.push(handle);
+                }
+                
+                // Buffer this block
+                buffered_blocks.insert(block_idx, (data, digest));
+                
+                // Write any blocks we can in order
+                while let Some((data, digest)) = buffered_blocks.remove(&next_write_index) {
+                    output.write_all(&data)?;
+                    bytes_written += data.len() as i64;
+                    
+                    self.state.add_downloaded_block_digest(digest);
+                    self.state.add_number_of_bytes_written(data.len() as i64);
+                    (self.release_block_listing)(1);
+                    
+                    on_progress(bytes_written, total_size);
+                    next_write_index += 1;
+                }
+            } else if download_futures.is_empty() {
+                // No more pending downloads, write remaining buffered blocks
+                while let Some((idx, (data, digest))) = buffered_blocks.pop_first() {
+                    if idx != next_write_index {
+                        return Err(anyhow::anyhow!(
+                            "Block ordering error: expected {}, got {}",
+                            next_write_index, idx
+                        ));
+                    }
+                    output.write_all(&data)?;
+                    bytes_written += data.len() as i64;
+                    
+                    self.state.add_downloaded_block_digest(digest);
+                    self.state.add_number_of_bytes_written(data.len() as i64);
+                    (self.release_block_listing)(1);
+                    
+                    on_progress(bytes_written, total_size);
+                    next_write_index += 1;
+                }
+                break;
+            }
+        }
+        
+        debug!(
+            "Parallel download complete: {} blocks, {} bytes",
+            total_blocks, bytes_written
+        );
+        
+        Ok(())
+    }
+    
+    /// Download and decrypt a single block, returning (block_index, decrypted_data, sha256_digest).
+    async fn download_and_decrypt_block(
+        client: &ProtonDriveClient,
+        block_index: i32,
+        bare_url: &str,
+        token: &str,
+        content_key: &PgpSessionKey,
+    ) -> anyhow::Result<(i32, Vec<u8>, Vec<u8>)> {
+        let response = client
+            .api()
+            .storage()
+            .get_blob_stream(bare_url, token)
+            .await?;
+        let blob_bytes = response.bytes().await?;
+        
+        // Hash the encrypted bytes for verification
+        let mut hasher = Sha256::new();
+        hasher.update(&blob_bytes);
+        let digest = hasher.finalize().to_vec();
+        
+        // Decrypt
+        let alg = SymmetricKeyAlgorithm::from(content_key.algorithm);
+        let sk = SessionKey::new(&content_key.key, alg);
+        
+        let result = match Decryptor::default()
+            .with_session_key(sk)
+            .decrypt(&blob_bytes, DataEncoding::Auto)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Failed to decrypt block {}: {:?}", block_index, e);
+                return Err(FileContentsDecryptionException::WithCause(e.into()).into());
+            }
+        };
+        
+        debug!(
+            "Block {} decrypted: {} encrypted -> {} decrypted bytes",
+            block_index, blob_bytes.len(), result.data.len()
+        );
+        
+        Ok((block_index, result.data, digest))
     }
 }

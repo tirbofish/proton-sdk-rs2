@@ -52,29 +52,18 @@ impl FileDownloader {
             tracing::debug!("Download state created: {} blocks, size={}", num_blocks, download_state.revision_dto.revision.size);
 
             let download_state = Arc::new(download_state);
-            let mut reader = RevisionOperations::open_for_reading(
+            let reader = RevisionOperations::open_for_reading(
                 &client,
                 download_state.clone(),
                 Box::new(|_| {}),
             );
 
-            let total_size = download_state.revision_dto.revision.size;
-            let mut total_downloaded = 0;
-
-            loop {
-                let block = match reader.read_next_block().await {
-                    Ok(Some(b)) => b,
-                    Ok(None) => break,
-                    Err(e) => {
-                        tracing::error!("Failed to read block: {:?}", e);
-                        return Err(e);
-                    }
-                };
-
-                content_output_stream.write_all(&block)?;
-                total_downloaded += block.len() as i64;
-                on_progress(total_downloaded, total_size);
-            }
+            // Use parallel downloads for better performance (downloads up to 5 blocks concurrently)
+            reader
+                .read_all_blocks_parallel(&mut *content_output_stream, |downloaded, total| {
+                    on_progress(downloaded, total);
+                })
+                .await?;
             
             // Ensure all buffered data is flushed before returning
             content_output_stream.flush()?;

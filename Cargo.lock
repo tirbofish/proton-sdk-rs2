@@ -3140,6 +3140,7 @@ dependencies = [
  "proton-drive-sdk",
  "proton-sdk-rs2",
  "ron",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",

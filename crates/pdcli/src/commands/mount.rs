@@ -49,6 +49,7 @@ use proton_drive_sdk::revision::RevisionId;
 use proton_drive_sdk::utils::PotentialObject;
 use proton_drive_sdk::volume::VolumeId;
 use proton_sdk_rs2::session::ProtonAPISession;
+use serde::{Deserialize, Serialize};
 
 /// Time-to-live for cached attributes.
 const TTL: Duration = Duration::from_secs(1);
@@ -74,6 +75,262 @@ const EVENT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Maximum age for a cached thumbnail to be considered valid (24 hours)
 const THUMBNAIL_CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
+// ============================================================================
+// Thumbnail Configuration
+// ============================================================================
+
+/// Configuration for thumbnail/preview process detection.
+/// This allows users to customize which processes are allowed to read file content
+/// vs blocked (treated as thumbnailers that shouldn't trigger downloads).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThumbnailConfig {
+    /// Processes explicitly allowed to read file content (viewers, editors).
+    /// These are checked by executable path (e.g., "/usr/bin/papers").
+    #[serde(default)]
+    pub allowed_exes: Vec<String>,
+    
+    /// Processes to block from reading uncached file content.
+    /// These are checked by executable path (e.g., "/usr/bin/nautilus").
+    #[serde(default)]
+    pub blocked_exes: Vec<String>,
+    
+    /// Process names (from /proc/pid/comm) that are always allowed.
+    #[serde(default)]
+    pub allowed_names: Vec<String>,
+    
+    /// Process names that should be blocked (thumbnailers, indexers).
+    #[serde(default)]
+    pub blocked_names: Vec<String>,
+}
+
+impl Default for ThumbnailConfig {
+    fn default() -> Self {
+        Self {
+            allowed_exes: vec![
+                // PDF/Document viewers
+                "/papers".to_string(),
+                "/evince".to_string(),
+                "/okular".to_string(),
+                "/zathura".to_string(),
+                // Text editors
+                "/gedit".to_string(),
+                "/gnome-text-editor".to_string(),
+                "/kate".to_string(),
+                "/kwrite".to_string(),
+                "/mousepad".to_string(),
+                "/pluma".to_string(),
+                "/xed".to_string(),
+                // Image viewers
+                "/loupe".to_string(),
+                "/eog".to_string(),
+                "/gwenview".to_string(),
+                "/feh".to_string(),
+                "/sxiv".to_string(),
+                // Video players
+                "/totem".to_string(),
+                "/vlc".to_string(),
+                "/mpv".to_string(),
+                "/celluloid".to_string(),
+                // Browsers
+                "/firefox".to_string(),
+                "/chromium".to_string(),
+                "/chrome".to_string(),
+                "/brave".to_string(),
+                // Office
+                "/libreoffice".to_string(),
+                "/soffice".to_string(),
+                // Code editors
+                "/code".to_string(),
+                "/codium".to_string(),
+                "/sublime_text".to_string(),
+                "/atom".to_string(),
+            ],
+            blocked_exes: vec![
+                // File managers - their pool threads read content for thumbnails
+                "/nautilus".to_string(),
+                "/dolphin".to_string(),
+                "/thunar".to_string(),
+                "/nemo".to_string(),
+                "/pcmanfm".to_string(),
+                "/caja".to_string(),
+                "/spacefm".to_string(),
+                // Thumbnailer paths
+                "/libexec/".to_string(),
+            ],
+            allowed_names: vec![
+                "papers".to_string(),
+                "evince".to_string(),
+                "gedit".to_string(),
+                "gnome-text-ed".to_string(),
+                "loupe".to_string(),
+                "eog".to_string(),
+                "totem".to_string(),
+                "vlc".to_string(),
+                "mpv".to_string(),
+                "firefox".to_string(),
+                "chromium".to_string(),
+                "chrome".to_string(),
+                "libreoffice".to_string(),
+                "soffice".to_string(),
+                "lowriter".to_string(),
+                "localc".to_string(),
+                "code".to_string(),
+                "codium".to_string(),
+            ],
+            blocked_names: vec![
+                // File managers
+                "nautilus".to_string(),
+                "dolphin".to_string(),
+                "thunar".to_string(),
+                "nemo".to_string(),
+                "pcmanfm".to_string(),
+                "caja".to_string(),
+                // Thumbnail services
+                "tumbler".to_string(),
+                "tumblerd".to_string(),
+                "tracker-extract".to_string(),
+                "tracker-miner-fs".to_string(),
+                "tracker".to_string(),
+            ],
+        }
+    }
+}
+
+impl ThumbnailConfig {
+    /// Load the thumbnail config from ~/.config/pdcli/thumbnails.toml
+    /// Creates a default config file if it doesn't exist.
+    pub fn load() -> Self {
+        let config_path = Self::config_path();
+        
+        if config_path.exists() {
+            match std::fs::read_to_string(&config_path) {
+                Ok(contents) => {
+                    match toml::from_str(&contents) {
+                        Ok(config) => {
+                            tracing::debug!("Loaded thumbnail config from {:?}", config_path);
+                            return config;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to parse thumbnail config: {}. Using defaults.", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to read thumbnail config: {}. Using defaults.", e);
+                }
+            }
+        } else {
+            // Create default config file
+            let default_config = Self::default();
+            if let Err(e) = default_config.save() {
+                tracing::warn!("Failed to create default thumbnail config: {}", e);
+            } else {
+                tracing::info!("Created default thumbnail config at {:?}", config_path);
+            }
+            return default_config;
+        }
+        
+        Self::default()
+    }
+    
+    /// Save the config to disk.
+    pub fn save(&self) -> Result<()> {
+        let config_path = Self::config_path();
+        
+        // Ensure parent directory exists
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        
+        let contents = toml::to_string_pretty(self)?;
+        
+        // Add helpful comments
+        let with_comments = format!(
+r#"# pdcli Thumbnail Configuration
+# 
+# This file controls which processes are allowed to read file content
+# vs blocked (treated as thumbnailers that shouldn't trigger downloads).
+#
+# Processes are identified by:
+# - Executable path (from /proc/pid/exe) - more reliable
+# - Process name (from /proc/pid/comm) - fallback, may be truncated to 15 chars
+#
+# Allowed processes can read file content and trigger downloads.
+# Blocked processes will get "Permission denied" for uncached files.
+#
+# Patterns are matched with contains() - "/papers" matches "/usr/bin/papers"
+
+{}"#, contents);
+        
+        std::fs::write(&config_path, with_comments)?;
+        Ok(())
+    }
+    
+    /// Get the config file path.
+    fn config_path() -> PathBuf {
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("pdcli")
+            .join("thumbnails.toml")
+    }
+    
+    /// Check if an executable path is explicitly allowed.
+    pub fn is_exe_allowed(&self, exe: &str) -> Option<bool> {
+        let exe_lower = exe.to_lowercase();
+        
+        // Check allowed first
+        for pattern in &self.allowed_exes {
+            if exe_lower.contains(&pattern.to_lowercase()) {
+                return Some(true);
+            }
+        }
+        
+        // Check blocked
+        for pattern in &self.blocked_exes {
+            if exe_lower.contains(&pattern.to_lowercase()) {
+                return Some(false);
+            }
+        }
+        
+        None // Not explicitly configured
+    }
+    
+    /// Check if a process name is explicitly allowed.
+    pub fn is_name_allowed(&self, name: &str) -> Option<bool> {
+        let name_lower = name.to_lowercase();
+        
+        // Check allowed first
+        for pattern in &self.allowed_names {
+            let pattern_lower = pattern.to_lowercase();
+            if name_lower.starts_with(&pattern_lower) || name_lower.contains(&pattern_lower) {
+                return Some(true);
+            }
+        }
+        
+        // Check blocked
+        for pattern in &self.blocked_names {
+            let pattern_lower = pattern.to_lowercase();
+            if name_lower.starts_with(&pattern_lower) || name_lower.contains(&pattern_lower) {
+                return Some(false);
+            }
+        }
+        
+        None // Not explicitly configured
+    }
+}
+
+/// Global thumbnail config, loaded once.
+static THUMBNAIL_CONFIG: std::sync::OnceLock<ThumbnailConfig> = std::sync::OnceLock::new();
+
+/// Get the global thumbnail config.
+fn get_thumbnail_config() -> &'static ThumbnailConfig {
+    THUMBNAIL_CONFIG.get_or_init(ThumbnailConfig::load)
+}
+
+// ============================================================================
+// End Thumbnail Configuration
+// ============================================================================
 
 /// Check if a valid freedesktop.org thumbnail already exists for the given file.
 /// Returns true if both "normal" and "large" thumbnails exist and are recent enough.
@@ -1083,6 +1340,7 @@ fn is_permanent_upload_error(error_msg: &str) -> bool {
         "API error 2000", // InvalidRequirements
         "API error 2001", // InvalidValue
         "API error 2011", // NotEnoughPermissions
+        "API error 2061", // InvalidEncryptedIdFormat - invalid LinkID (e.g., fake pending IDs)
         "API error 200001", // InsufficientQuota
         "API error 200002", // InsufficientSpace
         "API error 200003", // MaxFileSizeForFreeUser
@@ -1495,6 +1753,11 @@ pub struct ProtonDriveFs {
 impl ProtonDriveFs {
     /// Create a new filesystem instance.
     pub fn new(multi_progress: Arc<MultiProgress>, mount_path: &Path) -> Result<Self> {
+        // Initialize thumbnail config early (creates default config if needed)
+        let config = get_thumbnail_config();
+        tracing::info!("Loaded thumbnail config with {} allowed exes, {} blocked exes",
+            config.allowed_exes.len(), config.blocked_exes.len());
+        
         let ignore_manager = IgnoreManager::new()?;
         tracing::info!("Loaded global .pdclignore from {:?}", ignore_manager.global_ignore_path());
         
@@ -3279,7 +3542,7 @@ impl Filesystem for ProtonDriveFs {
             };
             
             if !is_cached {
-                tracing::debug!(
+                tracing::warn!(
                     "Blocking thumbnailer from uncached file: inode={}, file={}, process={} (pid {})",
                     inode, filename, proc_name, req.pid
                 );
@@ -3340,7 +3603,7 @@ impl Filesystem for ProtonDriveFs {
             let mut inner = self.inner.write().await;
             inner.write_buffers.insert(fh, WriteBuffer {
                 inode,
-                is_new: false,
+                is_new: is_pending, // New files not yet uploaded should use NewFile upload path
                 offset: 0,
                 content: existing_content,
                 dirty: is_truncate, // Truncated files are dirty
@@ -4045,13 +4308,28 @@ impl Filesystem for ProtonDriveFs {
 
         let results = client.trash_nodes(vec![node_uid.clone()]).await
             .map_err(|e| {
-                tracing::error!("Failed to trash file '{}': {}", name_str, e);
-                Errno::from(libc::EIO)
+                let error_str = e.to_string();
+                tracing::error!("Failed to trash file '{}': {}", name_str, error_str);
+                // If the node is already gone on the server, still clean up local state
+                if error_str.contains("not found") || error_str.contains("DoesNotExist") 
+                    || error_str.contains("2501") {
+                    Errno::new_not_exist()
+                } else {
+                    Errno::from(libc::EIO)
+                }
             })?;
 
         // Check result
         if let Some(Err(e)) = results.get(&node_uid) {
-            tracing::error!("Failed to trash file '{}': {}", name_str, e);
+            let error_str = e.to_string();
+            tracing::error!("Failed to trash file '{}': {}", name_str, error_str);
+            // If already not found, that's fine - just clean up local state
+            if error_str.contains("not found") || error_str.contains("DoesNotExist") 
+                || error_str.contains("2501") {
+                self.remove_node(parent, child_inode).await;
+                tracing::info!("File '{}' already gone from server, cleaned up local state", name_str);
+                return Ok(());
+            }
             return Err(Errno::from(libc::EIO));
         }
 
@@ -4086,22 +4364,8 @@ impl Filesystem for ProtonDriveFs {
                 Errno::from(libc::EIO)
             })?;
 
-        let results = client.trash_nodes(vec![node_uid.clone()]).await
-            .map_err(|e| {
-                tracing::error!("Failed to trash folder '{}': {}", name_str, e);
-                Errno::from(libc::EIO)
-            })?;
-
-        // Check result
-        if let Some(Err(e)) = results.get(&node_uid) {
-            tracing::error!("Failed to trash folder '{}': {}", name_str, e);
-            return Err(Errno::from(libc::EIO));
-        }
-
-        // Remove from filesystem state (including any cached children)
-        {
-            let mut inner = self.inner.write().await;
-            
+        // Helper function to clean up folder from local state
+        let cleanup_folder_from_state = |inner: &mut ProtonDriveFsInner, child_inode: u64, parent: u64| {
             // Recursively remove children from local state
             fn remove_children_recursive(inner: &mut ProtonDriveFsInner, inode: u64) {
                 if let Some(children) = inner.children.remove(&inode) {
@@ -4117,7 +4381,7 @@ impl Filesystem for ProtonDriveFs {
             }
             
             // Remove children first
-            remove_children_recursive(&mut inner, child_inode);
+            remove_children_recursive(inner, child_inode);
             
             // Remove the folder itself
             if let Some(node) = inner.nodes.remove(&child_inode) {
@@ -4129,6 +4393,40 @@ impl Filesystem for ProtonDriveFs {
             if let Some(parent_children) = inner.children.get_mut(&parent) {
                 parent_children.retain(|&c| c != child_inode);
             }
+        };
+
+        let results = client.trash_nodes(vec![node_uid.clone()]).await
+            .map_err(|e| {
+                let error_str = e.to_string();
+                tracing::error!("Failed to trash folder '{}': {}", name_str, error_str);
+                // If the node is already gone on the server, still clean up local state
+                if error_str.contains("not found") || error_str.contains("DoesNotExist") 
+                    || error_str.contains("2501") {
+                    Errno::new_not_exist()
+                } else {
+                    Errno::from(libc::EIO)
+                }
+            })?;
+
+        // Check result
+        if let Some(Err(e)) = results.get(&node_uid) {
+            let error_str = e.to_string();
+            tracing::error!("Failed to trash folder '{}': {}", name_str, error_str);
+            // If already not found, that's fine - just clean up local state
+            if error_str.contains("not found") || error_str.contains("DoesNotExist") 
+                || error_str.contains("2501") {
+                let mut inner = self.inner.write().await;
+                cleanup_folder_from_state(&mut inner, child_inode, parent);
+                tracing::info!("Folder '{}' already gone from server, cleaned up local state", name_str);
+                return Ok(());
+            }
+            return Err(Errno::from(libc::EIO));
+        }
+
+        // Remove from filesystem state (including any cached children)
+        {
+            let mut inner = self.inner.write().await;
+            cleanup_folder_from_state(&mut inner, child_inode, parent);
         }
 
         tracing::info!("Trashed folder '{}' (with contents)", name_str);
@@ -4419,12 +4717,14 @@ const FOPEN_DIRECT_IO: u32 = 1 << 0;
 
 /// Check if a process is a known thumbnailer/preview process.
 /// Returns true if the process should be blocked from downloading large files.
+/// 
+/// Uses the config from ~/.config/pdcli/thumbnails.toml to determine allowed/blocked processes.
 fn is_thumbnailer_process(proc_name: &str, pid: u32) -> bool {
+    let config = get_thumbnail_config();
     let name = proc_name.to_lowercase();
     
     // FIRST: Block anything with "thumbnailer" or "thumbnail" in the name
     // This catches evince-thumbnailer, papers-thumbnailer, totem-video-thumbnailer, etc.
-    // Check this BEFORE the allowed list to prevent thumbnailer variants from being allowed
     if name.contains("thumbnailer") || name.contains("thumbnail") {
         tracing::debug!("Blocking thumbnailer process: {}", proc_name);
         return true;
@@ -4455,134 +4755,71 @@ fn is_thumbnailer_process(proc_name: &str, pid: u32) -> bool {
         }
     }
     
-    // Explicitly allow known document viewers - NEVER block these
-    const ALLOWED_PROCESSES: &[&str] = &[
-        "papers",       // GNOME's new PDF viewer
-        "evince",       // GNOME's old PDF viewer
-        "okular",
-        "xreader",
-        "atril",
-        "zathura",
-        "mupdf",
-        "qpdfview",
-        "libreoffice",
-        "soffice.bin",
-        "lowriter",
-        "localc",
-        "loimpress",
-        "gimp",
-        "inkscape",
-        "eog",
-        "firefox",
-        "chromium",
-        "chrome",
-        "code",
-    ];
-    
-    for allowed in ALLOWED_PROCESSES {
-        if name == *allowed || name.starts_with(allowed) {
-            return false;
-        }
-    }
-    
     // GNOME's GLib threadpool workers have names like "pool-1", "pool-56", etc.
-    // These are used for both thumbnail generation AND legitimate app operations.
-    // We check the parent process to distinguish:
-    // - If parent is systemd → block (GNOME thumbnail service runs as systemd user unit)
-    // - If parent is a document viewer (evince, okular) → allow (legitimate)
+    // These are used for BOTH thumbnail generation AND legitimate app operations.
+    // For pool threads, we check the THREAD GROUP LEADER (the actual owning process),
+    // not the parent PID. Apps like Papers run as systemd services, so their threads
+    // show systemd as parent, but the thread group leader is the actual app.
     if name.starts_with("pool-") && pid > 0 {
-        // Get full parent chain for debugging
-        let (parent_name, grandparent_name) = get_parent_process_chain(pid);
+        // Get the thread group leader (the main process this thread belongs to)
+        let (tgid, tg_leader_name, tg_leader_exe) = get_thread_group_leader_with_exe(pid);
         tracing::debug!(
-            "Pool thread detected: proc={}, pid={}, parent={:?}, grandparent={:?}",
-            proc_name, pid, parent_name, grandparent_name
+            "Pool thread detected: proc={}, pid={}, tgid={:?}, leader={:?}, exe={:?}",
+            proc_name, pid, tgid, tg_leader_name, tg_leader_exe
         );
         
-        // Check both parent and grandparent - threads can be nested
-        let parents_to_check: Vec<String> = [parent_name, grandparent_name]
-            .into_iter()
-            .flatten()
-            .map(|s| s.to_lowercase())
-            .collect();
-        
-        if parents_to_check.is_empty() {
-            tracing::debug!("Pool thread: no parents found, allowing");
-            return false;
-        }
-        
-        // Allow if any parent is a known document viewer
-        const ALLOWED_PARENTS: &[&str] = &[
-            "evince",
-            "papers",        // GNOME's new PDF viewer (replaces Evince)
-            "okular", 
-            "xreader",
-            "atril",
-            "zathura",
-            "mupdf",
-            "qpdfview",
-            "libreoffice",
-            "soffice",
-            "lowriter",
-            "localc",
-            "loimpress",
-            "gimp",
-            "inkscape",
-            "eog",           // GNOME image viewer
-            "gpicview",
-            "feh",
-            "firefox",
-            "chromium",
-            "chrome",
-            "code",          // VS Code
-            "gedit",
-            "kate",
-            "vlc",
-            "mpv",
-            "totem",         // GNOME Videos (but not totem-video-thumbnailer)
-        ];
-        
-        for parent in &parents_to_check {
-            for allowed in ALLOWED_PARENTS {
-                if parent.contains(allowed) {
-                    tracing::debug!("Pool thread: parent {} is allowed (document viewer)", parent);
-                    return false;
-                }
-            }
-        }
-        
-        // Block if parent is systemd - this is GNOME's thumbnail service
-        // running as a systemd user unit (gnome-desktop-thumbnailer.service)
-        for parent in &parents_to_check {
-            if parent == "systemd" {
-                tracing::debug!("Pool thread: parent is systemd (thumbnail service), blocking");
+        // Check the thread group leader's executable path using config
+        if let Some(ref exe) = tg_leader_exe {
+            // Always block thumbnailer executables
+            let exe_lower = exe.to_lowercase();
+            if exe_lower.contains("thumbnailer") || exe_lower.contains("thumbnail") {
+                tracing::debug!("Pool thread: exe {} is thumbnailer, blocking", exe);
                 return true;
             }
-        }
-        
-        // Block if any parent is a file manager or shell (likely thumbnailing)
-        const BLOCKED_PARENTS: &[&str] = &[
-            "nautilus",
-            "dolphin",
-            "thunar",
-            "pcmanfm",
-            "nemo",
-            "caja",
-            "gnome-shell",
-            "gjs",
-            "tracker",
-        ];
-        
-        for parent in &parents_to_check {
-            for blocked in BLOCKED_PARENTS {
-                if parent.contains(blocked) {
-                    tracing::debug!("Pool thread: parent {} is blocked (file manager)", parent);
+            
+            // Check config for exe path
+            match config.is_exe_allowed(exe) {
+                Some(true) => {
+                    tracing::debug!("Pool thread: exe {} allowed by config", exe);
+                    return false;
+                }
+                Some(false) => {
+                    tracing::debug!("Pool thread: exe {} blocked by config", exe);
                     return true;
+                }
+                None => {
+                    // Not in config, continue to name check
                 }
             }
         }
         
-        // For unknown parents, allow by default (assume legitimate use)
-        tracing::debug!("Pool thread: unknown parents {:?}, allowing", parents_to_check);
+        // Check leader name using config
+        if let Some(ref leader) = tg_leader_name {
+            // Always block thumbnailer names
+            let leader_lower = leader.to_lowercase();
+            if leader_lower.contains("thumbnailer") || leader_lower.contains("thumbnail") {
+                tracing::debug!("Pool thread: leader {} is thumbnailer, blocking", leader);
+                return true;
+            }
+            
+            match config.is_name_allowed(leader) {
+                Some(true) => {
+                    tracing::debug!("Pool thread: leader {} allowed by config", leader);
+                    return false;
+                }
+                Some(false) => {
+                    tracing::debug!("Pool thread: leader {} blocked by config", leader);
+                    return true;
+                }
+                None => {
+                    // Not in config
+                }
+            }
+        }
+        
+        // For unknown pool threads, ALLOW by default
+        // This is safer - occasional thumbnailer downloads are better than blocking legitimate apps
+        tracing::debug!("Pool thread: unknown leader {:?}, allowing by default", tg_leader_name);
         return false;
     }
     
@@ -4600,59 +4837,46 @@ fn is_thumbnailer_process(proc_name: &str, pid: u32) -> bool {
         }
     }
     
+    // Default: ALLOW - don't block unknown processes
+    // This ensures legitimate apps like Papers, text editors, etc. work correctly
     false
 }
 
-/// Get the name of a process's parent and grandparent.
-fn get_parent_process_chain(pid: u32) -> (Option<String>, Option<String>) {
-    // Read /proc/pid/status to get PPid
+/// Get the thread group leader (Tgid) for a thread, including its executable path.
+/// For threads like "pool-X", this returns the PID, name, and exe of the main process they belong to.
+/// This is crucial because apps like Papers run as systemd services, so their worker threads
+/// have systemd as their parent, but the Tgid points to the actual Papers process.
+fn get_thread_group_leader_with_exe(pid: u32) -> (Option<u32>, Option<String>, Option<String>) {
+    // Read /proc/pid/status to get Tgid (Thread Group ID)
     let status_path = format!("/proc/{}/status", pid);
     let status = match std::fs::read_to_string(&status_path) {
         Ok(s) => s,
-        Err(_) => return (None, None),
+        Err(_) => return (None, None, None),
     };
     
-    let ppid: u32 = match status.lines()
-        .find(|line| line.starts_with("PPid:"))
+    let tgid: u32 = match status.lines()
+        .find(|line| line.starts_with("Tgid:"))
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
     {
-        Some(p) if p > 0 => p,
-        _ => return (None, None),
+        Some(t) if t > 0 => t,
+        _ => return (None, None, None),
     };
     
-    // Read parent's comm
-    let comm_path = format!("/proc/{}/comm", ppid);
-    let parent_name = std::fs::read_to_string(&comm_path)
+    // Read the comm of the thread group leader
+    let comm_path = format!("/proc/{}/comm", tgid);
+    let leader_name = std::fs::read_to_string(&comm_path)
         .ok()
         .map(|s| s.trim().to_string());
     
-    // Also get grandparent
-    let grandparent_name = {
-        let parent_status_path = format!("/proc/{}/status", ppid);
-        if let Ok(parent_status) = std::fs::read_to_string(&parent_status_path) {
-            if let Some(gppid) = parent_status.lines()
-                .find(|line| line.starts_with("PPid:"))
-                .and_then(|line| line.split_whitespace().nth(1))
-                .and_then(|s| s.parse::<u32>().ok())
-            {
-                if gppid > 0 {
-                    let gp_comm_path = format!("/proc/{}/comm", gppid);
-                    std::fs::read_to_string(&gp_comm_path)
-                        .ok()
-                        .map(|s| s.trim().to_string())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    };
+    // Read the exe symlink for the full executable path
+    // This is more reliable than comm since it shows the full path
+    let exe_path = format!("/proc/{}/exe", tgid);
+    let leader_exe = std::fs::read_link(&exe_path)
+        .ok()
+        .map(|p| p.to_string_lossy().to_string());
     
-    (parent_name, grandparent_name)
+    (Some(tgid), leader_name, leader_exe)
 }
 
 /// Add a bookmark to GTK's bookmarks file so it appears in Nautilus/Files sidebar.

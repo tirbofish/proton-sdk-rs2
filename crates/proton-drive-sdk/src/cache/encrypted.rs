@@ -9,7 +9,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use hmac::{Hmac, KeyInit, Mac};
 use proton_sdk_rs2::cache::CacheRepository;
-use rand::RngCore;
+use rand::RngExt;
 use sha2::Sha256;
 use std::sync::Arc;
 
@@ -60,7 +60,7 @@ impl EncryptedCacheRepository {
 
     fn encrypt(&self, entry_key: &str, plaintext: &str) -> anyhow::Result<String> {
         let mut salt = [0u8; SALT_LEN];
-        rand::thread_rng().fill_bytes(&mut salt);
+        rand::rng().fill(&mut salt);
 
         let info: Vec<u8> = ENCRYPTION_CONTEXT
             .iter()

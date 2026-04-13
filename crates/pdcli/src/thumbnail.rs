@@ -3,12 +3,6 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-static THUMBNAIL_CONFIG: std::sync::OnceLock<ThumbnailConfig> = std::sync::OnceLock::new();
-
-fn get_thumbnail_config() -> &'static ThumbnailConfig {
-    THUMBNAIL_CONFIG.get_or_init(ThumbnailConfig::load)
-}
-
 /// Configuration for thumbnail/preview process detection.
 /// This allows users to customize which processes are allowed to read file content
 /// vs blocked (treated as thumbnailers that shouldn't trigger downloads).

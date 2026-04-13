@@ -23,6 +23,7 @@ pub(super) fn datetime_to_system_time(dt: DateTime<Utc>) -> SystemTime {
 
 /// Metadata for a Proton Drive file.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // temporary for now
 pub struct ProtonFileMetadata {
     pub uid: NodeUid,
     pub parent_uid: Option<NodeUid>,
@@ -90,6 +91,7 @@ impl ProtonFileMetadata {
 
 /// Metadata for a Proton Drive folder.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // temporary for now
 pub struct ProtonFolderMetadata {
     pub uid: NodeUid,
     pub parent_uid: Option<NodeUid>,
@@ -122,6 +124,7 @@ impl ProtonFolderMetadata {
 
 /// Metadata for a degraded node (decryption failed for some fields).
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // temporary for now
 pub struct DegradedNodeMetadata {
     pub uid: NodeUid,
     pub parent_uid: Option<NodeUid>,

@@ -1,6 +1,8 @@
 pub mod auth;
 pub mod cancellation;
-pub mod commands;
+pub mod fs;
+pub mod thumbnail;
+pub mod mount;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -186,7 +188,7 @@ impl ProtonDriveCommandLineInterface {
                 spinner.set_message("Initializing...");
                 
                 let spinner_for_progress = spinner.clone();
-                let progress: crate::commands::mount::ProgressCallback = Box::new(move |msg| {
+                let progress: crate::mount::ProgressCallback = Box::new(move |msg| {
                     spinner_for_progress.set_message(msg.to_string());
                 });
                 
@@ -214,7 +216,7 @@ impl ProtonDriveCommandLineInterface {
                     let session = session_guard.as_ref()
                         .ok_or_else(|| anyhow::anyhow!("Session is None in guard"))?;
                     
-                    crate::commands::mount::mount(&path, session, guard.token(), Some(progress), Some(ready_tx)).await
+                    crate::mount::mount(&path, session, guard.token(), Some(progress), Some(ready_tx)).await
                 };
                 
                 // Check if it failed due to locked keys
@@ -246,7 +248,7 @@ impl ProtonDriveCommandLineInterface {
                             spinner.set_message("Retrying mount...");
                             
                             let spinner_for_progress = spinner.clone();
-                            let progress: crate::commands::mount::ProgressCallback = Box::new(move |msg| {
+                            let progress: crate::mount::ProgressCallback = Box::new(move |msg| {
                                 spinner_for_progress.set_message(msg.to_string());
                             });
                             
@@ -271,7 +273,7 @@ impl ProtonDriveCommandLineInterface {
                             let session = session_guard.as_ref()
                                 .ok_or_else(|| anyhow::anyhow!("Session is None"))?;
                             
-                            crate::commands::mount::mount(&path, session, guard.token(), Some(progress), Some(ready_tx)).await
+                            crate::mount::mount(&path, session, guard.token(), Some(progress), Some(ready_tx)).await
                         } else {
                             mount_result
                         }
@@ -301,10 +303,10 @@ pub async fn main() -> anyhow::Result<()> {
 
     // Handle standalone flags first
     if cli.clear_cache {
-        return crate::commands::mount::clear_cache();
+        return crate::mount::clear_cache();
     }
     if cli.clear_pending_uploads {
-        return crate::commands::mount::clear_pending_uploads();
+        return crate::mount::clear_pending_uploads();
     }
 
     // Require a subcommand if no flags given

@@ -6,8 +6,7 @@ use fuse3::raw::prelude::{FileAttr, FileType};
 use proton_drive_sdk::node::file::FileNode as DriveFileNode;
 use proton_drive_sdk::node::folder::FolderNode as DriveFolderNode;
 use proton_drive_sdk::node::revision::RevisionUid;
-use proton_drive_sdk::node::{DegradedNode, Node, NodeUid};
-use proton_drive_sdk::utils::PotentialObject;
+use proton_drive_sdk::node::NodeUid;
 
 use super::{DIR_MODE, FILE_MODE};
 
@@ -47,6 +46,7 @@ pub struct ProtonFileMetadata {
 }
 
 impl ProtonFileMetadata {
+    #[allow(dead_code)]
     pub fn from_file_node(node: &DriveFileNode, is_photo: bool, capture_time: Option<DateTime<Utc>>) -> Self {
         let revision = &node.active_revision;
 
@@ -145,6 +145,7 @@ pub struct DegradedNodeMetadata {
 pub enum FsNode {
     File(ProtonFileMetadata),
     Folder(ProtonFolderMetadata),
+    #[allow(dead_code)]
     Degraded(DegradedNodeMetadata),
 }
 

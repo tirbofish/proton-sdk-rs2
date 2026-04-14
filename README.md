@@ -24,7 +24,8 @@ cargo run
 ```
 
 ## sdk
-proton-srp and other proton based cryptography libraries do not use crates.io, you will have to use this git repository as the latest kind. 
+
+proton-drive-sdk and proton-sdk-rs2 are both on crates.io, as well as the proton based cryptography libraries (no changes, just some cosmetic stuff). 
 
 **crates.io**
 ```toml

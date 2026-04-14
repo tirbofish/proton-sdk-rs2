@@ -218,7 +218,7 @@ impl OfflineIndex {
     }
 
     /// Emit an event (ignores errors if no subscribers).
-    fn emit(&self, event: IndexEvent) {
+    pub fn emit(&self, event: IndexEvent) {
         // Ignore send errors - they just mean no one is listening
         let _ = self.event_tx.send(event);
     }
@@ -422,6 +422,28 @@ impl OfflineIndex {
     pub fn upsert_children(&self, parent_link_id: &str, children: &[IndexedNode]) -> Result<()> {
         let conn = self.connection.lock().unwrap();
 
+        // Collect the link IDs of the fresh children
+        let fresh_link_ids: std::collections::HashSet<&str> = children.iter()
+            .map(|n| n.link_id.as_str())
+            .collect();
+
+        // Remove stale children (in index but not in fresh list) — unless they're local-only
+        let existing_ids: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT link_id FROM nodes WHERE parent_link_id = ?1 AND local_only = 0"
+            )?;
+            stmt.query_map(params![parent_link_id], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()
+                .context("Failed to collect existing children")?
+        };
+        for existing_id in &existing_ids {
+            if !fresh_link_ids.contains(existing_id.as_str()) {
+                conn.execute("DELETE FROM nodes WHERE link_id = ?1", params![existing_id])
+                    .context("Failed to delete stale child")?;
+                tracing::debug!("Removed stale index entry for link {}", existing_id);
+            }
+        }
+
         for node in children {
             conn.execute(
                 r#"
@@ -567,11 +589,13 @@ impl OfflineIndex {
             ).context("Failed to delete node tree")?;
         }
 
-        // Emit event for the root node (FUSE handler will clean up children)
-        self.emit(IndexEvent::NodeRemoved {
-            link_id: link_id.to_string(),
-            parent_link_id,
-        });
+        // Only emit event if we actually deleted something
+        if count > 0 {
+            self.emit(IndexEvent::NodeRemoved {
+                link_id: link_id.to_string(),
+                parent_link_id,
+            });
+        }
 
         Ok(count)
     }

@@ -42,6 +42,11 @@ pub(super) fn is_permanent_upload_error(error_msg: &str) -> bool {
         return false;
     }
     
+    // Name-already-exists errors (2500) are recoverable - fall back to revision upload
+    if is_name_exists_error(error_msg) {
+        return false;
+    }
+    
     // Stale revision errors (2511, 2061) are recoverable - refresh revision_uid and retry
     if is_stale_revision_error(error_msg) {
         return false;
@@ -88,9 +93,20 @@ pub(super) fn is_permanent_upload_error(error_msg: &str) -> bool {
         || error_lower.contains("permission denied")
 }
 
+/// Check if an error is a "file or folder with that name already exists" error (2500).
+/// These can be recovered by falling back to a revision upload for the existing file.
+pub(super) fn is_name_exists_error(error_msg: &str) -> bool {
+    let error_lower = error_msg.to_lowercase();
+    error_lower.contains("2500") && error_lower.contains("name") && error_lower.contains("already exists")
+}
+
 /// Check if an error is a "draft revision already exists" error (2500).
 /// These can be recovered by deleting the stale draft and retrying.
 pub(super) fn is_draft_revision_error(error_msg: &str) -> bool {
+    // Exclude "name already exists" errors which are a different kind of 2500
+    if is_name_exists_error(error_msg) {
+        return false;
+    }
     let error_lower = error_msg.to_lowercase();
     error_lower.contains("2500") 
         || (error_lower.contains("draft") && error_lower.contains("already exists"))

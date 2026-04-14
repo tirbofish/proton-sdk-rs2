@@ -98,6 +98,9 @@ pub struct ProtonFolderMetadata {
     pub name: String,
     pub creation_time: DateTime<Utc>,
     pub trash_time: Option<DateTime<Utc>>,
+    /// Bumped to `Utc::now()` whenever children are added/removed/updated
+    /// so that Nautilus detects the change and refreshes.
+    pub content_modified_at: Option<DateTime<Utc>>,
     pub author_email: Option<String>,
     pub name_author_email: Option<String>,
     pub owner_email: Option<String>,
@@ -118,6 +121,7 @@ impl ProtonFolderMetadata {
             owner_email: node.base.owned_by.as_ref().and_then(|o| o.email.clone()),
             owner_organisation: node.base.owned_by.as_ref().and_then(|o| o.organisation.clone()),
             is_album,
+            content_modified_at: None,
         }
     }
 }
@@ -211,7 +215,13 @@ impl FsNode {
                     datetime_to_system_time(f.creation_time)
                 }
             }
-            FsNode::Folder(f) => datetime_to_system_time(f.creation_time),
+            FsNode::Folder(f) => {
+                if let Some(mtime) = f.content_modified_at {
+                    datetime_to_system_time(mtime)
+                } else {
+                    datetime_to_system_time(f.creation_time)
+                }
+            }
             FsNode::Degraded(d) => datetime_to_system_time(d.creation_time),
         }
     }

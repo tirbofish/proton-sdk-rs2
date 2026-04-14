@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use console::style;
 
 use super::thumbnail::get_thumbnail_config;
-use super::uploads::PersistentUpload;
 
 /// Check if a process is a known thumbnailer/preview process.
 pub(super) fn is_thumbnailer_process(proc_name: &str, pid: u32) -> bool {
@@ -269,75 +268,36 @@ pub fn clear_cache() -> Result<()> {
 }
 
 pub fn clear_pending_uploads() -> Result<()> {
-    use indicatif::{ProgressBar, ProgressStyle};
-
     let pending_dir = dirs::config_dir()
         .context("Could not determine config directory")?
         .join("pdcli")
         .join("pending_uploads");
 
     if !pending_dir.exists() {
-        println!("{}", style("No pending uploads.").yellow());
+        println!("{}", style("No pending uploads directory found.").yellow());
         return Ok(());
     }
 
     let mut file_count = 0u64;
-    let mut upload_names: Vec<String> = Vec::new();
-
     if let Ok(entries) = std::fs::read_dir(&pending_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().map(|e| e == "json").unwrap_or(false) {
-                if let Ok(metadata) = entry.metadata() {
-                    if metadata.is_file() {
-                        file_count += 1;
-
-                        if let Ok(data) = std::fs::read(&path) {
-                            if let Ok(upload) = serde_json::from_slice::<PersistentUpload>(&data) {
-                                upload_names.push(upload.name().to_string());
-                            }
-                        }
-                    }
-                }
+                let _ = std::fs::remove_file(&path);
+                file_count += 1;
             }
         }
     }
 
     if file_count == 0 {
         println!("{}", style("No pending uploads.").yellow());
-        return Ok(());
+    } else {
+        println!(
+            "{} Cleared {} pending uploads",
+            style("✓").green().bold(),
+            file_count
+        );
     }
-
-    println!();
-    println!("{}", style("Pending uploads to be cleared:").bold());
-    for name in &upload_names {
-        println!("  {} {}", style("•").dim(), name);
-    }
-    println!();
-
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.cyan} {msg}")
-            .unwrap(),
-    );
-    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
-    spinner.set_message(format!("Clearing {} pending uploads...", file_count));
-
-    if let Ok(entries) = std::fs::read_dir(&pending_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false) {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-    }
-
-    spinner.finish_with_message(format!(
-        "{} Cleared {} pending uploads",
-        style("✓").green().bold(),
-        file_count
-    ));
 
     Ok(())
 }

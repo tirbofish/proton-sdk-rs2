@@ -66,7 +66,7 @@ use self::state::ProtonDriveFsInner;
 use self::thumbnail::{
     get_thumbnail_config, has_cached_thumbnail, is_lock_file, plant_freedesktop_thumbnail,
 };
-use self::uploads::{PendingFile, PendingUploadStore, PersistentUpload, UploadTask, WriteBuffer};
+use self::uploads::{DebounceTrigger, PendingFile, PendingUploadStore, PersistentUpload, UploadTask, WriteBuffer};
 
 pub use self::maintenance::{clear_cache, clear_pending_uploads};
 
@@ -109,6 +109,10 @@ pub struct ProtonDriveFs {
     upload_tx: mpsc::UnboundedSender<UploadTask>,
     /// Upload queue receiver (moved to background task on init)
     upload_rx: RwLock<Option<mpsc::UnboundedReceiver<UploadTask>>>,
+    /// Debounce trigger sender - signals that an inode needs uploading
+    debounce_tx: mpsc::UnboundedSender<DebounceTrigger>,
+    /// Debounce trigger receiver (moved to background task on init)
+    debounce_rx: RwLock<Option<mpsc::UnboundedReceiver<DebounceTrigger>>>,
     /// Persistent upload store for resume capability
     pending_upload_store: Arc<PendingUploadStore>,
     /// Mount path for constructing file URIs (used for thumbnail caching)
@@ -127,6 +131,7 @@ impl ProtonDriveFs {
         tracing::info!("Loaded global .pdclignore from {:?}", ignore_manager.global_ignore_path());
         
         let (upload_tx, upload_rx) = mpsc::unbounded_channel();
+        let (debounce_tx, debounce_rx) = mpsc::unbounded_channel();
         let pending_upload_store = Arc::new(PendingUploadStore::new()?);
         
         // Open offline index
@@ -147,6 +152,8 @@ impl ProtonDriveFs {
             ignore_manager: RwLock::new(ignore_manager),
             upload_tx,
             upload_rx: RwLock::new(Some(upload_rx)),
+            debounce_tx,
+            debounce_rx: RwLock::new(Some(debounce_rx)),
             pending_upload_store,
             mount_path: mount_path.to_path_buf(),
         })
@@ -258,6 +265,201 @@ impl ProtonDriveFs {
         // Store client
         *self.client.write().await = Some(client);
         
+        // Spawn debounce processor - coalesces rapid saves
+        let debounce_rx = self.debounce_rx.write().await.take();
+        if let Some(mut rx) = debounce_rx {
+            let inner_arc = self.inner.clone();
+            let upload_tx = self.upload_tx.clone();
+            let pending_upload_store = self.pending_upload_store.clone();
+            let client_arc = self.client.clone();
+            
+            tokio::spawn(async move {
+                use std::time::{Duration, Instant};
+                use self::state::UPLOAD_DEBOUNCE_MS;
+                
+                let debounce_duration = Duration::from_millis(UPLOAD_DEBOUNCE_MS);
+                
+                loop {
+                    // Wait for a trigger or check deadlines
+                    let next_deadline = {
+                        let inner = inner_arc.read().await;
+                        inner.upload_deadlines.values().min().copied()
+                    };
+                    
+                    let timeout = match next_deadline {
+                        Some(deadline) => {
+                            let now = Instant::now();
+                            if deadline > now {
+                                deadline - now
+                            } else {
+                                Duration::ZERO
+                            }
+                        }
+                        None => Duration::from_secs(60), // Long wait if no pending uploads
+                    };
+                    
+                    tokio::select! {
+                        // New trigger received
+                        trigger = rx.recv() => {
+                            match trigger {
+                                Some(trigger) => {
+                                    // Update deadline for this inode
+                                    let mut inner = inner_arc.write().await;
+                                    let new_deadline = Instant::now() + debounce_duration;
+                                    inner.upload_deadlines.insert(trigger.inode, new_deadline);
+                                    tracing::debug!(
+                                        "Debounce: inode {} deadline set to {:?}",
+                                        trigger.inode, debounce_duration
+                                    );
+                                }
+                                None => {
+                                    tracing::debug!("Debounce processor: channel closed");
+                                    break;
+                                }
+                            }
+                        }
+                        // Timeout - check if any deadlines have expired
+                        _ = tokio::time::sleep(timeout) => {
+                            let now = Instant::now();
+                            
+                            // Collect expired inodes
+                            let expired: Vec<u64> = {
+                                let inner = inner_arc.read().await;
+                                inner.upload_deadlines
+                                    .iter()
+                                    .filter(|&(_, &deadline)| deadline <= now)
+                                    .map(|(&inode, _)| inode)
+                                    .collect()
+                            };
+                            
+                            // Process each expired deadline
+                            for inode in expired {
+                                // Get data we need, extracting node_uid if revision upload
+                                let (content, is_new, filename, generation, node_uid_opt) = {
+                                    let mut inner = inner_arc.write().await;
+                                    
+                                    // Remove deadline
+                                    inner.upload_deadlines.remove(&inode);
+                                    
+                                    // Skip if already being uploaded
+                                    if inner.pending_revision_uploads.contains(&inode) {
+                                        tracing::debug!("Debounce: inode {} already uploading, skipping", inode);
+                                        continue;
+                                    }
+                                    
+                                    // Get content and metadata
+                                    let content = inner.file_cache.peek(&inode).cloned();
+                                    let is_new = inner.pending_files.contains_key(&inode);
+                                    let filename = inner.nodes.get(&inode)
+                                        .map(|n| n.name().to_string())
+                                        .unwrap_or_default();
+                                    let generation = inner.cache_generations.get(&inode).copied().unwrap_or(0);
+                                    
+                                    // For revision uploads, get node_uid and mark as pending
+                                    let node_uid_opt = if !is_new {
+                                        inner.pending_revision_uploads.insert(inode);
+                                        inner.nodes.get(&inode).map(|n| n.uid().clone())
+                                    } else {
+                                        None
+                                    };
+                                    
+                                    (content, is_new, filename, generation, node_uid_opt)
+                                };
+                                
+                                let Some(content) = content else {
+                                    tracing::warn!("Debounce: no content for inode {}", inode);
+                                    continue;
+                                };
+                                
+                                if is_new {
+                                    // New file upload
+                                    let pending = {
+                                        let inner = inner_arc.read().await;
+                                        inner.pending_files.get(&inode).cloned()
+                                    };
+                                    
+                                    if let Some(pending) = pending {
+                                        if pending.local_only {
+                                            tracing::debug!("Debounce: skipping local-only file {}", pending.name);
+                                            continue;
+                                        }
+                                        
+                                        let persist_id = PendingUploadStore::generate_id();
+                                        let persist_upload = PersistentUpload::NewFile {
+                                            id: persist_id.clone(),
+                                            parent_uid: pending.parent_uid.clone(),
+                                            name: pending.name.clone(),
+                                            mime_type: pending.mime_type.clone(),
+                                            content: content.clone(),
+                                            retry_count: 0,
+                                            created_at: chrono::Utc::now().timestamp(),
+                                        };
+                                        if let Err(e) = pending_upload_store.save(&persist_upload) {
+                                            tracing::warn!("Failed to persist upload: {}", e);
+                                        }
+                                        
+                                        let _ = upload_tx.send(UploadTask::NewFile {
+                                            inode,
+                                            pending,
+                                            persist_id: Some(persist_id),
+                                        });
+                                        tracing::info!("Debounce: queued new file upload for '{}' (inode {})", filename, inode);
+                                    }
+                                } else {
+                                    // Revision upload - get fresh revision_uid from server
+                                    let revision_uid = if let Some(node_uid) = node_uid_opt {
+                                        let client = client_arc.read().await;
+                                        if let Some(client) = client.as_ref() {
+                                            match client.get_node(node_uid).await {
+                                                Ok(PotentialObject::Node(Node::File(f) | Node::Photo(f))) => {
+                                                    Some(f.active_revision.uid.clone())
+                                                }
+                                                _ => None,
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                    
+                                    if let Some(revision_uid) = revision_uid {
+                                        let persist_id = PendingUploadStore::generate_id();
+                                        let persist_upload = PersistentUpload::NewRevision {
+                                            id: persist_id.clone(),
+                                            revision_uid: revision_uid.clone(),
+                                            filename: filename.clone(),
+                                            content: content.clone(),
+                                            retry_count: 0,
+                                            created_at: chrono::Utc::now().timestamp(),
+                                        };
+                                        if let Err(e) = pending_upload_store.save(&persist_upload) {
+                                            tracing::warn!("Failed to persist upload: {}", e);
+                                        }
+                                        
+                                        let _ = upload_tx.send(UploadTask::NewRevision {
+                                            inode,
+                                            revision_uid,
+                                            filename: filename.clone(),
+                                            content,
+                                            persist_id: Some(persist_id),
+                                            generation,
+                                        });
+                                        tracing::info!("Debounce: queued revision upload for '{}' (inode {}, gen {})", filename, inode, generation);
+                                    } else {
+                                        // Failed to get revision - clear pending status
+                                        let mut inner = inner_arc.write().await;
+                                        inner.pending_revision_uploads.remove(&inode);
+                                        tracing::warn!("Debounce: failed to get revision for inode {}", inode);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        
         // Spawn background upload processor
         let upload_rx = self.upload_rx.write().await.take();
         if let Some(mut rx) = upload_rx {
@@ -266,6 +468,7 @@ impl ProtonDriveFs {
             let multi_progress = self.multi_progress.clone();
             let pending_upload_store = self.pending_upload_store.clone();
             let index = self.index.clone();
+            let upload_tx = self.upload_tx.clone();
             
             tokio::spawn(async move {
                 // Allow up to 3 concurrent file uploads
@@ -280,6 +483,7 @@ impl ProtonDriveFs {
                     let semaphore = upload_semaphore.clone();
                     let pending_upload_store = pending_upload_store.clone();
                     let index = index.clone();
+                    let upload_tx = upload_tx.clone();
                     
                     // Spawn each upload as a separate task so they run concurrently
                     tokio::spawn(async move {
@@ -438,15 +642,18 @@ impl ProtonDriveFs {
                                 }
                             }
                         }
-                        UploadTask::NewRevision { inode, revision_uid, filename, content, persist_id } => {
-                            // Read fresh content from file_cache if available (may have changed since queuing)
-                            let fresh_content = {
-                                let mut inner_guard = inner.write().await;
-                                inner_guard.file_cache.get(&inode).cloned()
+                        UploadTask::NewRevision { inode, revision_uid, filename, content: queued_content, persist_id, generation } => {
+                            // Read fresh content and current generation from file_cache
+                            let (fresh_content, current_generation) = {
+                                let inner_guard = inner.read().await;
+                                let cached_content = inner_guard.file_cache.peek(&inode).cloned();
+                                let current_gen = inner_guard.cache_generations.get(&inode).copied().unwrap_or(0);
+                                (cached_content, current_gen)
                             };
-                            let content = fresh_content.unwrap_or(content);
+                            let content = fresh_content.unwrap_or(queued_content);
                             
-                            tracing::info!("Background uploading revision for '{}' ({} bytes)", filename, content.len());
+                            tracing::info!("Background uploading revision for '{}' ({} bytes, gen {}→{})", 
+                                filename, content.len(), generation, current_generation);
                             
                             let pb = multi_progress.add(ProgressBar::new(content.len() as u64));
                             pb.set_style(
@@ -536,6 +743,7 @@ impl ProtonDriveFs {
                             
                             // Try up to 4 times to handle race conditions (2511 errors can chain)
                             let mut attempts = 0;
+                            let mut requeued = false; // Track if we re-queued for newer generation
                             // current_revision_uid already fetched fresh above
                             loop {
                                 attempts += 1;
@@ -588,10 +796,46 @@ impl ProtonDriveFs {
                                                         tracing::warn!("Failed to upsert uploaded revision to index: {}", e);
                                                     }
                                                     
-                                                    // Cache the content and clear pending status
+                                                    // Check if newer saves occurred during upload
                                                     let mut inner = inner.write().await;
-                                                    inner.file_cache.put(inode, content.clone());
-                                                    inner.pending_revision_uploads.remove(&inode);
+                                                    let latest_gen = inner.cache_generations.get(&inode).copied().unwrap_or(0);
+                                                    
+                                                    if latest_gen > current_generation {
+                                                        // Newer save occurred during upload - re-queue with fresh content
+                                                        tracing::info!(
+                                                            "Newer save detected for '{}' (gen {} > {}), re-queueing upload",
+                                                            filename, latest_gen, current_generation
+                                                        );
+                                                        
+                                                        // Get fresh content and new revision UID from the just-created revision
+                                                        let fresh_content = inner.file_cache.peek(&inode).cloned().unwrap_or_default();
+                                                        
+                                                        // Extract active revision UID from the potential_node
+                                                        if let PotentialObject::Node(Node::File(f) | Node::Photo(f)) = &potential_node {
+                                                            let new_revision_uid = f.active_revision.uid.clone();
+                                                            
+                                                            // Re-queue with latest generation and fresh content
+                                                            // Keep pending status - the new task will handle it
+                                                            let _ = upload_tx.send(UploadTask::NewRevision {
+                                                                inode,
+                                                                revision_uid: new_revision_uid,
+                                                                filename: filename.clone(),
+                                                                content: fresh_content,
+                                                                persist_id: None, // Don't persist follow-up uploads
+                                                                generation: latest_gen,
+                                                            });
+                                                            requeued = true;
+                                                            // Keep inode in pending_revision_uploads so concurrent saves don't queue duplicates
+                                                        } else {
+                                                            // Couldn't get revision - clear pending and hope next save works
+                                                            tracing::warn!("Failed to get revision UID for re-queue of '{}'", filename);
+                                                            inner.pending_revision_uploads.remove(&inode);
+                                                        }
+                                                    } else {
+                                                        // No newer saves - update cache and clear pending
+                                                        inner.file_cache.put(inode, content.clone());
+                                                        inner.pending_revision_uploads.remove(&inode);
+                                                    }
                                                 }
                                                 break; // Success - exit retry loop
                                             }
@@ -642,8 +886,8 @@ impl ProtonDriveFs {
                                 }
                             }
                             
-                            // Always clear pending status when task completes (success or failure)
-                            {
+                            // Clear pending status when task completes, unless we re-queued for a newer generation
+                            if !requeued {
                                 let mut inner = inner.write().await;
                                 inner.pending_revision_uploads.remove(&inode);
                             }
@@ -1110,8 +1354,20 @@ impl ProtonDriveFs {
                                         if let Some(&existing_inode) = inner_guard.link_id_to_inode.get(&link_id) {
                                             // Update existing node
                                             inner_guard.nodes.insert(existing_inode, fs_node);
-                                            // Clear file cache since content may have changed
-                                            inner_guard.file_cache.remove(&existing_inode);
+                                            
+                                            // Only clear file cache if there's no pending local changes.
+                                            // If there's an upload deadline or pending upload, we have local
+                                            // content that should be preserved.
+                                            let has_local_changes = 
+                                                inner_guard.upload_deadlines.contains_key(&existing_inode) ||
+                                                inner_guard.pending_revision_uploads.contains(&existing_inode);
+                                            
+                                            if !has_local_changes {
+                                                inner_guard.file_cache.remove(&existing_inode);
+                                                tracing::debug!("Cleared cache for FUSE node '{}' (inode {})", node_name, existing_inode);
+                                            } else {
+                                                tracing::debug!("Keeping cache for FUSE node '{}' (inode {}) - has pending local changes", node_name, existing_inode);
+                                            }
                                             tracing::debug!("Updated FUSE node '{}' (inode {}) from index", node_name, existing_inode);
                                         } else if let Some(parent) = parent_link_id {
                                             // New node - add to FUSE and parent's children
@@ -1188,8 +1444,15 @@ impl ProtonDriveFs {
                                 IndexEvent::OfflineStatusChanged { link_id, available } => {
                                     let mut inner_guard = inner.write().await;
                                     if let Some(&inode) = inner_guard.link_id_to_inode.get(&link_id) {
-                                        inner_guard.file_cache.remove(&inode);
-                                        tracing::debug!("Invalidated cache for {} (offline={})", link_id, available);
+                                        // Only clear cache if no pending local changes
+                                        let has_local_changes = 
+                                            inner_guard.upload_deadlines.contains_key(&inode) ||
+                                            inner_guard.pending_revision_uploads.contains(&inode);
+                                        
+                                        if !has_local_changes {
+                                            inner_guard.file_cache.remove(&inode);
+                                            tracing::debug!("Invalidated cache for {} (offline={})", link_id, available);
+                                        }
                                     }
                                 }
                                 IndexEvent::MutationQueued { .. } | IndexEvent::MutationRemoved { .. } => {
@@ -1719,6 +1982,7 @@ impl ProtonDriveFs {
     }
 
     /// Get the revision UID for a file inode (without triggering download).
+    #[allow(dead_code)]
     async fn get_revision_uid(&self, inode: u64) -> Option<RevisionUid> {
         let inner = self.inner.read().await;
         if let Some(FsNode::File(file_meta)) = inner.nodes.get(&inode) {
@@ -2023,6 +2287,7 @@ impl ProtonDriveFs {
     }
 
     /// Upload a pending file to Proton Drive.
+    #[allow(dead_code)]
     async fn upload_pending_file(&self, inode: u64) -> Result<NodeUid> {
         let pending = {
             let inner = self.inner.read().await;
@@ -2130,219 +2395,35 @@ impl ProtonDriveFs {
         Ok(node_uid)
     }
 
-    /// Upload the write buffer as a new revision of an existing file.
-    async fn upload_write_buffer(&self, fh: u64) -> Result<()> {
-        let (inode, content, is_new) = {
+    /// Queue a write buffer for background upload (non-blocking).
+    /// Uses debouncing to coalesce rapid saves into a single upload.
+    /// Returns immediately after triggering debounce, upload happens asynchronously.
+    async fn queue_write_buffer(&self, fh: u64) -> Result<()> {
+        let (inode, content) = {
             let inner = self.inner.read().await;
             match inner.write_buffers.get(&fh) {
-                Some(buf) if buf.dirty => (buf.inode, buf.content.clone(), buf.is_new),
+                Some(buf) if buf.dirty => (buf.inode, buf.content.clone()),
                 _ => return Ok(()), // Not dirty, nothing to do
             }
         };
-        
-        // Check if background upload is already in progress for this inode
-        // If so, skip sync upload to avoid race condition (2511 errors)
+
+        // Mark buffer as clean and increment generation atomically
         {
-            let inner = self.inner.read().await;
-            if inner.pending_revision_uploads.contains(&inode) {
-                tracing::debug!("Background upload already pending for inode {}, skipping sync upload", inode);
-                return Ok(()); // Background will handle it
-            }
-        }
-
-        if is_new {
-            // This is a new file, use the pending file upload
-            self.upload_pending_file(inode).await?;
-        } else {
-            // This is an update to an existing file - upload as new revision
-            let revision_uid = self.get_revision_uid(inode).await
-                .ok_or_else(|| anyhow::anyhow!("No revision UID for inode {}", inode))?;
-
-            let client_guard = self.client.read().await;
-            let client = client_guard.as_ref()
-                .ok_or_else(|| anyhow::anyhow!("No client"))?;
-
-            let filename = {
-                let inner = self.inner.read().await;
-                inner.nodes.get(&inode).map(|n| n.name().to_string()).unwrap_or_default()
-            };
-
-            tracing::info!("Uploading new revision for '{}' ({} bytes)", filename, content.len());
-
-            // Create progress bar
-            let pb = self.multi_progress.add(ProgressBar::new(content.len() as u64));
-            pb.set_style(
-                ProgressStyle::default_bar()
-                    .template("{spinner:.white.on_cyan} {msg} [{bar:30.white.on_cyan}] {bytes}/{total_bytes}")
-                    .unwrap()
-                    .progress_chars("█▓░")
-            );
-            pb.set_message(format!("↑ {}", filename));
-            pb.enable_steady_tick(Duration::from_millis(100));
-
-            let size = content.len() as i64;
-
-            let uploader = client.get_file_revision_uploader(
-                revision_uid,
-                size,
-                Some(std::time::SystemTime::now()),
-                None,
-                None,
-            ).await?;
-
-            let pb_clone = pb.clone();
-            let new_node_uid = uploader.upload_from_stream(
-                Box::new(std::io::Cursor::new(content.clone())),
-                Vec::new(),
-                Box::new(move |bytes, _total| {
-                    pb_clone.set_position(bytes as u64);
-                }),
-            ).await?;
-
-            pb.finish_with_message(format!("{} {}", style("✓").green(), filename));
-
-            // Update Index first (Index → FUSE flow)
-            // The Index event handler will update FUSE state
-            let potential_node = client.get_node(new_node_uid.clone()).await?;
-            
-            // Get parent_link_id from existing index entry
-            let link_id = new_node_uid.link_id.raw();
-            let parent_link_id = self.index.get_node(link_id)
-                .ok()
-                .flatten()
-                .and_then(|n| n.parent_link_id)
-                .unwrap_or_default();
-            
-            let indexed = indexed_node_from_potential(&potential_node, &parent_link_id);
-            
-            if let Err(e) = self.index.upsert_node(&indexed) {
-                tracing::warn!("Failed to upsert sync revision to index: {}", e);
-            }
-            
-            // Cache the content
             let mut inner = self.inner.write().await;
+            if let Some(buf) = inner.write_buffers.get_mut(&fh) {
+                buf.dirty = false;
+            }
+            // Increment generation for this inode (tracks save version)
+            let gen_entry = inner.cache_generations.entry(inode).or_insert(0);
+            *gen_entry += 1;
+            // Update the cache so subsequent reads see the new content
             inner.file_cache.put(inode, content);
         }
 
-        // Mark buffer as clean
-        {
-            let mut inner = self.inner.write().await;
-            if let Some(buf) = inner.write_buffers.get_mut(&fh) {
-                buf.dirty = false;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Queue a write buffer for background upload (non-blocking).
-    /// Returns immediately after queuing, upload happens asynchronously.
-    async fn queue_write_buffer(&self, fh: u64) -> Result<()> {
-        let (inode, content, is_new) = {
-            let inner = self.inner.read().await;
-            match inner.write_buffers.get(&fh) {
-                Some(buf) if buf.dirty => (buf.inode, buf.content.clone(), buf.is_new),
-                _ => return Ok(()), // Not dirty, nothing to do
-            }
-        };
-
-        // Mark buffer as clean immediately (data is now "committed" to upload queue)
-        {
-            let mut inner = self.inner.write().await;
-            if let Some(buf) = inner.write_buffers.get_mut(&fh) {
-                buf.dirty = false;
-            }
-            // Also update the cache so subsequent reads see the new content
-            inner.file_cache.put(inode, content.clone());
-        }
-
-        if is_new {
-            // Queue upload of new file
-            let pending = {
-                let inner = self.inner.read().await;
-                inner.pending_files.get(&inode).cloned()
-            };
-            
-            if let Some(pending) = pending {
-                // Skip upload for local-only files (e.g., lock files)
-                if pending.local_only {
-                    tracing::debug!("Skipping upload for local-only file: {}", pending.name);
-                } else {
-                    // Persist the upload for resume capability
-                    let persist_id = PendingUploadStore::generate_id();
-                    let persist_upload = PersistentUpload::NewFile {
-                        id: persist_id.clone(),
-                        parent_uid: pending.parent_uid.clone(),
-                        name: pending.name.clone(),
-                        mime_type: pending.mime_type.clone(),
-                        content: pending.content.clone(),
-                        retry_count: 0,
-                        created_at: chrono::Utc::now().timestamp(),
-                    };
-                    if let Err(e) = self.pending_upload_store.save(&persist_upload) {
-                        tracing::warn!("Failed to persist upload: {}", e);
-                    }
-                    
-                    let _ = self.upload_tx.send(UploadTask::NewFile { 
-                        inode, 
-                        pending,
-                        persist_id: Some(persist_id),
-                    });
-                    tracing::info!("Queued new file upload for inode {}", inode);
-                }
-            }
-        } else {
-            // Queue revision upload
-            // Check if there's already a pending upload for this inode
-            let already_pending = {
-                let inner = self.inner.read().await;
-                inner.pending_revision_uploads.contains(&inode)
-            };
-            
-            if already_pending {
-                // Another upload is already queued for this inode.
-                // The worker will read fresh content from file_cache when it runs.
-                tracing::debug!("Revision upload already pending for inode {}, skipping duplicate queue", inode);
-                return Ok(());
-            }
-            
-            let revision_uid = self.get_revision_uid(inode).await;
-            let filename = {
-                let mut inner = self.inner.write().await;
-                // Mark as pending before getting filename
-                inner.pending_revision_uploads.insert(inode);
-                inner.nodes.get(&inode).map(|n| n.name().to_string()).unwrap_or_default()
-            };
-            
-            if let Some(revision_uid) = revision_uid {
-                // Persist the upload for resume capability
-                let persist_id = PendingUploadStore::generate_id();
-                let persist_upload = PersistentUpload::NewRevision {
-                    id: persist_id.clone(),
-                    revision_uid: revision_uid.clone(),
-                    filename: filename.clone(),
-                    content: content.clone(),
-                    retry_count: 0,
-                    created_at: chrono::Utc::now().timestamp(),
-                };
-                if let Err(e) = self.pending_upload_store.save(&persist_upload) {
-                    tracing::warn!("Failed to persist upload: {}", e);
-                }
-                
-                let _ = self.upload_tx.send(UploadTask::NewRevision {
-                    inode,
-                    revision_uid,
-                    filename: filename.clone(),
-                    content,
-                    persist_id: Some(persist_id),
-                });
-                tracing::info!("Queued revision upload for '{}' (inode {})", filename, inode);
-            } else {
-                // No revision_uid - remove from pending set
-                let mut inner = self.inner.write().await;
-                inner.pending_revision_uploads.remove(&inode);
-            }
-        }
+        // Send debounce trigger - the debounce processor will handle
+        // coalescing rapid saves and queueing the actual upload
+        let _ = self.debounce_tx.send(DebounceTrigger { inode });
+        tracing::debug!("Debounce trigger sent for inode {}", inode);
 
         Ok(())
     }
@@ -2679,11 +2760,14 @@ impl Filesystem for ProtonDriveFs {
                 is_new: is_pending, // New files not yet uploaded should use NewFile upload path
                 offset: 0,
                 content: existing_content,
-                dirty: is_truncate, // Truncated files are dirty
+                dirty: false, // Only mark dirty when actual writes happen
             });
             inner.fh_to_inode.insert(fh, inode);
             
-            // If truncating, update the file size
+            // If truncating, update the local file size and cache.
+            // We don't mark as dirty yet - only actual writes will do that.
+            // This prevents uploading empty content when editors open with O_TRUNC
+            // but then fail to write (e.g., temp file creation rejected).
             if is_truncate {
                 if let Some(FsNode::File(f)) = inner.nodes.get_mut(&inode) {
                     f.size = 0;
@@ -3687,10 +3771,12 @@ impl Filesystem for ProtonDriveFs {
         tracing::debug!("FUSE fsync: inode={}, fh={}, uid={}, gid={}, pid={}",
             inode, fh, req.uid, req.gid, req.pid);
 
-        // fsync should wait for upload to complete (blocking for durability)
-        self.upload_write_buffer(fh).await
+        // For cloud storage, we use debounced async uploads.
+        // Data is "durable" once it's in the cache and upload queue.
+        // This avoids race conditions from blocking uploads.
+        self.queue_write_buffer(fh).await
             .map_err(|e| {
-                tracing::error!("Failed to sync writes: {}", e);
+                tracing::error!("Failed to queue writes: {}", e);
                 Errno::from(libc::EIO)
             })?;
 

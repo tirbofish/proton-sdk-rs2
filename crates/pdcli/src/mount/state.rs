@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use proton_drive_sdk::node::NodeUid;
 use proton_drive_sdk::volume::VolumeId;
@@ -9,6 +10,9 @@ use super::cache::MemoryCache;
 use super::models::FsNode;
 use super::uploads::{PendingFile, WriteBuffer};
 use super::{FIRST_DYNAMIC_INODE, MYFILES_INODE, ROOT_INODE};
+
+/// Debounce delay for coalescing rapid saves (500ms)
+pub(super) const UPLOAD_DEBOUNCE_MS: u64 = 500;
 
 /// Internal filesystem state.
 pub(super) struct ProtonDriveFsInner {
@@ -32,6 +36,13 @@ pub(super) struct ProtonDriveFsInner {
     /// When a second save comes for same inode, we skip queuing since
     /// the worker will read fresh content from file_cache anyway.
     pub(super) pending_revision_uploads: std::collections::HashSet<u64>,
+    /// Generation counter for file cache entries, used to detect stale uploads.
+    /// When a file is saved, its generation is incremented. When an upload completes,
+    /// we only update the cache if the generation hasn't changed (no newer saves).
+    pub(super) cache_generations: BTreeMap<u64, u64>,
+    /// Debounce deadlines: inode -> when to actually trigger upload.
+    /// Each save resets the deadline. Upload only fires when deadline expires.
+    pub(super) upload_deadlines: BTreeMap<u64, Instant>,
 }
 
 impl ProtonDriveFsInner {
@@ -53,6 +64,8 @@ impl ProtonDriveFsInner {
             last_event_id: None,
             downloading_inodes: std::collections::HashSet::new(),
             pending_revision_uploads: std::collections::HashSet::new(),
+            cache_generations: BTreeMap::new(),
+            upload_deadlines: BTreeMap::new(),
         }
     }
 

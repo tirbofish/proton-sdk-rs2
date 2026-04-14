@@ -187,6 +187,14 @@ pub(super) struct WriteBuffer {
     pub(super) dirty: bool,
 }
 
+/// Signal to the debounce processor that an inode needs uploading.
+/// The processor will wait for the debounce period to expire before
+/// actually triggering the upload.
+#[derive(Debug, Clone)]
+pub(super) struct DebounceTrigger {
+    pub(super) inode: u64,
+}
+
 #[derive(Debug)]
 pub(super) enum UploadTask {
     NewFile {
@@ -200,6 +208,9 @@ pub(super) enum UploadTask {
         filename: String,
         content: Vec<u8>,
         persist_id: Option<String>,
+        /// Cache generation at the time this upload was queued.
+        /// Used to detect if newer saves occurred during upload.
+        generation: u64,
     },
     ResumePersisted(PersistentUpload),
 }

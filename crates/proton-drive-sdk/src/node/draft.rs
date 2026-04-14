@@ -142,7 +142,6 @@ impl RevisionDraftProvider for NewFileDraftProvider {
 #[async_trait]
 impl RevisionDraftProvider for NewRevisionDraftProvider {
     async fn get_draft(&self) -> anyhow::Result<RevisionDraft> {
-        // Implementation for new revision draft
         let node_secrets =
             crate::node::file::FileOperations::get_secrets(&self.client, self.node_uid.clone())
                 .await?;
@@ -155,7 +154,7 @@ impl RevisionDraftProvider for NewRevisionDraftProvider {
             ))
             .await?;
 
-        let content_key = crate::crypto::CryptoGenerator::generate_session_key();
+        let content_key = node_secrets.content_key.clone();
 
         let request = crate::api::revision::RevisionCreationRequest {
             current_revision_id: Some(self.revision_id.clone()),

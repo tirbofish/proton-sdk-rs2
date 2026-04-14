@@ -6,8 +6,7 @@ use fuse3::raw::prelude::{FileAttr, FileType};
 use proton_drive_sdk::node::file::FileNode as DriveFileNode;
 use proton_drive_sdk::node::folder::FolderNode as DriveFolderNode;
 use proton_drive_sdk::node::revision::RevisionUid;
-use proton_drive_sdk::node::{DegradedNode, Node, NodeUid};
-use proton_drive_sdk::utils::PotentialObject;
+use proton_drive_sdk::node::NodeUid;
 
 use super::{DIR_MODE, FILE_MODE};
 
@@ -47,6 +46,7 @@ pub struct ProtonFileMetadata {
 }
 
 impl ProtonFileMetadata {
+    #[allow(dead_code)]
     pub fn from_file_node(node: &DriveFileNode, is_photo: bool, capture_time: Option<DateTime<Utc>>) -> Self {
         let revision = &node.active_revision;
 
@@ -98,6 +98,9 @@ pub struct ProtonFolderMetadata {
     pub name: String,
     pub creation_time: DateTime<Utc>,
     pub trash_time: Option<DateTime<Utc>>,
+    /// Bumped to `Utc::now()` whenever children are added/removed/updated
+    /// so that Nautilus detects the change and refreshes.
+    pub content_modified_at: Option<DateTime<Utc>>,
     pub author_email: Option<String>,
     pub name_author_email: Option<String>,
     pub owner_email: Option<String>,
@@ -118,6 +121,7 @@ impl ProtonFolderMetadata {
             owner_email: node.base.owned_by.as_ref().and_then(|o| o.email.clone()),
             owner_organisation: node.base.owned_by.as_ref().and_then(|o| o.organisation.clone()),
             is_album,
+            content_modified_at: None,
         }
     }
 }
@@ -141,6 +145,7 @@ pub struct DegradedNodeMetadata {
 pub enum FsNode {
     File(ProtonFileMetadata),
     Folder(ProtonFolderMetadata),
+    #[allow(dead_code)]
     Degraded(DegradedNodeMetadata),
 }
 
@@ -211,7 +216,13 @@ impl FsNode {
                     datetime_to_system_time(f.creation_time)
                 }
             }
-            FsNode::Folder(f) => datetime_to_system_time(f.creation_time),
+            FsNode::Folder(f) => {
+                if let Some(mtime) = f.content_modified_at {
+                    datetime_to_system_time(mtime)
+                } else {
+                    datetime_to_system_time(f.creation_time)
+                }
+            }
             FsNode::Degraded(d) => datetime_to_system_time(d.creation_time),
         }
     }

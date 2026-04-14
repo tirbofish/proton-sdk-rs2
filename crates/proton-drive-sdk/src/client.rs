@@ -438,10 +438,20 @@ impl ProtonDriveClient {
         NodeOperations::get_node(self, node_uid).await
     }
 
+    /// Like `get_node`, but bypasses the entity cache and always fetches fresh data from the API.
+    /// Use this when you know the cached node metadata may be stale (e.g. after uploading a new revision).
+    pub async fn get_node_uncached(
+        &self,
+        node_uid: NodeUid,
+    ) -> anyhow::Result<PotentialObject<Node, DegradedNode>> {
+        let _ = self.cache().entities().remove_node(node_uid.clone()).await;
+        NodeOperations::get_node(self, node_uid).await
+    }
+
     /// Fetch and decrypt a thumbnail block belonging to the file identified by
     /// `node_uid`.  `thumbnail_id` is the server-assigned ID stored in the
     /// node's `Revision.thumbnails` list.  Returns the raw (decrypted) image
-    /// bytes on success.
+    /// bytes on success, which you will have to construct yourself with a crate like `image`. 
     pub async fn fetch_thumbnail(
         &self,
         node_uid: NodeUid,

@@ -28,10 +28,6 @@ pub(super) struct ProtonDriveFsInner {
     pub(super) last_event_id: Option<String>,
     /// Inodes currently being downloaded (for emblem display)
     pub(super) downloading_inodes: std::collections::HashSet<u64>,
-    /// Inodes with queued revision uploads (for deduplication)
-    /// When a second save comes for same inode, we skip queuing since
-    /// the worker will read fresh content from file_cache anyway.
-    pub(super) pending_revision_uploads: std::collections::HashSet<u64>,
 }
 
 impl ProtonDriveFsInner {
@@ -52,7 +48,6 @@ impl ProtonDriveFsInner {
             fh_to_inode: BTreeMap::new(),
             last_event_id: None,
             downloading_inodes: std::collections::HashSet::new(),
-            pending_revision_uploads: std::collections::HashSet::new(),
         }
     }
 

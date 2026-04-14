@@ -32,7 +32,7 @@ use futures_util::stream;
 use futures_util::stream::Stream;
 use futures_util::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use proton_drive_sdk::api::events::{VolumeEventDto, VolumeEventType};
@@ -57,7 +57,7 @@ mod uploads;
 
 use self::cache::{DiskCache, MAX_DISK_CACHE_SIZE};
 use self::errors::{
-    classify_download_error, is_permanent_upload_error, is_transient_error, is_stale_revision_error, MAX_UPLOAD_RETRIES,
+    classify_download_error, is_stale_revision_error, is_transient_error,
 };
 use self::ignore::{IgnoreManager, PDCLIGNORE_FILENAME};
 use self::maintenance::{add_gtk_bookmark, is_thumbnailer_process, remove_gtk_bookmark};
@@ -66,7 +66,7 @@ use self::state::ProtonDriveFsInner;
 use self::thumbnail::{
     get_thumbnail_config, has_cached_thumbnail, is_lock_file, plant_freedesktop_thumbnail,
 };
-use self::uploads::{PendingFile, PendingUploadStore, PersistentUpload, UploadTask, WriteBuffer};
+use self::uploads::{PendingFile, WriteBuffer};
 
 pub use self::maintenance::{clear_cache, clear_pending_uploads};
 
@@ -105,12 +105,6 @@ pub struct ProtonDriveFs {
     multi_progress: Arc<MultiProgress>,
     /// Ignore pattern manager
     ignore_manager: RwLock<IgnoreManager>,
-    /// Background upload queue sender
-    upload_tx: mpsc::UnboundedSender<UploadTask>,
-    /// Upload queue receiver (moved to background task on init)
-    upload_rx: RwLock<Option<mpsc::UnboundedReceiver<UploadTask>>>,
-    /// Persistent upload store for resume capability
-    pending_upload_store: Arc<PendingUploadStore>,
     /// Mount path for constructing file URIs (used for thumbnail caching)
     mount_path: PathBuf,
 }
@@ -125,9 +119,6 @@ impl ProtonDriveFs {
         
         let ignore_manager = IgnoreManager::new()?;
         tracing::info!("Loaded global .pdclignore from {:?}", ignore_manager.global_ignore_path());
-        
-        let (upload_tx, upload_rx) = mpsc::unbounded_channel();
-        let pending_upload_store = Arc::new(PendingUploadStore::new()?);
         
         // Open offline index
         let index_path = dirs::config_dir()
@@ -145,9 +136,6 @@ impl ProtonDriveFs {
             is_online: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             multi_progress,
             ignore_manager: RwLock::new(ignore_manager),
-            upload_tx,
-            upload_rx: RwLock::new(Some(upload_rx)),
-            pending_upload_store,
             mount_path: mount_path.to_path_buf(),
         })
     }
@@ -228,6 +216,7 @@ impl ProtonDriveFs {
             owner_email: None,
             owner_organisation: None,
             is_album: false,
+            content_modified_at: None,
         });
         inner.nodes.insert(ROOT_INODE, virtual_root);
         inner.children.insert(ROOT_INODE, vec![MYFILES_INODE]);
@@ -245,6 +234,7 @@ impl ProtonDriveFs {
             owner_email: None,
             owner_organisation: None,
             is_album: false,
+            content_modified_at: None,
         };
         let my_files_node = FsNode::Folder(my_files_meta);
         inner.uid_to_inode.insert(root_uid.to_string(), MYFILES_INODE);
@@ -257,695 +247,6 @@ impl ProtonDriveFs {
         
         // Store client
         *self.client.write().await = Some(client);
-        
-        // Spawn background upload processor
-        let upload_rx = self.upload_rx.write().await.take();
-        if let Some(mut rx) = upload_rx {
-            let client = self.client.clone();
-            let inner = self.inner.clone();
-            let multi_progress = self.multi_progress.clone();
-            let pending_upload_store = self.pending_upload_store.clone();
-            let index = self.index.clone();
-            
-            tokio::spawn(async move {
-                // Allow up to 3 concurrent file uploads
-                const MAX_CONCURRENT_FILE_UPLOADS: usize = 3;
-                let upload_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FILE_UPLOADS));
-                
-                while let Some(task) = rx.recv().await {
-                    // Clone what we need for the spawned task
-                    let client = client.clone();
-                    let inner = inner.clone();
-                    let multi_progress = multi_progress.clone();
-                    let semaphore = upload_semaphore.clone();
-                    let pending_upload_store = pending_upload_store.clone();
-                    let index = index.clone();
-                    
-                    // Spawn each upload as a separate task so they run concurrently
-                    tokio::spawn(async move {
-                        // Acquire semaphore permit to limit concurrent uploads
-                        let _permit = semaphore.acquire().await.unwrap();
-                        
-                        let client_guard = client.read().await;
-                        let Some(client) = client_guard.as_ref() else {
-                            tracing::error!("No client for background upload");
-                            return;
-                        };
-                    
-                    match task {
-                        UploadTask::NewFile { inode, pending, persist_id } => {
-                            tracing::info!("Background uploading new file '{}' ({} bytes)", pending.name, pending.content.len());
-                            
-                            let pb = multi_progress.add(ProgressBar::new(pending.content.len() as u64));
-                            pb.set_style(
-                                ProgressStyle::default_bar()
-                                    .template("{spinner:.white.on_blue} {msg} [{bar:30.white.on_blue}] {bytes}/{total_bytes}")
-                                    .unwrap()
-                                    .progress_chars("█▓░")
-                            );
-                            pb.set_message(format!("↑ {}", pending.name));
-                            pb.enable_steady_tick(Duration::from_millis(100));
-                            
-                            let size = pending.content.len() as i64;
-                            
-                            // Helper to handle upload errors - shows appropriate message and removes on permanent error
-                            let handle_newfile_error = |persist_id: &Option<String>, name: &str, error: &anyhow::Error, pb: &ProgressBar| {
-                                let error_msg = error.to_string();
-                                // Extract a short error description for display
-                                let short_error = if let Some(api_err) = error_msg.strip_prefix("API error ") {
-                                    let truncated = if api_err.len() > 50 {
-                                        format!("API {:.50}...", api_err)
-                                    } else {
-                                        format!("API {}", api_err)
-                                    };
-                                    truncated
-                                } else if error_msg.len() > 40 {
-                                    format!("{:.40}...", error_msg)
-                                } else {
-                                    error_msg.clone()
-                                };
-                                
-                                if is_permanent_upload_error(&error_msg) {
-                                    pb.finish_with_message(format!("{} {} ({})", style("✗").red(), name, short_error));
-                                    tracing::warn!(
-                                        "Permanent error for '{}': {} - removing from queue",
-                                        name, error_msg
-                                    );
-                                    if let Some(id) = persist_id {
-                                        if let Err(e) = pending_upload_store.remove(id) {
-                                            tracing::warn!("Failed to remove failed upload: {}", e);
-                                        }
-                                    }
-                                } else if is_transient_error(&error_msg) {
-                                    pb.finish_with_message(format!("{} {} ({}, will retry)", style("⚠").yellow(), name, short_error));
-                                    tracing::info!(
-                                        "Network error for '{}': {} - will retry on next mount",
-                                        name, error_msg
-                                    );
-                                    // Keep in persistent store for retry
-                                } else {
-                                    pb.finish_with_message(format!("{} {} ({}, will retry)", style("⚠").yellow(), name, short_error));
-                                    tracing::warn!(
-                                        "Unknown error for '{}': {} - will retry on next mount",
-                                        name, error_msg
-                                    );
-                                    // Keep in persistent store for retry
-                                }
-                            };
-                            
-                            match client.get_file_uploader(
-                                pending.parent_uid.clone(),
-                                pending.name.clone(),
-                                pending.mime_type.clone(),
-                                size,
-                                Some(std::time::SystemTime::now()),
-                                None,
-                                None,
-                                true,
-                            ).await {
-                                Ok(uploader) => {
-                                    let pb_clone = pb.clone();
-                                    let content = pending.content.clone();
-                                    match uploader.upload_from_stream(
-                                        Box::new(std::io::Cursor::new(content.clone())),
-                                        Vec::new(),
-                                        Box::new(move |bytes, _total| {
-                                            pb_clone.set_position(bytes as u64);
-                                        }),
-                                    ).await {
-                                        Ok(node_uid) => {
-                                            pb.finish_with_message(format!("{} {}", style("✓").green(), pending.name));
-                                            
-                                            // Remove from persistence store on success
-                                            if let Some(id) = persist_id {
-                                                if let Err(e) = pending_upload_store.remove(&id) {
-                                                    tracing::warn!("Failed to remove persisted upload {}: {}", id, e);
-                                                }
-                                            }
-                                            
-                                            // Update Index first (Index → FUSE flow)
-                                            // The Index event handler will update FUSE state
-                                            if let Ok(potential_node) = client.get_node(node_uid.clone()).await {
-                                                // Get parent_link_id from pending info
-                                                let parent_link_id = pending.parent_uid.link_id.raw().to_string();
-                                                let indexed = indexed_node_from_potential(&potential_node, &parent_link_id);
-                                                
-                                                if let Err(e) = index.upsert_node(&indexed) {
-                                                    tracing::warn!("Failed to upsert uploaded node to index: {}", e);
-                                                }
-                                                
-                                                // CRITICAL: Update FUSE state directly after upload
-                                                // The index event handler can't find this node because the link_id
-                                                // changed from "pending-*" to the real one.
-                                                let mut inner = inner.write().await;
-                                                
-                                                // Get the old pending link_id before we replace it
-                                                let old_link_id = inner.nodes.get(&inode)
-                                                    .map(|n| n.uid().link_id.raw().to_string());
-                                                
-                                                // Build new FsNode with real metadata
-                                                let new_fs_node = fs_node_from_indexed(&indexed);
-                                                let new_link_id = node_uid.link_id.raw().to_string();
-                                                let new_uid_str = node_uid.to_string();
-                                                
-                                                // Update node with real metadata
-                                                inner.nodes.insert(inode, new_fs_node);
-                                                
-                                                // Update link_id_to_inode: remove old pending mapping, add real one
-                                                if let Some(old_id) = old_link_id {
-                                                    if old_id != new_link_id {
-                                                        inner.link_id_to_inode.remove(&old_id);
-                                                        tracing::debug!("Replaced pending link_id '{}' with real '{}'", old_id, new_link_id);
-                                                    }
-                                                }
-                                                inner.link_id_to_inode.insert(new_link_id, inode);
-                                                
-                                                // Update uid_to_inode mapping
-                                                inner.uid_to_inode.insert(new_uid_str, inode);
-                                                
-                                                // Clean up pending state and cache content
-                                                inner.pending_files.remove(&inode);
-                                                inner.file_cache.put(inode, content);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            handle_newfile_error(&persist_id, &pending.name, &e, &pb);
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    handle_newfile_error(&persist_id, &pending.name, &e, &pb);
-                                }
-                            }
-                        }
-                        UploadTask::NewRevision { inode, revision_uid, filename, content, persist_id } => {
-                            // Read fresh content from file_cache if available (may have changed since queuing)
-                            let fresh_content = {
-                                let mut inner_guard = inner.write().await;
-                                inner_guard.file_cache.get(&inode).cloned()
-                            };
-                            let content = fresh_content.unwrap_or(content);
-                            
-                            tracing::info!("Background uploading revision for '{}' ({} bytes)", filename, content.len());
-                            
-                            let pb = multi_progress.add(ProgressBar::new(content.len() as u64));
-                            pb.set_style(
-                                ProgressStyle::default_bar()
-                                    .template("{spinner:.white.on_cyan} {msg} [{bar:30.white.on_cyan}] {bytes}/{total_bytes}")
-                                    .unwrap()
-                                    .progress_chars("█▓░")
-                            );
-                            pb.set_message(format!("↑ {}", filename));
-                            pb.enable_steady_tick(Duration::from_millis(100));
-                            
-                            let size = content.len() as i64;
-                            
-                            // Update progress bar size in case content changed
-                            pb.set_length(size as u64);
-                            
-                            // Fetch fresh revision_uid from server at execution time
-                            // This handles race conditions where a previous upload completed between queue and execute
-                            let node_uid = revision_uid.node_uid.clone();
-                            let mut current_revision_uid = match client.get_node(node_uid.clone()).await {
-                                Ok(PotentialObject::Node(Node::File(f) | Node::Photo(f))) => {
-                                    tracing::debug!("Fetched fresh revision for '{}': {:?}", filename, f.active_revision.uid.revision_id);
-                                    f.active_revision.uid.clone()
-                                }
-                                _ => {
-                                    tracing::debug!("Using queued revision for '{}' (fresh fetch failed)", filename);
-                                    revision_uid
-                                }
-                            };
-                            
-                            // Helper to handle upload errors - shows appropriate message and removes on permanent error
-                            let handle_revision_error = |persist_id: &Option<String>, name: &str, error: &anyhow::Error, pb: &ProgressBar| -> bool {
-                                let error_msg = error.to_string();
-                                // Check for "draft already exists" error - this is recoverable
-                                if error_msg.contains("2500") || error_msg.contains("Draft") {
-                                    pb.set_message(format!("↑ {} (clearing stale draft...)", name));
-                                    return true; // Signal to retry after clearing draft
-                                }
-                                // Check for "revision no longer up to date" or similar stale revision errors
-                                // These can be recovered by refreshing revision_uid from server
-                                if is_stale_revision_error(&error_msg) {
-                                    pb.set_message(format!("↑ {} (refreshing revision...)", name));
-                                    return true; // Signal to retry with fresh revision
-                                }
-                                // Extract a short error description for display
-                                let short_error = if let Some(api_err) = error_msg.strip_prefix("API error ") {
-                                    let truncated = if api_err.len() > 50 {
-                                        format!("API {:.50}...", api_err)
-                                    } else {
-                                        format!("API {}", api_err)
-                                    };
-                                    truncated
-                                } else if error_msg.len() > 40 {
-                                    format!("{:.40}...", error_msg)
-                                } else {
-                                    error_msg.clone()
-                                };
-                                
-                                if is_permanent_upload_error(&error_msg) {
-                                    pb.finish_with_message(format!("{} {} ({})", style("✗").red(), name, short_error));
-                                    tracing::warn!(
-                                        "Permanent error for revision '{}': {} - removing from queue",
-                                        name, error_msg
-                                    );
-                                    if let Some(id) = persist_id {
-                                        if let Err(e) = pending_upload_store.remove(id) {
-                                            tracing::warn!("Failed to remove failed upload: {}", e);
-                                        }
-                                    }
-                                } else if is_transient_error(&error_msg) {
-                                    pb.finish_with_message(format!("{} {} ({}, will retry)", style("⚠").yellow(), name, short_error));
-                                    tracing::info!(
-                                        "Network error for revision '{}': {} - will retry on next mount",
-                                        name, error_msg
-                                    );
-                                    // Keep in persistent store for retry
-                                } else {
-                                    pb.finish_with_message(format!("{} {} ({}, will retry)", style("⚠").yellow(), name, short_error));
-                                    tracing::warn!(
-                                        "Unknown error for revision '{}': {} - will retry on next mount",
-                                        name, error_msg
-                                    );
-                                    // Keep in persistent store for retry
-                                }
-                                false // Don't retry
-                            };
-                            
-                            // Try up to 4 times to handle race conditions (2511 errors can chain)
-                            let mut attempts = 0;
-                            // current_revision_uid already fetched fresh above
-                            loop {
-                                attempts += 1;
-                                if attempts > 4 {
-                                    pb.finish_with_message(format!("{} {} (failed after {} retries)", style("✗").red(), filename, attempts - 1));
-                                    break;
-                                }
-                                
-                                match client.get_file_revision_uploader(
-                                    current_revision_uid.clone(),
-                                    size,
-                                    Some(std::time::SystemTime::now()),
-                                    None,
-                                    None,
-                                ).await {
-                                    Ok(uploader) => {
-                                        let pb_clone = pb.clone();
-                                        let content_clone = content.clone();
-                                        match uploader.upload_from_stream(
-                                            Box::new(std::io::Cursor::new(content_clone)),
-                                            Vec::new(),
-                                            Box::new(move |bytes, _total| {
-                                                pb_clone.set_position(bytes as u64);
-                                            }),
-                                        ).await {
-                                            Ok(new_node_uid) => {
-                                                pb.finish_with_message(format!("{} {}", style("✓").green(), filename));
-                                                
-                                                // Remove from persistence store on success
-                                                if let Some(id) = &persist_id {
-                                                    if let Err(e) = pending_upload_store.remove(id) {
-                                                        tracing::warn!("Failed to remove persisted upload {}: {}", id, e);
-                                                    }
-                                                }
-                                                
-                                                // Update Index first (Index → FUSE flow)
-                                                // The Index event handler will update FUSE state
-                                                if let Ok(potential_node) = client.get_node(new_node_uid.clone()).await {
-                                                    // Get parent_link_id from existing index entry
-                                                    let link_id = new_node_uid.link_id.raw();
-                                                    let parent_link_id = index.get_node(link_id)
-                                                        .ok()
-                                                        .flatten()
-                                                        .and_then(|n| n.parent_link_id)
-                                                        .unwrap_or_default();
-                                                    
-                                                    let indexed = indexed_node_from_potential(&potential_node, &parent_link_id);
-                                                    
-                                                    if let Err(e) = index.upsert_node(&indexed) {
-                                                        tracing::warn!("Failed to upsert uploaded revision to index: {}", e);
-                                                    }
-                                                    
-                                                    // Cache the content and clear pending status
-                                                    let mut inner = inner.write().await;
-                                                    inner.file_cache.put(inode, content.clone());
-                                                    inner.pending_revision_uploads.remove(&inode);
-                                                }
-                                                break; // Success - exit retry loop
-                                            }
-                                            Err(e) => {
-                                                let should_retry = handle_revision_error(&persist_id, &filename, &e, &pb);
-                                                if should_retry {
-                                                    // Delete stale draft and retry
-                                                    let node_uid = current_revision_uid.node_uid.clone();
-                                                    pb.set_message(format!("↑ {} (clearing draft...)", filename));
-                                                    match client.delete_draft_revisions(node_uid.clone()).await {
-                                                        Ok(n) => tracing::info!("Deleted {} draft revision(s) for {:?}", n, node_uid),
-                                                        Err(e) => tracing::warn!("Failed to delete drafts: {}", e),
-                                                    }
-                                                    // Fetch latest revision ID for retry
-                                                    if let Ok(potential) = client.get_node(node_uid.clone()).await {
-                                                        if let PotentialObject::Node(Node::File(f) | Node::Photo(f)) = &potential {
-                                                            current_revision_uid = f.active_revision.uid.clone();
-                                                            pb.set_message(format!("↑ {}", filename));
-                                                            continue; // Retry with fresh revision UID
-                                                        }
-                                                    }
-                                                }
-                                                break; // Don't retry
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let should_retry = handle_revision_error(&persist_id, &filename, &e, &pb);
-                                        if should_retry {
-                                            // Delete stale draft and retry
-                                            let node_uid = current_revision_uid.node_uid.clone();
-                                            pb.set_message(format!("↑ {} (clearing draft...)", filename));
-                                            match client.delete_draft_revisions(node_uid.clone()).await {
-                                                Ok(n) => tracing::info!("Deleted {} draft revision(s) for {:?}", n, node_uid),
-                                                Err(e) => tracing::warn!("Failed to delete drafts: {}", e),
-                                            }
-                                            // Fetch latest revision ID for retry  
-                                            if let Ok(potential) = client.get_node(node_uid.clone()).await {
-                                                if let PotentialObject::Node(Node::File(f) | Node::Photo(f)) = &potential {
-                                                    current_revision_uid = f.active_revision.uid.clone();
-                                                    pb.set_message(format!("↑ {}", filename));
-                                                    continue; // Retry with fresh revision UID
-                                                }
-                                            }
-                                        }
-                                        break; // Don't retry
-                                    }
-                                }
-                            }
-                            
-                            // Always clear pending status when task completes (success or failure)
-                            {
-                                let mut inner = inner.write().await;
-                                inner.pending_revision_uploads.remove(&inode);
-                            }
-                        }
-                        UploadTask::ResumePersisted(mut persisted) => {
-                            // Check if we've exceeded max retries
-                            if persisted.retry_count() >= MAX_UPLOAD_RETRIES {
-                                tracing::warn!(
-                                    "Giving up on upload '{}' after {} retries",
-                                    persisted.name(),
-                                    persisted.retry_count()
-                                );
-                                if let Err(e) = pending_upload_store.remove(persisted.id()) {
-                                    tracing::warn!("Failed to remove failed upload: {}", e);
-                                }
-                                return;
-                            }
-                            
-                            // Check if upload is stale (older than 24 hours)
-                            if persisted.is_stale() {
-                                tracing::warn!(
-                                    "Removing stale upload '{}' (created more than 24 hours ago)",
-                                    persisted.name()
-                                );
-                                if let Err(e) = pending_upload_store.remove(persisted.id()) {
-                                    tracing::warn!("Failed to remove stale upload: {}", e);
-                                }
-                                return;
-                            }
-                            
-                            // Resume a persisted upload from a previous session
-                            let (name, content_len): (String, usize) = match &persisted {
-                                PersistentUpload::NewFile { name, content, .. } => {
-                                    (name.clone(), content.len())
-                                }
-                                PersistentUpload::NewRevision { filename, content, .. } => {
-                                    (filename.clone(), content.len())
-                                }
-                            };
-                            
-                            let retry_info = if persisted.retry_count() > 0 {
-                                format!(" (retry {})", persisted.retry_count())
-                            } else {
-                                String::new()
-                            };
-                            tracing::info!("Resuming persisted upload for '{}' ({} bytes){}", name, content_len, retry_info);
-                            
-                            let pb = multi_progress.add(ProgressBar::new(content_len as u64));
-                            pb.set_style(
-                                ProgressStyle::default_bar()
-                                    .template("{spinner:.white.on_yellow} {msg} [{bar:30.white.on_yellow}] {bytes}/{total_bytes}")
-                                    .unwrap()
-                                    .progress_chars("█▓░")
-                            );
-                            pb.set_message(format!("⟳ {}", name));
-                            pb.enable_steady_tick(Duration::from_millis(100));
-                            
-                            // Helper to handle upload failure
-                            let handle_upload_error = |id: &str, name: &str, error: &anyhow::Error, persisted: &mut PersistentUpload, pb: &ProgressBar| {
-                                let error_msg = error.to_string();
-                                // Extract a short error description for display
-                                let short_error = if let Some(api_err) = error_msg.strip_prefix("API error ") {
-                                    // Show "API error XXXX: message" but truncate long messages
-                                    let truncated = if api_err.len() > 50 {
-                                        format!("API {:.50}...", api_err)
-                                    } else {
-                                        format!("API {}", api_err)
-                                    };
-                                    truncated
-                                } else if error_msg.len() > 40 {
-                                    format!("{:.40}...", error_msg)
-                                } else {
-                                    error_msg.clone()
-                                };
-                                
-                                // Check if this is a permanent error
-                                if is_permanent_upload_error(&error_msg) {
-                                    pb.finish_with_message(format!("{} {} ({})", style("✗").red(), name, short_error));
-                                    tracing::warn!(
-                                        "Permanent error for '{}': {} - removing from queue",
-                                        name, error_msg
-                                    );
-                                    if let Err(e) = pending_upload_store.remove(id) {
-                                        tracing::warn!("Failed to remove failed upload: {}", e);
-                                    }
-                                } else if is_transient_error(&error_msg) {
-                                    // Network/connection error - will retry
-                                    persisted.increment_retry();
-                                    pb.finish_with_message(format!(
-                                        "{} {} ({}, retry {}/{})", 
-                                        style("⚠").yellow(), name, short_error, persisted.retry_count(), MAX_UPLOAD_RETRIES
-                                    ));
-                                    tracing::info!(
-                                        "Network error for '{}': {} - will retry (attempt {}/{})",
-                                        name, error_msg, persisted.retry_count(), MAX_UPLOAD_RETRIES
-                                    );
-                                    if let Err(e) = pending_upload_store.save(persisted) {
-                                        tracing::warn!("Failed to update retry count: {}", e);
-                                    }
-                                } else {
-                                    // Unknown error - treat as transient but warn
-                                    persisted.increment_retry();
-                                    pb.finish_with_message(format!(
-                                        "{} {} ({}, retry {}/{})", 
-                                        style("⚠").yellow(), name, short_error, persisted.retry_count(), MAX_UPLOAD_RETRIES
-                                    ));
-                                    tracing::warn!(
-                                        "Unknown error for '{}': {} - will retry (attempt {}/{})",
-                                        name, error_msg, persisted.retry_count(), MAX_UPLOAD_RETRIES
-                                    );
-                                    if let Err(e) = pending_upload_store.save(persisted) {
-                                        tracing::warn!("Failed to update retry count: {}", e);
-                                    }
-                                }
-                            };
-                            
-                            match persisted.clone() {
-                                PersistentUpload::NewFile { id, parent_uid, name, mime_type, content, .. } => {
-                                    let size = content.len() as i64;
-                                    match client.get_file_uploader(
-                                        parent_uid.clone(),
-                                        name.clone(),
-                                        mime_type,
-                                        size,
-                                        Some(std::time::SystemTime::now()),
-                                        None,
-                                        None,
-                                        true,
-                                    ).await {
-                                        Ok(uploader) => {
-                                            let pb_clone = pb.clone();
-                                            match uploader.upload_from_stream(
-                                                Box::new(std::io::Cursor::new(content)),
-                                                Vec::new(),
-                                                Box::new(move |bytes, _total| {
-                                                    pb_clone.set_position(bytes as u64);
-                                                }),
-                                            ).await {
-                                                Ok(node_uid) => {
-                                                    pb.finish_with_message(format!("{} {}", style("✓").green(), name));
-                                                    // Remove from persistence store on success
-                                                    if let Err(e) = pending_upload_store.remove(&id) {
-                                                        tracing::warn!("Failed to remove persisted upload {}: {}", id, e);
-                                                    }
-                                                    
-                                                    // Update Index (Index → FUSE flow)
-                                                    if let Ok(potential_node) = client.get_node(node_uid).await {
-                                                        let parent_link_id = parent_uid.link_id.raw().to_string();
-                                                        let indexed = indexed_node_from_potential(&potential_node, &parent_link_id);
-                                                        if let Err(e) = index.upsert_node(&indexed) {
-                                                            tracing::warn!("Failed to upsert resumed upload to index: {}", e);
-                                                        }
-                                                    }
-                                                    
-                                                    tracing::info!("Successfully resumed upload for '{}'", name);
-                                                }
-                                                Err(e) => {
-                                                    handle_upload_error(&id, &name, &e, &mut persisted, &pb);
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            handle_upload_error(&id, &name, &e, &mut persisted, &pb);
-                                        }
-                                    }
-                                }
-                                PersistentUpload::NewRevision { id, revision_uid, filename, content, .. } => {
-                                    let size = content.len() as i64;
-                                    let mut current_revision_uid = revision_uid.clone();
-                                    
-                                    // Try upload, clearing draft if needed (one retry)
-                                    let mut cleared_draft = false;
-                                    loop {
-                                        match client.get_file_revision_uploader(
-                                            current_revision_uid.clone(),
-                                            size,
-                                            Some(std::time::SystemTime::now()),
-                                            None,
-                                            None,
-                                        ).await {
-                                            Ok(uploader) => {
-                                                let pb_clone = pb.clone();
-                                                match uploader.upload_from_stream(
-                                                    Box::new(std::io::Cursor::new(content.clone())),
-                                                    Vec::new(),
-                                                    Box::new(move |bytes, _total| {
-                                                        pb_clone.set_position(bytes as u64);
-                                                    }),
-                                                ).await {
-                                                    Ok(new_node_uid) => {
-                                                        pb.finish_with_message(format!("{} {}", style("✓").green(), filename));
-                                                        // Remove from persistence store on success
-                                                        if let Err(e) = pending_upload_store.remove(&id) {
-                                                            tracing::warn!("Failed to remove persisted upload {}: {}", id, e);
-                                                        }
-                                                        
-                                                        // Update Index (Index → FUSE flow)
-                                                        if let Ok(potential_node) = client.get_node(new_node_uid.clone()).await {
-                                                            let link_id = new_node_uid.link_id.raw();
-                                                            let parent_link_id = index.get_node(link_id)
-                                                                .ok()
-                                                                .flatten()
-                                                                .and_then(|n| n.parent_link_id)
-                                                                .unwrap_or_default();
-                                                            let indexed = indexed_node_from_potential(&potential_node, &parent_link_id);
-                                                            if let Err(e) = index.upsert_node(&indexed) {
-                                                                tracing::warn!("Failed to upsert resumed revision to index: {}", e);
-                                                            }
-                                                        }
-                                                        
-                                                        tracing::info!("Successfully resumed revision upload for '{}'", filename);
-                                                    }
-                                                    Err(e) => {
-                                                        let error_msg = e.to_string();
-                                                        // Check for draft error or stale revision and try to recover
-                                                        let is_draft_err = error_msg.contains("2500") || error_msg.contains("Draft");
-                                                        let is_stale_err = is_stale_revision_error(&error_msg);
-                                                        
-                                                        if !cleared_draft && (is_draft_err || is_stale_err) {
-                                                            pb.set_message(format!("⟳ {} (refreshing revision...)", filename));
-                                                            let node_uid = current_revision_uid.node_uid.clone();
-                                                            if is_draft_err {
-                                                                let _ = client.delete_draft_revisions(node_uid.clone()).await;
-                                                            }
-                                                            // Get fresh revision UID
-                                                            if let Ok(potential) = client.get_node(node_uid).await {
-                                                                if let PotentialObject::Node(Node::File(f) | Node::Photo(f)) = &potential {
-                                                                    current_revision_uid = f.active_revision.uid.clone();
-                                                                    cleared_draft = true;
-                                                                    pb.set_message(format!("⟳ {}", filename));
-                                                                    continue; // Retry
-                                                                }
-                                                            }
-                                                        }
-                                                        handle_upload_error(&id, &filename, &e, &mut persisted, &pb);
-                                                    }
-                                                }
-                                                break;
-                                            }
-                                            Err(e) => {
-                                                let error_msg = e.to_string();
-                                                // Check for draft error or stale revision and try to recover
-                                                let is_draft_err = error_msg.contains("2500") || error_msg.contains("Draft");
-                                                let is_stale_err = is_stale_revision_error(&error_msg);
-                                                
-                                                if !cleared_draft && (is_draft_err || is_stale_err) {
-                                                    pb.set_message(format!("⟳ {} (refreshing revision...)", filename));
-                                                    let node_uid = current_revision_uid.node_uid.clone();
-                                                    if is_draft_err {
-                                                        let _ = client.delete_draft_revisions(node_uid.clone()).await;
-                                                    }
-                                                    // Get fresh revision UID
-                                                    if let Ok(potential) = client.get_node(node_uid).await {
-                                                        if let PotentialObject::Node(Node::File(f) | Node::Photo(f)) = &potential {
-                                                            current_revision_uid = f.active_revision.uid.clone();
-                                                            cleared_draft = true;
-                                                            pb.set_message(format!("⟳ {}", filename));
-                                                            continue; // Retry
-                                                        }
-                                                    }
-                                                }
-                                                handle_upload_error(&id, &filename, &e, &mut persisted, &pb);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    }); // End of spawned upload task
-                }
-            });
-        }
-        
-        // Load and queue any pending uploads from previous sessions
-        match self.pending_upload_store.load_all() {
-            Ok(pending_uploads) => {
-                if !pending_uploads.is_empty() {
-                    tracing::info!("Found {} pending uploads from previous session", pending_uploads.len());
-                    for persisted in pending_uploads {
-                        // Skip stale or max-retried uploads (they'll be cleaned during actual processing)
-                        if persisted.is_stale() {
-                            tracing::warn!("Skipping stale upload '{}' (will be cleaned up)", persisted.name());
-                            continue;
-                        }
-                        if persisted.retry_count() >= MAX_UPLOAD_RETRIES {
-                            tracing::warn!("Skipping upload '{}' - exceeded max retries (will be cleaned up)", persisted.name());
-                            continue;
-                        }
-                        
-                        tracing::info!("Queueing resumed upload for '{}' (retry {})", persisted.name(), persisted.retry_count());
-                        if let Err(e) = self.upload_tx.send(UploadTask::ResumePersisted(persisted)) {
-                            tracing::error!("Failed to queue resumed upload: {}", e);
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to load pending uploads: {}", e);
-            }
-        }
         
         // Start background event poller
         {
@@ -960,26 +261,33 @@ impl ProtonDriveFs {
                 let index = self.index.clone();
                 let multi_progress = self.multi_progress.clone();
                 
-                // Get the initial event ID
-                {
-                    let client_guard = client.read().await;
-                    if let Some(client) = client_guard.as_ref() {
-                        match client.get_volume_latest_event_id(volume_id.clone()).await {
-                            Ok(event_id) => {
-                                tracing::info!("Starting event polling from event ID: {}", event_id);
-                                let mut inner_guard = inner.write().await;
-                                inner_guard.last_event_id = Some(event_id);
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to get latest event ID: {}", e);
-                            }
-                        }
-                    }
-                }
-                
                 tokio::spawn(async move {
                     // Small delay before first poll to let mount complete
                     tokio::time::sleep(Duration::from_secs(2)).await;
+                    
+                    // Fetch the initial event ID (with retries)
+                    loop {
+                        let client_guard = client.read().await;
+                        if let Some(c) = client_guard.as_ref() {
+                            match c.get_volume_latest_event_id(volume_id.clone()).await {
+                                Ok(event_id) => {
+                                    tracing::info!("Starting event polling from event ID: {}", event_id);
+                                    let mut inner_guard = inner.write().await;
+                                    inner_guard.last_event_id = Some(event_id);
+                                    break;
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to get latest event ID, retrying in {:?}: {}", EVENT_POLL_INTERVAL, e);
+                                    drop(client_guard);
+                                    tokio::time::sleep(EVENT_POLL_INTERVAL).await;
+                                }
+                            }
+                        } else {
+                            drop(client_guard);
+                            tokio::time::sleep(EVENT_POLL_INTERVAL).await;
+                        }
+                    }
+                    
                     tracing::info!("Event poller started, polling every {} seconds", EVENT_POLL_INTERVAL.as_secs());
                     
                     loop {
@@ -1003,6 +311,11 @@ impl ProtonDriveFs {
                         match client.poll_volume_events(volume_id.clone(), &last_event_id).await {
                             Ok(response) => {
                                 let event_count = response.events.len();
+                                if event_count == 0 {
+                                    tracing::trace!("Event poll: no new events (cursor={})", last_event_id);
+                                } else {
+                                    tracing::info!("Event poll: {} new event(s) (cursor={})", event_count, last_event_id);
+                                }
                                 
                                 // Show spinner if we have events to process
                                 let spinner = if event_count > 0 {
@@ -1048,7 +361,7 @@ impl ProtonDriveFs {
                                         pb.set_message(format!("Syncing {}/{} changes from server...", 
                                             processed, event_count));
                                     }
-                                    if let Err(e) = Self::process_event(&index, client, &volume_id, event).await {
+                                    if let Err(e) = Self::process_event(&index, client, &volume_id, event, &inner).await {
                                         tracing::warn!("Failed to process event {}: {}", event.event_id, e);
                                     }
                                 }
@@ -1110,12 +423,13 @@ impl ProtonDriveFs {
                                         if let Some(&existing_inode) = inner_guard.link_id_to_inode.get(&link_id) {
                                             // Update existing node
                                             inner_guard.nodes.insert(existing_inode, fs_node);
-                                            // Clear file cache since content may have changed
+                                            
+                                            // Clear file cache so next read fetches fresh content
                                             inner_guard.file_cache.remove(&existing_inode);
                                             tracing::debug!("Updated FUSE node '{}' (inode {}) from index", node_name, existing_inode);
-                                        } else if let Some(parent) = parent_link_id {
+                                        } else if let Some(ref parent) = parent_link_id {
                                             // New node - add to FUSE and parent's children
-                                            if let Some(&parent_inode) = inner_guard.link_id_to_inode.get(&parent) {
+                                            if let Some(&parent_inode) = inner_guard.link_id_to_inode.get(parent) {
                                                 let inode = inner_guard.insert_node(fs_node, None);
                                                 inner_guard.link_id_to_inode.insert(link_id.clone(), inode);
                                                 
@@ -1133,26 +447,41 @@ impl ProtonDriveFs {
                                                 tracing::debug!("Node '{}' parent not in FUSE yet, will appear when parent accessed", node_name);
                                             }
                                         }
+                                        
+                                        // Bump parent folder's mtime so Nautilus detects the change
+                                        if let Some(ref parent) = parent_link_id {
+                                            if let Some(&parent_inode) = inner_guard.link_id_to_inode.get(parent) {
+                                                if let Some(FsNode::Folder(folder)) = inner_guard.nodes.get_mut(&parent_inode) {
+                                                    folder.content_modified_at = Some(chrono::Utc::now());
+                                                    tracing::debug!("Bumped mtime for parent folder (inode {})", parent_inode);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 IndexEvent::NodeRemoved { link_id, parent_link_id } => {
                                     let mut inner_guard = inner.write().await;
                                     if let Some(&inode) = inner_guard.link_id_to_inode.get(&link_id) {
-                                        // Get the name before removing
+                                        // Get the name and parent info before removing
                                         let node_name = inner_guard.nodes.get(&inode)
                                             .map(|n| n.name().to_string())
                                             .unwrap_or_else(|| "unknown".to_string());
                                         
+                                        // Determine parent link ID: prefer event data, fall back to node's own parent_uid
+                                        let effective_parent_link_id = parent_link_id.or_else(|| {
+                                            inner_guard.nodes.get(&inode)
+                                                .and_then(|n| n.parent_uid())
+                                                .map(|uid| uid.link_id.raw().to_string())
+                                        });
+                                        
                                         // Recursively remove this node and all children from FUSE
                                         fn remove_recursive(inner: &mut ProtonDriveFsInner, inode: u64) -> usize {
                                             let mut count = 1;
-                                            // Remove children first
                                             if let Some(children) = inner.children.remove(&inode) {
                                                 for child_inode in children {
                                                     count += remove_recursive(inner, child_inode);
                                                 }
                                             }
-                                            // Remove the node itself
                                             if let Some(node) = inner.nodes.remove(&inode) {
                                                 inner.uid_to_inode.remove(&node.uid().to_string());
                                                 inner.link_id_to_inode.remove(node.uid().link_id.raw());
@@ -1164,16 +493,24 @@ impl ProtonDriveFs {
                                         
                                         let removed_count = remove_recursive(&mut inner_guard, inode);
                                         
-                                        // Remove from parent's children list
-                                        if let Some(parent) = parent_link_id {
+                                        // Remove from parent's children list and bump parent mtime
+                                        if let Some(parent) = effective_parent_link_id {
                                             if let Some(&parent_inode) = inner_guard.link_id_to_inode.get(&parent) {
                                                 if let Some(children) = inner_guard.children.get_mut(&parent_inode) {
                                                     children.retain(|&i| i != inode);
                                                 }
+                                                // Bump parent mtime so Nautilus detects the change
+                                                if let Some(FsNode::Folder(folder)) = inner_guard.nodes.get_mut(&parent_inode) {
+                                                    folder.content_modified_at = Some(chrono::Utc::now());
+                                                }
                                             }
+                                        } else {
+                                            tracing::warn!("No parent info for removed node '{}' (inode {}), orphan inode may remain in parent children list", node_name, inode);
                                         }
                                         
                                         tracing::info!("Removed FUSE node '{}' (inode {}) and {} total nodes", node_name, inode, removed_count);
+                                    } else {
+                                        tracing::debug!("NodeRemoved for link_id {} but not found in FUSE state", link_id);
                                     }
                                 }
                                 IndexEvent::ChildrenLoaded { parent_link_id, count } => {
@@ -1182,6 +519,10 @@ impl ProtonDriveFs {
                                     let mut inner_guard = inner.write().await;
                                     if let Some(&parent_inode) = inner_guard.link_id_to_inode.get(&parent_link_id) {
                                         inner_guard.loaded_folders.remove(&parent_inode);
+                                        // Bump mtime so Nautilus refreshes
+                                        if let Some(FsNode::Folder(folder)) = inner_guard.nodes.get_mut(&parent_inode) {
+                                            folder.content_modified_at = Some(chrono::Utc::now());
+                                        }
                                         tracing::debug!("Folder {} will reload {} children from index on next access", parent_inode, count);
                                     }
                                 }
@@ -1325,16 +666,16 @@ impl ProtonDriveFs {
         client: &ProtonDriveClient,
         volume_id: &VolumeId,
         event: &VolumeEventDto,
+        inner: &Arc<RwLock<ProtonDriveFsInner>>,
     ) -> Result<()> {
         let link_id = event.link.link_id.raw();
         let parent_link_id = event.link.parent_link_id.as_ref().map(|l| l.raw().to_string());
         let event_type = event.event_type();
-        tracing::info!("Processing event {:?} for link {}", event_type, link_id);
+        tracing::info!("Processing event {:?} for link {} (parent={:?})", event_type, link_id, parent_link_id);
         
         match event_type {
             Some(VolumeEventType::Create) | Some(VolumeEventType::UpdateMetadata) | Some(VolumeEventType::UpdateContent) => {
                 // Fetch the node from server and update the index.
-                // The index will emit NodeUpserted event, which the handler will use to update FUSE.
                 let node_uid = NodeUid::new(volume_id.clone(), event.link.link_id.clone());
                 
                 match client.get_node(node_uid.clone()).await {
@@ -1345,8 +686,40 @@ impl ProtonDriveFs {
                         
                         if let Err(e) = index.upsert_node(&indexed) {
                             tracing::warn!("Failed to upsert node {} to index: {}", link_id, e);
-                        } else {
-                            tracing::debug!("Updated index for node {} (event: {:?})", link_id, event_type);
+                        }
+                        
+                        // Directly update FUSE state (don't rely solely on broadcast channel)
+                        let fs_node = fs_node_from_indexed(&indexed);
+                        let node_name = fs_node.name().to_string();
+                        let mut inner_guard = inner.write().await;
+                        
+                        if let Some(&existing_inode) = inner_guard.link_id_to_inode.get(link_id) {
+                            // Update existing node
+                            inner_guard.nodes.insert(existing_inode, fs_node);
+                            inner_guard.file_cache.remove(&existing_inode);
+                            tracing::info!("Event: updated FUSE node '{}' (inode {})", node_name, existing_inode);
+                        } else if let Some(ref parent) = parent_link_id {
+                            if let Some(&parent_inode) = inner_guard.link_id_to_inode.get(parent.as_str()) {
+                                let inode = inner_guard.insert_node(fs_node, None);
+                                inner_guard.link_id_to_inode.insert(link_id.to_string(), inode);
+                                if let Some(children) = inner_guard.children.get_mut(&parent_inode) {
+                                    if !children.contains(&inode) {
+                                        children.push(inode);
+                                    }
+                                } else {
+                                    inner_guard.children.insert(parent_inode, vec![inode]);
+                                }
+                                tracing::info!("Event: added new FUSE node '{}' (inode {}) to parent {}", node_name, inode, parent_inode);
+                            }
+                        }
+                        
+                        // Bump parent mtime
+                        if let Some(ref parent) = parent_link_id {
+                            if let Some(&parent_inode) = inner_guard.link_id_to_inode.get(parent.as_str()) {
+                                if let Some(FsNode::Folder(folder)) = inner_guard.nodes.get_mut(&parent_inode) {
+                                    folder.content_modified_at = Some(chrono::Utc::now());
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -1355,11 +728,64 @@ impl ProtonDriveFs {
                 }
             }
             Some(VolumeEventType::Delete) => {
-                // Delete from index (recursively in case it's a folder).
-                // The index will emit NodeRemoved event, which the handler will use to remove from FUSE.
+                // Delete from index
                 match index.delete_node_recursive(link_id) {
-                    Ok(count) => tracing::debug!("Deleted {} node(s) from index for {}", count, link_id),
-                    Err(e) => tracing::warn!("Failed to delete node {} from index: {}", link_id, e),
+                    Ok(count) => {
+                        tracing::info!("Deleted {} node(s) from index for link {}", count, link_id);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to delete node {} from index: {}", link_id, e);
+                    }
+                }
+                
+                // Directly remove from FUSE state (don't rely solely on broadcast channel)
+                let mut inner_guard = inner.write().await;
+                if let Some(&inode) = inner_guard.link_id_to_inode.get(link_id) {
+                    let node_name = inner_guard.nodes.get(&inode)
+                        .map(|n| n.name().to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    
+                    // Determine parent: from event DTO, then from FUSE node
+                    let effective_parent = parent_link_id.clone().or_else(|| {
+                        inner_guard.nodes.get(&inode)
+                            .and_then(|n| n.parent_uid())
+                            .map(|uid| uid.link_id.raw().to_string())
+                    });
+                    
+                    // Recursively remove this node and all children from FUSE
+                    fn remove_recursive(inner: &mut ProtonDriveFsInner, inode: u64) -> usize {
+                        let mut count = 1;
+                        if let Some(children) = inner.children.remove(&inode) {
+                            for child_inode in children {
+                                count += remove_recursive(inner, child_inode);
+                            }
+                        }
+                        if let Some(node) = inner.nodes.remove(&inode) {
+                            inner.uid_to_inode.remove(&node.uid().to_string());
+                            inner.link_id_to_inode.remove(node.uid().link_id.raw());
+                        }
+                        inner.file_cache.remove(&inode);
+                        inner.loaded_folders.remove(&inode);
+                        count
+                    }
+                    
+                    let removed_count = remove_recursive(&mut inner_guard, inode);
+                    
+                    // Remove from parent's children list and bump parent mtime
+                    if let Some(parent) = effective_parent {
+                        if let Some(&parent_inode) = inner_guard.link_id_to_inode.get(&parent) {
+                            if let Some(children) = inner_guard.children.get_mut(&parent_inode) {
+                                children.retain(|&i| i != inode);
+                            }
+                            if let Some(FsNode::Folder(folder)) = inner_guard.nodes.get_mut(&parent_inode) {
+                                folder.content_modified_at = Some(chrono::Utc::now());
+                            }
+                        }
+                    }
+                    
+                    tracing::info!("Event: removed FUSE node '{}' (inode {}) and {} total nodes", node_name, inode, removed_count);
+                } else {
+                    tracing::info!("Event: Delete for link {} but not in FUSE state (already removed or never loaded)", link_id);
                 }
             }
             None => {
@@ -1698,6 +1124,7 @@ impl ProtonDriveFs {
                         owner_email: None,
                         owner_organisation: None,
                         is_album: false,
+                        content_modified_at: None,
                     })
                 }
             };
@@ -1719,6 +1146,7 @@ impl ProtonDriveFs {
     }
 
     /// Get the revision UID for a file inode (without triggering download).
+    #[allow(dead_code)]
     async fn get_revision_uid(&self, inode: u64) -> Option<RevisionUid> {
         let inner = self.inner.read().await;
         if let Some(FsNode::File(file_meta)) = inner.nodes.get(&inode) {
@@ -2023,6 +1451,7 @@ impl ProtonDriveFs {
     }
 
     /// Upload a pending file to Proton Drive.
+    #[allow(dead_code)]
     async fn upload_pending_file(&self, inode: u64) -> Result<NodeUid> {
         let pending = {
             let inner = self.inner.read().await;
@@ -2130,7 +1559,10 @@ impl ProtonDriveFs {
         Ok(node_uid)
     }
 
-    /// Upload the write buffer as a new revision of an existing file.
+    /// Queue a write buffer for background upload (non-blocking).
+    /// Uses debouncing to coalesce rapid saves into a single upload.
+    /// Upload a file synchronously when its write buffer is dirty.
+    /// Blocks the calling program until the upload completes or fails.
     async fn upload_write_buffer(&self, fh: u64) -> Result<()> {
         let (inode, content, is_new) = {
             let inner = self.inner.read().await;
@@ -2139,38 +1571,137 @@ impl ProtonDriveFs {
                 _ => return Ok(()), // Not dirty, nothing to do
             }
         };
-        
-        // Check if background upload is already in progress for this inode
-        // If so, skip sync upload to avoid race condition (2511 errors)
+
+        // Mark buffer as clean and update the cache
         {
-            let inner = self.inner.read().await;
-            if inner.pending_revision_uploads.contains(&inode) {
-                tracing::debug!("Background upload already pending for inode {}, skipping sync upload", inode);
-                return Ok(()); // Background will handle it
+            let mut inner = self.inner.write().await;
+            if let Some(buf) = inner.write_buffers.get_mut(&fh) {
+                buf.dirty = false;
             }
+            inner.file_cache.put(inode, content.clone());
         }
 
+        // Get client
+        let client_guard = self.client.read().await;
+        let client = client_guard.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No client available"))?;
+
+        let size = content.len() as i64;
+
         if is_new {
-            // This is a new file, use the pending file upload
-            self.upload_pending_file(inode).await?;
-        } else {
-            // This is an update to an existing file - upload as new revision
-            let revision_uid = self.get_revision_uid(inode).await
-                .ok_or_else(|| anyhow::anyhow!("No revision UID for inode {}", inode))?;
-
-            let client_guard = self.client.read().await;
-            let client = client_guard.as_ref()
-                .ok_or_else(|| anyhow::anyhow!("No client"))?;
-
-            let filename = {
+            // New file upload
+            let pending = {
                 let inner = self.inner.read().await;
-                inner.nodes.get(&inode).map(|n| n.name().to_string()).unwrap_or_default()
+                inner.pending_files.get(&inode).cloned()
+            };
+            let Some(pending) = pending else {
+                return Err(anyhow::anyhow!("No pending file metadata for inode {}", inode));
+            };
+            if pending.local_only {
+                return Ok(());
+            }
+
+            tracing::info!("Uploading new file '{}' ({} bytes, blocking)", pending.name, size);
+
+            let pb = self.multi_progress.add(ProgressBar::new(size as u64));
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("{spinner:.white.on_blue} {msg} [{bar:30.white.on_blue}] {bytes}/{total_bytes}")
+                    .unwrap()
+                    .progress_chars("█▓░")
+            );
+            pb.set_message(format!("↑ {}", pending.name));
+            pb.enable_steady_tick(Duration::from_millis(100));
+
+            match client.get_file_uploader(
+                pending.parent_uid.clone(),
+                pending.name.clone(),
+                pending.mime_type.clone(),
+                size,
+                Some(std::time::SystemTime::now()),
+                None,
+                None,
+                true,
+            ).await {
+                Ok(uploader) => {
+                    let pb_clone = pb.clone();
+                    match uploader.upload_from_stream(
+                        Box::new(std::io::Cursor::new(content.clone())),
+                        Vec::new(),
+                        Box::new(move |bytes, _total| {
+                            pb_clone.set_position(bytes as u64);
+                        }),
+                    ).await {
+                        Ok(node_uid) => {
+                            pb.finish_with_message(format!("{} {}", console::style("✓").green(), pending.name));
+
+                            // Update index
+                            if let Ok(potential_node) = client.get_node(node_uid.clone()).await {
+                                let parent_link_id = pending.parent_uid.link_id.raw().to_string();
+                                let indexed = indexed_node_from_potential(&potential_node, &parent_link_id);
+                                if let Err(e) = self.index.upsert_node(&indexed) {
+                                    tracing::warn!("Failed to upsert uploaded node to index: {}", e);
+                                }
+
+                                // Update FUSE state
+                                let mut inner = self.inner.write().await;
+                                let old_link_id = inner.nodes.get(&inode)
+                                    .map(|n| n.uid().link_id.raw().to_string());
+
+                                let new_fs_node = fs_node_from_indexed(&indexed);
+                                let new_link_id = node_uid.link_id.raw().to_string();
+                                let new_uid_str = node_uid.to_string();
+
+                                inner.nodes.insert(inode, new_fs_node);
+                                if let Some(old_id) = old_link_id {
+                                    if old_id != new_link_id {
+                                        inner.link_id_to_inode.remove(&old_id);
+                                    }
+                                }
+                                inner.link_id_to_inode.insert(new_link_id, inode);
+                                inner.uid_to_inode.insert(new_uid_str, inode);
+                                inner.pending_files.remove(&inode);
+                                inner.file_cache.put(inode, content);
+                            }
+                            Ok(())
+                        }
+                        Err(e) => {
+                            pb.finish_with_message(format!("{} {} (upload failed)", console::style("✗").red(), pending.name));
+                            Err(e)
+                        }
+                    }
+                }
+                Err(e) => {
+                    pb.finish_with_message(format!("{} {} (upload failed)", console::style("✗").red(), pending.name));
+                    Err(e)
+                }
+            }
+        } else {
+            // Existing file — upload as new revision
+            let (filename, node_uid) = {
+                let inner = self.inner.read().await;
+                let filename = inner.nodes.get(&inode)
+                    .map(|n| n.name().to_string())
+                    .unwrap_or_default();
+                let node_uid = inner.nodes.get(&inode).map(|n| n.uid().clone());
+                (filename, node_uid)
+            };
+            let node_uid = node_uid
+                .ok_or_else(|| anyhow::anyhow!("No node UID for inode {}", inode))?;
+
+            // Fetch fresh revision from server (bypass cache)
+            let current_revision_uid = match client.get_node_uncached(node_uid.clone()).await {
+                Ok(PotentialObject::Node(Node::File(f) | Node::Photo(f))) => {
+                    f.active_revision.uid.clone()
+                }
+                _ => {
+                    return Err(anyhow::anyhow!("Failed to get current revision for '{}'", filename));
+                }
             };
 
-            tracing::info!("Uploading new revision for '{}' ({} bytes)", filename, content.len());
+            tracing::info!("Uploading revision for '{}' ({} bytes, blocking)", filename, size);
 
-            // Create progress bar
-            let pb = self.multi_progress.add(ProgressBar::new(content.len() as u64));
+            let pb = self.multi_progress.add(ProgressBar::new(size as u64));
             pb.set_style(
                 ProgressStyle::default_bar()
                     .template("{spinner:.white.on_cyan} {msg} [{bar:30.white.on_cyan}] {bytes}/{total_bytes}")
@@ -2180,176 +1711,109 @@ impl ProtonDriveFs {
             pb.set_message(format!("↑ {}", filename));
             pb.enable_steady_tick(Duration::from_millis(100));
 
-            let size = content.len() as i64;
+            // Try up to 4 times (handle stale revision / draft conflicts)
+            let mut revision_uid = current_revision_uid;
+            let mut last_error = None;
+            for attempt in 0..4 {
+                if attempt > 0 {
+                    let backoff = Duration::from_secs(1 << (attempt - 1));
+                    tracing::debug!("Retry backoff for '{}': {:?}", filename, backoff);
+                    tokio::time::sleep(backoff).await;
+                }
 
-            let uploader = client.get_file_revision_uploader(
-                revision_uid,
-                size,
-                Some(std::time::SystemTime::now()),
-                None,
-                None,
-            ).await?;
+                match client.get_file_revision_uploader(
+                    revision_uid.clone(),
+                    size,
+                    Some(std::time::SystemTime::now()),
+                    None,
+                    None,
+                ).await {
+                    Ok(uploader) => {
+                        let pb_clone = pb.clone();
+                        match uploader.upload_from_stream(
+                            Box::new(std::io::Cursor::new(content.clone())),
+                            Vec::new(),
+                            Box::new(move |bytes, _total| {
+                                pb_clone.set_position(bytes as u64);
+                            }),
+                        ).await {
+                            Ok(new_node_uid) => {
+                                pb.finish_with_message(format!("{} {}", console::style("✓").green(), filename));
 
-            let pb_clone = pb.clone();
-            let new_node_uid = uploader.upload_from_stream(
-                Box::new(std::io::Cursor::new(content.clone())),
-                Vec::new(),
-                Box::new(move |bytes, _total| {
-                    pb_clone.set_position(bytes as u64);
-                }),
-            ).await?;
+                                // Update index
+                                if let Ok(potential_node) = client.get_node_uncached(new_node_uid.clone()).await {
+                                    let link_id = new_node_uid.link_id.raw();
+                                    let parent_link_id = self.index.get_node(link_id)
+                                        .ok()
+                                        .flatten()
+                                        .and_then(|n| n.parent_link_id)
+                                        .unwrap_or_default();
+                                    let indexed = indexed_node_from_potential(&potential_node, &parent_link_id);
+                                    if let Err(e) = self.index.upsert_node(&indexed) {
+                                        tracing::warn!("Failed to upsert revision to index: {}", e);
+                                    }
 
-            pb.finish_with_message(format!("{} {}", style("✓").green(), filename));
-
-            // Update Index first (Index → FUSE flow)
-            // The Index event handler will update FUSE state
-            let potential_node = client.get_node(new_node_uid.clone()).await?;
-            
-            // Get parent_link_id from existing index entry
-            let link_id = new_node_uid.link_id.raw();
-            let parent_link_id = self.index.get_node(link_id)
-                .ok()
-                .flatten()
-                .and_then(|n| n.parent_link_id)
-                .unwrap_or_default();
-            
-            let indexed = indexed_node_from_potential(&potential_node, &parent_link_id);
-            
-            if let Err(e) = self.index.upsert_node(&indexed) {
-                tracing::warn!("Failed to upsert sync revision to index: {}", e);
-            }
-            
-            // Cache the content
-            let mut inner = self.inner.write().await;
-            inner.file_cache.put(inode, content);
-        }
-
-        // Mark buffer as clean
-        {
-            let mut inner = self.inner.write().await;
-            if let Some(buf) = inner.write_buffers.get_mut(&fh) {
-                buf.dirty = false;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Queue a write buffer for background upload (non-blocking).
-    /// Returns immediately after queuing, upload happens asynchronously.
-    async fn queue_write_buffer(&self, fh: u64) -> Result<()> {
-        let (inode, content, is_new) = {
-            let inner = self.inner.read().await;
-            match inner.write_buffers.get(&fh) {
-                Some(buf) if buf.dirty => (buf.inode, buf.content.clone(), buf.is_new),
-                _ => return Ok(()), // Not dirty, nothing to do
-            }
-        };
-
-        // Mark buffer as clean immediately (data is now "committed" to upload queue)
-        {
-            let mut inner = self.inner.write().await;
-            if let Some(buf) = inner.write_buffers.get_mut(&fh) {
-                buf.dirty = false;
-            }
-            // Also update the cache so subsequent reads see the new content
-            inner.file_cache.put(inode, content.clone());
-        }
-
-        if is_new {
-            // Queue upload of new file
-            let pending = {
-                let inner = self.inner.read().await;
-                inner.pending_files.get(&inode).cloned()
-            };
-            
-            if let Some(pending) = pending {
-                // Skip upload for local-only files (e.g., lock files)
-                if pending.local_only {
-                    tracing::debug!("Skipping upload for local-only file: {}", pending.name);
-                } else {
-                    // Persist the upload for resume capability
-                    let persist_id = PendingUploadStore::generate_id();
-                    let persist_upload = PersistentUpload::NewFile {
-                        id: persist_id.clone(),
-                        parent_uid: pending.parent_uid.clone(),
-                        name: pending.name.clone(),
-                        mime_type: pending.mime_type.clone(),
-                        content: pending.content.clone(),
-                        retry_count: 0,
-                        created_at: chrono::Utc::now().timestamp(),
-                    };
-                    if let Err(e) = self.pending_upload_store.save(&persist_upload) {
-                        tracing::warn!("Failed to persist upload: {}", e);
+                                    // Update FUSE cache
+                                    let mut inner = self.inner.write().await;
+                                    inner.file_cache.put(inode, content.clone());
+                                }
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                let error_msg = e.to_string();
+                                if is_stale_revision_error(&error_msg) {
+                                    tracing::warn!("Stale revision for '{}' (attempt {}): {}", filename, attempt + 1, error_msg);
+                                    pb.set_message(format!("↑ {} (refreshing...)", filename));
+                                    // Clear draft and refresh revision
+                                    let _ = client.delete_draft_revisions(node_uid.clone()).await;
+                                    if let Ok(PotentialObject::Node(Node::File(f) | Node::Photo(f))) = client.get_node_uncached(node_uid.clone()).await {
+                                        revision_uid = f.active_revision.uid.clone();
+                                        continue;
+                                    }
+                                }
+                                last_error = Some(e);
+                                break;
+                            }
+                        }
                     }
-                    
-                    let _ = self.upload_tx.send(UploadTask::NewFile { 
-                        inode, 
-                        pending,
-                        persist_id: Some(persist_id),
-                    });
-                    tracing::info!("Queued new file upload for inode {}", inode);
+                    Err(e) => {
+                        let error_msg = e.to_string();
+                        if is_stale_revision_error(&error_msg) || error_msg.contains("2500") {
+                            tracing::warn!("Draft/stale error for '{}' (attempt {}): {}", filename, attempt + 1, error_msg);
+                            pb.set_message(format!("↑ {} (clearing draft...)", filename));
+                            let _ = client.delete_draft_revisions(node_uid.clone()).await;
+                            if let Ok(PotentialObject::Node(Node::File(f) | Node::Photo(f))) = client.get_node_uncached(node_uid.clone()).await {
+                                revision_uid = f.active_revision.uid.clone();
+                                continue;
+                            }
+                        }
+                        last_error = Some(e);
+                        break;
+                    }
                 }
             }
-        } else {
-            // Queue revision upload
-            // Check if there's already a pending upload for this inode
-            let already_pending = {
-                let inner = self.inner.read().await;
-                inner.pending_revision_uploads.contains(&inode)
-            };
-            
-            if already_pending {
-                // Another upload is already queued for this inode.
-                // The worker will read fresh content from file_cache when it runs.
-                tracing::debug!("Revision upload already pending for inode {}, skipping duplicate queue", inode);
-                return Ok(());
-            }
-            
-            let revision_uid = self.get_revision_uid(inode).await;
-            let filename = {
-                let mut inner = self.inner.write().await;
-                // Mark as pending before getting filename
-                inner.pending_revision_uploads.insert(inode);
-                inner.nodes.get(&inode).map(|n| n.name().to_string()).unwrap_or_default()
-            };
-            
-            if let Some(revision_uid) = revision_uid {
-                // Persist the upload for resume capability
-                let persist_id = PendingUploadStore::generate_id();
-                let persist_upload = PersistentUpload::NewRevision {
-                    id: persist_id.clone(),
-                    revision_uid: revision_uid.clone(),
-                    filename: filename.clone(),
-                    content: content.clone(),
-                    retry_count: 0,
-                    created_at: chrono::Utc::now().timestamp(),
-                };
-                if let Err(e) = self.pending_upload_store.save(&persist_upload) {
-                    tracing::warn!("Failed to persist upload: {}", e);
-                }
-                
-                let _ = self.upload_tx.send(UploadTask::NewRevision {
-                    inode,
-                    revision_uid,
-                    filename: filename.clone(),
-                    content,
-                    persist_id: Some(persist_id),
-                });
-                tracing::info!("Queued revision upload for '{}' (inode {})", filename, inode);
-            } else {
-                // No revision_uid - remove from pending set
-                let mut inner = self.inner.write().await;
-                inner.pending_revision_uploads.remove(&inode);
-            }
-        }
 
-        Ok(())
+            let err = last_error.unwrap_or_else(|| anyhow::anyhow!("Max retries exceeded for '{}'", filename));
+            pb.finish_with_message(format!("{} {} (upload failed)", console::style("✗").red(), filename));
+            Err(err)
+        }
     }
 
     /// Check if a file/folder name should be ignored based on .pdclignore patterns.
     /// Checks both the global .pdclignore and any local .pdclignore in the parent directory.
+    /// Also checks if the parent folder itself is local-only (e.g., .Trash-1000).
     async fn is_ignored(&self, parent_inode: u64, name: &str) -> bool {
+        // Check if parent folder is local-only — children inherit local-only status
+        {
+            let inner = self.inner.read().await;
+            if let Some(node) = inner.nodes.get(&parent_inode) {
+                if node.uid().link_id.raw().starts_with("local-") {
+                    tracing::debug!("File '{}' inherits local-only from parent folder", name);
+                    return true;
+                }
+            }
+        }
+
         let ignore_mgr = self.ignore_manager.read().await;
         
         // Check global patterns first
@@ -2679,11 +2143,14 @@ impl Filesystem for ProtonDriveFs {
                 is_new: is_pending, // New files not yet uploaded should use NewFile upload path
                 offset: 0,
                 content: existing_content,
-                dirty: is_truncate, // Truncated files are dirty
+                dirty: false, // Only mark dirty when actual writes happen
             });
             inner.fh_to_inode.insert(fh, inode);
             
-            // If truncating, update the file size
+            // If truncating, update the local file size and cache.
+            // We don't mark as dirty yet - only actual writes will do that.
+            // This prevents uploading empty content when editors open with O_TRUNC
+            // but then fail to write (e.g., temp file creation rejected).
             if is_truncate {
                 if let Some(FsNode::File(f)) = inner.nodes.get_mut(&inode) {
                     f.size = 0;
@@ -3091,8 +2558,8 @@ impl Filesystem for ProtonDriveFs {
         tracing::debug!("FUSE release: inode={}, fh={}, flags={:#x}, flush={}, uid={}, gid={}, pid={}",
             inode, fh, flags, flush, req.uid, req.gid, req.pid);
         
-        // Queue any pending writes for background upload (non-blocking)
-        if let Err(e) = self.queue_write_buffer(fh).await {
+        // Upload any pending writes (non-blocking on release to avoid blocking close)
+        if let Err(e) = self.upload_write_buffer(fh).await {
             tracing::error!("Failed to queue writes on release: {}", e);
             // Don't return error - release must succeed
         }
@@ -3119,10 +2586,10 @@ impl Filesystem for ProtonDriveFs {
         tracing::info!("FUSE mkdir: parent={}, name={}, uid={}, gid={}, pid={}",
             parent, name_str, req.uid, req.gid, req.pid);
 
-        // Check if the folder name should be ignored
-        if self.is_ignored(parent, &name_str).await {
-            tracing::warn!("Folder '{}' matches .pdclignore pattern, rejecting creation", name_str);
-            return Err(Errno::from(libc::EPERM));
+        // Check if the folder name should be ignored — create locally but don't upload
+        let is_local_only = self.is_ignored(parent, &name_str).await;
+        if is_local_only {
+            tracing::info!("Folder '{}' matches .pdclignore pattern, creating local-only", name_str);
         }
 
         // Get parent folder UID
@@ -3139,33 +2606,66 @@ impl Filesystem for ProtonDriveFs {
             return Err(Errno::new_is_not_dir());
         }
 
-        // Create the folder via SDK
-        let client_guard = self.client.read().await;
-        let client = client_guard.as_ref()
-            .ok_or_else(|| {
-                tracing::error!("No client available");
-                Errno::from(libc::EIO)
-            })?;
+        let (fs_node, inode) = if is_local_only {
+            // Create a local-only folder (not uploaded to server)
+            let now = Utc::now();
+            let volume_id = {
+                let inner = self.inner.read().await;
+                inner.volume_id.clone().unwrap_or_else(|| VolumeId::new("local".to_string()))
+            };
+            let local_uid = NodeUid::new(volume_id, LinkId::new(format!("local-{}", name_str)));
+            let folder_meta = ProtonFolderMetadata {
+                uid: local_uid,
+                parent_uid: Some(parent_uid),
+                name: name_str.clone(),
+                creation_time: now,
+                trash_time: None,
+                author_email: None,
+                name_author_email: None,
+                owner_email: None,
+                owner_organisation: None,
+                is_album: false,
+                content_modified_at: None,
+            };
+            let fs_node = FsNode::Folder(folder_meta);
+            let inode = {
+                let mut inner = self.inner.write().await;
+                let inode = inner.alloc_inode();
+                inner.nodes.insert(inode, fs_node.clone());
+                inner.children.entry(parent).or_default().push(inode);
+                inner.children.insert(inode, Vec::new());
+                inode
+            };
+            (fs_node, inode)
+        } else {
+            // Create the folder via SDK (uploaded to server)
+            let client_guard = self.client.read().await;
+            let client = client_guard.as_ref()
+                .ok_or_else(|| {
+                    tracing::error!("No client available");
+                    Errno::from(libc::EIO)
+                })?;
 
-        let folder_node = client.create_folder(
-            parent_uid,
-            name_str.clone(),
-            Some(std::time::SystemTime::now()),
-        ).await
-            .map_err(|e| {
-                tracing::error!("Failed to create folder '{}': {}", name_str, e);
-                Errno::from(libc::EIO)
-            })?;
+            let folder_node = client.create_folder(
+                parent_uid,
+                name_str.clone(),
+                Some(std::time::SystemTime::now()),
+            ).await
+                .map_err(|e| {
+                    tracing::error!("Failed to create folder '{}': {}", name_str, e);
+                    Errno::from(libc::EIO)
+                })?;
 
-        // Add to filesystem state
-        let fs_node = FsNode::Folder(ProtonFolderMetadata::from_folder_node(&folder_node, false));
-        let inode = {
-            let mut inner = self.inner.write().await;
-            let inode = inner.get_or_create_inode(&folder_node.base.uid);
-            inner.nodes.insert(inode, fs_node.clone());
-            inner.children.entry(parent).or_default().push(inode);
-            inner.children.insert(inode, Vec::new()); // Empty children list
-            inode
+            let fs_node = FsNode::Folder(ProtonFolderMetadata::from_folder_node(&folder_node, false));
+            let inode = {
+                let mut inner = self.inner.write().await;
+                let inode = inner.get_or_create_inode(&folder_node.base.uid);
+                inner.nodes.insert(inode, fs_node.clone());
+                inner.children.entry(parent).or_default().push(inode);
+                inner.children.insert(inode, Vec::new());
+                inode
+            };
+            (fs_node, inode)
         };
 
         tracing::info!("Created folder '{}' with inode {}", name_str, inode);
@@ -3189,17 +2689,11 @@ impl Filesystem for ProtonDriveFs {
         tracing::info!("FUSE create: parent={}, name={}, flags={:#x}, uid={}, gid={}, pid={}",
             parent, name_str, flags, req.uid, req.gid, req.pid);
 
-        // Check if this is a lock file - allow it locally but don't upload
-        let is_local_only = is_lock_file(&name_str);
-        
-        // Check if the file name should be ignored (but allow lock files locally)
-        if !is_local_only && self.is_ignored(parent, &name_str).await {
-            tracing::warn!("File '{}' matches .pdclignore pattern, rejecting creation", name_str);
-            return Err(Errno::from(libc::EPERM));
-        }
+        // Check if this is a lock file or ignored — allow locally but don't upload
+        let is_local_only = is_lock_file(&name_str) || self.is_ignored(parent, &name_str).await;
         
         if is_local_only {
-            tracing::debug!("Creating local-only file (lock file): {}", name_str);
+            tracing::debug!("Creating local-only file (ignored or lock file): {}", name_str);
         }
 
         // Get parent folder UID
@@ -3578,44 +3072,90 @@ impl Filesystem for ProtonDriveFs {
         let node_uid = src_node.uid().clone();
         let is_same_parent = parent == new_parent;
         let is_same_name = name_str == new_name_str;
+        
+        // Check if this is a local-only/pending node (not yet on server)
+        let is_pending = node_uid.link_id.raw().starts_with("pending-")
+            || node_uid.link_id.raw().starts_with("local-");
 
-        // Get client
-        let client_guard = self.client.read().await;
-        let client = client_guard.as_ref()
-            .ok_or_else(|| {
-                tracing::error!("No client available");
-                Errno::from(libc::EIO)
-            })?;
-
-        // Rename if name changed
-        if !is_same_name {
-            let new_media_type = if !src_node.is_dir() {
-                Some(mime_guess::from_path(&new_name_str).first_or_octet_stream().to_string())
-            } else {
-                None
-            };
-
-            client.rename_node(node_uid.clone(), new_name_str.clone(), new_media_type).await
-                .map_err(|e| {
-                    tracing::error!("Failed to rename '{}' to '{}': {}", name_str, new_name_str, e);
-                    Errno::from(libc::EIO)
-                })?;
+        // If target already exists, remove it first (atomic replace semantics, e.g. GNOME save pattern)
+        if let Some((existing_inode, existing_node)) = self.find_child(new_parent, new_name).await {
+            let existing_uid = existing_node.uid().clone();
+            let existing_is_pending = existing_uid.link_id.raw().starts_with("pending-")
+                || existing_uid.link_id.raw().starts_with("local-");
+            
+            // Delete the existing target from server if it's a real node
+            if !existing_is_pending {
+                let client_guard = self.client.read().await;
+                if let Some(client) = client_guard.as_ref() {
+                    if let Err(e) = client.trash_nodes(vec![existing_uid.clone()]).await {
+                        tracing::warn!("Failed to trash existing target '{}' during rename: {}", new_name_str, e);
+                        // Continue anyway - the local state update is more important
+                    }
+                }
+            }
+            
+            // Remove existing target from FUSE state
+            {
+                let mut inner = self.inner.write().await;
+                inner.nodes.remove(&existing_inode);
+                inner.uid_to_inode.remove(&existing_uid.to_string());
+                inner.link_id_to_inode.remove(existing_uid.link_id.raw());
+                inner.file_cache.remove(&existing_inode);
+                if let Some(children) = inner.children.get_mut(&new_parent) {
+                    children.retain(|&c| c != existing_inode);
+                }
+            }
+            tracing::info!("Removed existing target '{}' (inode {}) for rename-replace", new_name_str, existing_inode);
         }
 
-        // Move if parent changed
-        if !is_same_parent {
-            let new_parent_uid = self.get_node_uid(new_parent).await
+        // Only call server API if this is a real (non-pending) node
+        if !is_pending {
+            let client_guard = self.client.read().await;
+            let client = client_guard.as_ref()
                 .ok_or_else(|| {
-                    tracing::error!("New parent inode {} not found", new_parent);
-                    Errno::new_not_exist()
-                })?;
-
-            client.move_nodes(vec![node_uid.clone()], new_parent_uid).await
-                .map_err(|e| {
-                    tracing::error!("Failed to move '{}': {}", name_str, e);
+                    tracing::error!("No client available");
                     Errno::from(libc::EIO)
                 })?;
+
+            // Rename if name changed
+            if !is_same_name {
+                let new_media_type = if !src_node.is_dir() {
+                    Some(mime_guess::from_path(&new_name_str).first_or_octet_stream().to_string())
+                } else {
+                    None
+                };
+
+                client.rename_node(node_uid.clone(), new_name_str.clone(), new_media_type).await
+                    .map_err(|e| {
+                        tracing::error!("Failed to rename '{}' to '{}': {}", name_str, new_name_str, e);
+                        Errno::from(libc::EIO)
+                    })?;
+            }
+
+            // Move if parent changed
+            if !is_same_parent {
+                let new_parent_uid = self.get_node_uid(new_parent).await
+                    .ok_or_else(|| {
+                        tracing::error!("New parent inode {} not found", new_parent);
+                        Errno::new_not_exist()
+                    })?;
+
+                client.move_nodes(vec![node_uid.clone()], new_parent_uid).await
+                    .map_err(|e| {
+                        tracing::error!("Failed to move '{}': {}", name_str, e);
+                        Errno::from(libc::EIO)
+                    })?;
+            }
+        } else {
+            tracing::info!("Rename '{}' -> '{}' is local-only (pending node)", name_str, new_name_str);
         }
+
+        // Check if the new name is ignored (needed before taking write lock)
+        let new_name_is_ignored = if !is_same_name {
+            self.is_ignored(new_parent, &new_name_str).await
+        } else {
+            false
+        };
 
         // Update filesystem state
         {
@@ -3624,10 +3164,36 @@ impl Filesystem for ProtonDriveFs {
             // Update node name if changed
             if !is_same_name {
                 match inner.nodes.get_mut(&src_inode) {
-                    Some(FsNode::File(f)) => f.name = new_name_str.clone(),
+                    Some(FsNode::File(f)) => {
+                        f.name = new_name_str.clone();
+                        f.mime_type = mime_guess::from_path(&new_name_str)
+                            .first_or_octet_stream().to_string();
+                    },
                     Some(FsNode::Folder(f)) => f.name = new_name_str.clone(),
                     Some(FsNode::Degraded(d)) => d.name = new_name_str.clone(),
                     None => {}
+                }
+                
+                // Also update pending file metadata so upload uses the final name
+                if let Some(pending) = inner.pending_files.get_mut(&src_inode) {
+                    pending.name = new_name_str.clone();
+                    pending.mime_type = mime_guess::from_path(&new_name_str)
+                        .first_or_octet_stream().to_string();
+                    // If renamed from an ignored name to a non-ignored name, clear local_only
+                    // so the file actually uploads (e.g. .goutputstream-XXX → file3.txt)
+                    if pending.local_only && !new_name_is_ignored {
+                        pending.local_only = false;
+                        pending.dirty = true;
+                        // Re-mark all write buffers for this inode as dirty so
+                        // the next flush/release actually uploads the content
+                        for buf in inner.write_buffers.values_mut() {
+                            if buf.inode == src_inode {
+                                buf.dirty = true;
+                            }
+                        }
+                        tracing::info!("Cleared local_only flag for '{}' (inode {}) — file will upload", new_name_str, src_inode);
+                    }
+                    tracing::info!("Updated pending file name to '{}' for inode {}", new_name_str, src_inode);
                 }
             }
 
@@ -3666,11 +3232,10 @@ impl Filesystem for ProtonDriveFs {
         tracing::debug!("FUSE flush: inode={}, fh={}, uid={}, gid={}, pid={}",
             inode, fh, req.uid, req.gid, req.pid);
 
-        // Queue upload for background processing (non-blocking)
-        // The file is considered "saved" once it's in the upload queue
-        self.queue_write_buffer(fh).await
+        // Upload the file synchronously — blocks until the server confirms.
+        self.upload_write_buffer(fh).await
             .map_err(|e| {
-                tracing::error!("Failed to queue writes: {}", e);
+                tracing::error!("Upload failed on flush: {}", e);
                 Errno::from(libc::EIO)
             })?;
 
@@ -3687,10 +3252,10 @@ impl Filesystem for ProtonDriveFs {
         tracing::debug!("FUSE fsync: inode={}, fh={}, uid={}, gid={}, pid={}",
             inode, fh, req.uid, req.gid, req.pid);
 
-        // fsync should wait for upload to complete (blocking for durability)
+        // Upload the file synchronously — blocks until the server confirms.
         self.upload_write_buffer(fh).await
             .map_err(|e| {
-                tracing::error!("Failed to sync writes: {}", e);
+                tracing::error!("Upload failed on fsync: {}", e);
                 Errno::from(libc::EIO)
             })?;
 
@@ -4469,6 +4034,7 @@ fn fs_node_from_indexed(indexed: &IndexedNode) -> FsNode {
                 owner_email: None,
                 owner_organisation: None,
                 is_album: false,
+                content_modified_at: None,
             })
         }
     }

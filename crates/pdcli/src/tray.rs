@@ -1,4 +1,4 @@
-use tray_icon::{TrayIconBuilder, TrayIcon, Icon, menu::Menu};
+use tray_icon::{TrayIconBuilder, TrayIcon, Icon, menu::{Menu, MenuItem}};
 
 /// Creates a [`tray_icon::Icon`] from an RGBA pixel buffer.
 ///
@@ -15,6 +15,16 @@ fn load_icon(path: &std::path::Path) -> Icon {
     let (w, h) = (16u32, 16u32);
     let rgba = vec![0x6D, 0x4A, 0xFF, 0xFF].repeat((w * h) as usize);
     Icon::from_rgba(rgba, w, h).expect("failed to create fallback icon")
+}
+
+/// The ID we assign to the "Quit" menu item so we can recognise it in events.
+const QUIT_MENU_ID: &str = "quit";
+const SHOW_MENU_ID: &str = "show";
+
+/// Actions returned by polling tray events.
+pub struct TrayAction {
+    pub quit: bool,
+    pub show: bool,
 }
 
 /// Initialise the system-tray icon.
@@ -42,8 +52,9 @@ pub fn init(icon_path: &std::path::Path) -> impl FnOnce() -> Option<TrayIcon> {
     {
         std::thread::spawn(move || {
             gtk::init().unwrap();
+            let menu = build_menu();
             let _tray = TrayIconBuilder::new()
-                .with_menu(Box::new(Menu::new()))
+                .with_menu(Box::new(menu))
                 .with_tooltip("Proton Drive")
                 .with_icon(icon)
                 .build()
@@ -64,10 +75,12 @@ pub fn init(icon_path: &std::path::Path) -> impl FnOnce() -> Option<TrayIcon> {
     )))]
     {
         move || {
+            let menu = build_menu();
             Some(
                 TrayIconBuilder::new()
                     .with_tooltip("Proton Drive")
                     .with_icon(icon)
+                    .with_menu(Box::new(menu))
                     .build()
                     .expect("failed to build tray icon"),
             )
@@ -75,11 +88,33 @@ pub fn init(icon_path: &std::path::Path) -> impl FnOnce() -> Option<TrayIcon> {
     }
 }
 
-/// Call once per frame to drain tray-icon events.
-pub fn poll_events() {
+fn build_menu() -> Menu {
+    let menu = Menu::new();
+    let show_item = MenuItem::with_id(SHOW_MENU_ID, "Show", true, None);
+    let quit_item = MenuItem::with_id(QUIT_MENU_ID, "Quit", true, None);
+    menu.append(&show_item).ok();
+    menu.append(&quit_item).ok();
+    menu
+}
+
+/// Call once per frame to drain tray-icon and menu events.
+pub fn poll_events() -> TrayAction {
     use tray_icon::TrayIconEvent;
+    use tray_icon::menu::MenuEvent;
+
+    let mut action = TrayAction { quit: false, show: false };
 
     while let Ok(event) = TrayIconEvent::receiver().try_recv() {
         tracing::debug!(?event, "tray event");
     }
+
+    while let Ok(event) = MenuEvent::receiver().try_recv() {
+        if event.id.0 == QUIT_MENU_ID {
+            action.quit = true;
+        } else if event.id.0 == SHOW_MENU_ID {
+            action.show = true;
+        }
+    }
+
+    action
 }

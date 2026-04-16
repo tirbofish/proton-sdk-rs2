@@ -2,64 +2,17 @@ use std::path::PathBuf;
 
 use egui::Ui;
 
-use crate::{prefs, mount, ProtonDrive};
-
-/// A single tracked operation (upload, download, sync, etc.).
-pub struct TransferItem {
-    /// Human-readable label, e.g. file name.
-    pub label: String,
-    /// What kind of operation this is.
-    pub kind: TransferKind,
-    /// Progress in `0.0..=1.0`. `None` means indeterminate.
-    pub progress: Option<f32>,
-    /// Current status of the transfer.
-    pub status: TransferStatus,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransferKind {
-    Upload,
-    Download,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransferStatus {
-    /// Waiting in queue.
-    Pending,
-    /// Actively transferring.
-    InProgress,
-    /// Finished successfully.
-    Done,
-    /// Failed.
-    Failed,
-}
-
-impl std::fmt::Display for TransferKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TransferKind::Upload => f.write_str("⬆ Upload"),
-            TransferKind::Download => f.write_str("⬇ Download"),
-        }
-    }
-}
-
-impl std::fmt::Display for TransferStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TransferStatus::Pending => f.write_str("Pending"),
-            TransferStatus::InProgress => f.write_str("In progress"),
-            TransferStatus::Done => f.write_str("Done"),
-            TransferStatus::Failed => f.write_str("Failed"),
-        }
-    }
-}
+use crate::{prefs, mount, transfers, ProtonDrive};
 
 impl ProtonDrive {
     pub fn status_page(&self, ui: &mut Ui) {
         ui.heading("Status");
         ui.add_space(8.0);
 
-        if self.transfers.is_empty() {
+        // Poll the transfer log (synchronous — uses std::sync::RwLock)
+        let snapshot: Vec<transfers::TransferEntry> = self.transfer_log.snapshot();
+
+        if snapshot.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
                 ui.label("No active transfers.");
@@ -69,47 +22,72 @@ impl ProtonDrive {
             return;
         }
 
+        let mut cancel_indices: Vec<usize> = Vec::new();
+
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for item in &self.transfers {
+            for (idx, item) in snapshot.iter().enumerate() {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
-                        // Kind icon + label
                         let kind_label = match item.kind {
-                            TransferKind::Upload => "⬆",
-                            TransferKind::Download => "⬇",
+                            transfers::TransferKind::Upload => "⬆",
+                            transfers::TransferKind::Download => "⬇",
                         };
                         ui.label(kind_label);
-                        ui.strong(&item.label);
+                        ui.strong(&item.name);
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let status_color = match item.status {
-                                TransferStatus::Pending => egui::Color32::GRAY,
-                                TransferStatus::InProgress => ui.visuals().text_color(),
-                                TransferStatus::Done => egui::Color32::from_rgb(80, 200, 80),
-                                TransferStatus::Failed => egui::Color32::from_rgb(220, 60, 60),
+                            // Cancel button for active transfers
+                            if matches!(item.status, transfers::TransferStatus::InProgress | transfers::TransferStatus::Pending) {
+                                if ui.small_button("✕ Cancel").clicked() {
+                                    cancel_indices.push(idx);
+                                }
+                            }
+
+                            let (color, text) = match item.status {
+                                transfers::TransferStatus::Pending => (egui::Color32::GRAY, "Pending"),
+                                transfers::TransferStatus::InProgress => (ui.visuals().text_color(), "In progress"),
+                                transfers::TransferStatus::Done => (egui::Color32::from_rgb(80, 200, 80), "Done"),
+                                transfers::TransferStatus::Failed => (egui::Color32::from_rgb(220, 60, 60), "Failed"),
                             };
-                            ui.colored_label(status_color, item.status.to_string());
+                            ui.colored_label(color, text);
                         });
                     });
 
-                    // Progress bar or spinner
                     match item.progress {
                         Some(p) => {
-                            ui.add(egui::ProgressBar::new(p).show_percentage());
+                            let bar = egui::ProgressBar::new(p).show_percentage();
+                            // Show bytes if we have total_bytes
+                            let bar = if item.total_bytes > 0 {
+                                let transferred_mb = item.bytes_transferred as f64 / 1_048_576.0;
+                                let total_mb = item.total_bytes as f64 / 1_048_576.0;
+                                bar.text(format!("{transferred_mb:.1} / {total_mb:.1} MB"))
+                            } else {
+                                bar
+                            };
+                            ui.add(bar);
                         }
-                        None if item.status == TransferStatus::InProgress => {
+                        None if item.status == transfers::TransferStatus::InProgress => {
                             ui.spinner();
                         }
                         _ => {}
+                    }
+
+                    if let Some(ref err) = item.error {
+                        ui.colored_label(egui::Color32::from_rgb(220, 60, 60), err);
                     }
                 });
                 ui.add_space(4.0);
             }
         });
 
-        // Request repaint while any transfer is active
-        if self.transfers.iter().any(|t| {
-            t.status == TransferStatus::InProgress || t.status == TransferStatus::Pending
+        // Process cancel requests
+        for idx in cancel_indices {
+            self.transfer_log.cancel(idx);
+        }
+
+        // Repaint while active transfers exist
+        if snapshot.iter().any(|t| {
+            matches!(t.status, transfers::TransferStatus::InProgress | transfers::TransferStatus::Pending)
         }) {
             ui.ctx().request_repaint();
         }

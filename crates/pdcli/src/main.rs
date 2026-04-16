@@ -1,11 +1,16 @@
 mod auth;
 mod credentials;
 mod db;
+mod events;
+mod fs;
+mod index;
 mod task;
+mod transfers;
 mod tray;
 mod mount;
 mod pages;
 mod prefs;
+mod worker;
 
 use std::sync::Arc;
 
@@ -69,7 +74,7 @@ pub struct ProtonDrive {
     prefs: prefs::Preferences,
     cache: Arc<db::SQLIndexedCache>,
     shutdown: CancellationToken,
-    transfers: Vec<pages::TransferItem>,
+    transfer_log: transfers::TransferLog,
 }
 
 impl ProtonDrive {
@@ -109,7 +114,7 @@ impl ProtonDrive {
             }
         });
 
-        Self { state, rt, _tray: None, page: Page::Status, prefs: prefs::load(), cache, shutdown, transfers: Vec::new() }
+        Self { state, rt, _tray: None, page: Page::Status, prefs: prefs::load(), cache, shutdown, transfer_log: transfers::TransferLog::new() }
     }
 
     fn with_tray(mut self, tray: Option<tray_icon::TrayIcon>) -> Self {
@@ -132,16 +137,62 @@ impl ProtonDrive {
         let mount_path = self.prefs.mount_path.clone();
         let path = mount_path.clone();
         let shutdown = self.shutdown.clone();
+        let drive_for_index = drive_client.clone();
+        let transfer_log = self.transfer_log.clone();
+        let cache_dir = dirs::cache_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join("pdcli")
+            .join("file_cache");
 
-        // spawn fuse
+        // Mount FUSE immediately, then bootstrap in the background
         self.rt.handle().spawn(async move {
-            let mut mount_handle = match mount::mount(path).await {
+            // Create the index with a dummy volume ID — bootstrap will set the real one.
+            // The FUSE root will be an empty directory until bootstrap completes.
+            let mut idx_inner = index::DriveIndex::new_deferred(drive_for_index.clone(), cache_dir);
+            idx_inner.transfer_log = transfer_log;
+            let idx = Arc::new(idx_inner);
+
+            // Ensure the FUSE root inode exists so mount succeeds
+            {
+                let mut store = idx.store.write().await;
+                store.ensure_root();
+            }
+
+            // Mount FUSE immediately — don't wait for network
+            let mut mount_handle = match mount::mount(path.clone(), idx.clone()).await {
                 Ok(h) => h,
                 Err(e) => {
                     tracing::error!(error = %e, "FUSE mount failed");
                     return;
                 }
             };
+            tracing::info!(path = %path.display(), "FUSE mounted (bootstrapping in background)");
+
+            // Bootstrap in the background: fetch My Files, set volume ID, populate root
+            let bootstrap_idx = idx.clone();
+            let bootstrap_shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                if bootstrap_shutdown.is_cancelled() {
+                    return;
+                }
+                if let Err(e) = bootstrap_idx.bootstrap_from_server().await {
+                    tracing::error!(error = %e, "background bootstrap failed");
+                }
+            });
+
+            // Spawn the request worker
+            let worker_index = idx.clone();
+            let worker_shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                worker::run(worker_index, worker_shutdown).await;
+            });
+
+            // Spawn the event poller (waits for volume_id to be set by bootstrap)
+            let events_index = idx.clone();
+            let events_shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                events::run(events_index, events_shutdown).await;
+            });
 
             tokio::select! {
                 res = &mut mount_handle => {
@@ -154,8 +205,13 @@ impl ProtonDrive {
                 }
             }
 
+            // Try graceful unmount first, then lazy unmount as fallback
             if let Err(e) = mount_handle.unmount().await {
-                tracing::error!(error = %e, "failed to unmount");
+                tracing::warn!(error = %e, "graceful unmount failed, trying lazy unmount");
+                let _ = tokio::process::Command::new("fusermount3")
+                    .args(["-uz", &path.display().to_string()])
+                    .status()
+                    .await;
             }
             tracing::info!("FUSE unmounted");
         });
@@ -165,12 +221,29 @@ impl ProtonDrive {
 
 impl eframe::App for ProtonDrive {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        tray::poll_events();
+        let tray_action = tray::poll_events();
 
-        // If shutdown was requested (e.g. ctrl+c), close the window
-        if self.shutdown.is_cancelled() {
+        // If quit was requested via tray menu, ctrl+c, or explicit shutdown
+        if tray_action.quit || self.shutdown.is_cancelled() {
+            self.shutdown.cancel();
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             return;
+        }
+
+        // Re-show window if "Show" was clicked in the tray menu
+        if tray_action.show {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+
+        // Intercept window close: hide to tray instead of quitting.
+        // The user must use the "Quit" button or tray menu to actually exit.
+        if ui.ctx().input(|i| i.viewport().close_requested()) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            // Try hiding; if that doesn't work on the WM, minimize instead
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -208,6 +281,8 @@ impl eframe::App for ProtonDrive {
                     let username = session.username.clone();
                     let mp = mount_path.display().to_string();
 
+                    let mut quit_clicked = false;
+
                     egui::Panel::left("sidebar")
                         .resizable(false)
                         .default_size(160.0)
@@ -216,11 +291,20 @@ impl eframe::App for ProtonDrive {
                                 ui.selectable_value(&mut self.page, Page::Status, "📊 Status");
 
                                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                                    if ui.button("⏻ Quit").clicked() {
+                                        quit_clicked = true;
+                                    }
                                     ui.selectable_value(&mut self.page, Page::Settings, "⚙ Settings");
                                     ui.selectable_value(&mut self.page, Page::Account, "👤 Account");
                                 });
                             });
                         });
+
+                    if quit_clicked {
+                        self.shutdown.cancel();
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        return;
+                    }
 
                     let mut sign_out = false;
 
@@ -253,7 +337,16 @@ impl Drop for ProtonDrive {
     fn drop(&mut self) {
         tracing::info!("ProtonDrive dropping, requesting shutdown...");
         self.shutdown.cancel();
-        // Give the mount task a moment to unmount cleanly
-        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Try lazy unmount as a safety net in case the async unmount didn't complete
+        if let AppState::Ready { mount_path, .. } = &self.state {
+            let path_str = mount_path.display().to_string();
+            let _ = std::process::Command::new("fusermount3")
+                .args(["-uz", &path_str])
+                .status();
+        }
+
+        // Give the mount task a moment to clean up
+        std::thread::sleep(std::time::Duration::from_millis(300));
     }
 }

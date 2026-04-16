@@ -1,4 +1,7 @@
+use std::sync::Arc;
+
 use proton_sdk_rs2::{
+    cache::CacheRepository,
     client::ProtonClientOptions,
     session::ProtonAPISession,
     AppVersionConfiguration,
@@ -6,13 +9,11 @@ use proton_sdk_rs2::{
 
 use crate::{credentials, task::AsyncTask};
 
-/// Result of the initial login attempt — either a ready session or one awaiting 2FA.
 enum LoginResult {
     Ready(ProtonAPISession),
     Needs2FA(ProtonAPISession, String),
 }
 
-/// Encapsulates the login form state and the in-flight authentication task.
 pub struct AuthScreen {
     username: String,
     password: String,
@@ -45,7 +46,7 @@ impl AuthScreen {
         }
     }
 
-    fn begin_login(&mut self, rt: &tokio::runtime::Handle) {
+    fn begin_login(&mut self, rt: &tokio::runtime::Handle, entity_repo: Arc<dyn CacheRepository>) {
         self.error = None;
         let username = self.username.clone();
         let password = self.password.clone();
@@ -53,11 +54,16 @@ impl AuthScreen {
         tracing::info!(username = %username, "starting authentication");
 
         self.login_task = Some(AsyncTask::spawn(rt, async move {
+            let options = ProtonClientOptions {
+                entity_cache_repository: Some(entity_repo.clone()),
+                secret_cache_repository: Some(entity_repo),
+                ..ProtonClientOptions::default()
+            };
             let session = ProtonAPISession::begin(
                 username,
                 &password,
                 AppVersionConfiguration::new("pdcli", 0, 1, 0),
-                ProtonClientOptions::default(),
+                options,
             )
             .await?;
 
@@ -76,14 +82,14 @@ impl AuthScreen {
     }
 
     /// Renders the auth UI. Returns `Some(session)` once fully authenticated.
-    pub fn ui(&mut self, ui: &mut egui::Ui, rt: &tokio::runtime::Handle) -> Option<ProtonAPISession> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, rt: &tokio::runtime::Handle, entity_repo: Arc<dyn CacheRepository>) -> Option<ProtonAPISession> {
         match &mut self.phase {
-            AuthPhase::Credentials => self.credentials_ui(ui, rt),
+            AuthPhase::Credentials => self.credentials_ui(ui, rt, entity_repo),
             AuthPhase::TwoFactor { .. } => self.two_factor_ui(ui, rt),
         }
     }
 
-    fn credentials_ui(&mut self, ui: &mut egui::Ui, rt: &tokio::runtime::Handle) -> Option<ProtonAPISession> {
+    fn credentials_ui(&mut self, ui: &mut egui::Ui, rt: &tokio::runtime::Handle, entity_repo: Arc<dyn CacheRepository>) -> Option<ProtonAPISession> {
         // Poll the login task
         if let Some(task) = &mut self.login_task {
             if let Some(result) = task.poll() {
@@ -129,7 +135,7 @@ impl AuthScreen {
                 let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let sign_in = ui.add_sized([300.0, 32.0], egui::Button::new("Sign in")).clicked();
                 if (sign_in || enter_pressed) && !self.username.is_empty() && !self.password.is_empty() {
-                    self.begin_login(rt);
+                    self.begin_login(rt, entity_repo);
                 }
             }
 

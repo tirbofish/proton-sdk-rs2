@@ -3,14 +3,18 @@ mod credentials;
 mod db;
 mod task;
 mod tray;
+mod mount;
+mod pages;
+mod prefs;
 
 use std::sync::Arc;
 
+use proton_drive_sdk::client::ProtonDriveClient;
 use proton_sdk_rs2::{
-    cache::InMemoryCacheRepository,
     session::ProtonAPISession,
     AppVersionConfiguration,
 };
+use tokio_util::sync::CancellationToken;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -42,26 +46,47 @@ enum AppState {
     Restoring(task::AsyncTask<anyhow::Result<ProtonAPISession>>),
     /// No valid session — show the login form.
     Login(auth::AuthScreen),
-    /// Authenticated and ready.
-    Authenticated(ProtonAPISession),
+    /// Authenticated and FUSE mounted.
+    Ready {
+        session: ProtonAPISession,
+        drive_client: ProtonDriveClient,
+        mount_path: std::path::PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Status,
+    Account,
+    Settings,
 }
 
 pub struct ProtonDrive {
     state: AppState,
     rt: tokio::runtime::Runtime,
     _tray: Option<tray_icon::TrayIcon>,
+    page: Page,
+    prefs: prefs::Preferences,
+    cache: Arc<db::SQLIndexedCache>,
+    shutdown: CancellationToken,
+    transfers: Vec<pages::TransferItem>,
 }
 
 impl ProtonDrive {
     fn new(rt: tokio::runtime::Runtime) -> Self {
+        let cache = Arc::new(
+            db::SQLIndexedCache::open().expect("failed to open indexed cache"),
+        );
+
         let state = match credentials::load() {
             Some(cred) => {
                 tracing::info!("found stored credentials, restoring session");
+                let entity_repo = cache.entity_repository();
                 let task = task::AsyncTask::spawn(rt.handle(), async move {
                     let session = ProtonAPISession::from_stored_credentials(
                         cred,
                         AppVersionConfiguration::new("pdcli", 0, 1, 0),
-                        Arc::new(InMemoryCacheRepository::new()),
+                        entity_repo,
                     );
                     Ok(session)
                 });
@@ -73,18 +98,80 @@ impl ProtonDrive {
             }
         };
 
-        Self { state, rt, _tray: None }
+        let shutdown = CancellationToken::new();
+
+        // ctrl+c triggers shutdown
+        let shutdown_on_signal = shutdown.clone();
+        rt.handle().spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                tracing::info!("received ctrl+c, shutting down...");
+                shutdown_on_signal.cancel();
+            }
+        });
+
+        Self { state, rt, _tray: None, page: Page::Status, prefs: prefs::load(), cache, shutdown, transfers: Vec::new() }
     }
 
     fn with_tray(mut self, tray: Option<tray_icon::TrayIcon>) -> Self {
         self._tray = tray;
         self
     }
+
+    fn start_mount(&self, session: ProtonAPISession) -> AppState {
+        let drive_client = match ProtonDriveClient::new(&session, None) {
+            Ok(client) => {
+                tracing::info!("ProtonDriveClient initialised");
+                client
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to create ProtonDriveClient");
+                return AppState::Login(auth::AuthScreen::new());
+            }
+        };
+
+        let mount_path = self.prefs.mount_path.clone();
+        let path = mount_path.clone();
+        let shutdown = self.shutdown.clone();
+
+        // spawn fuse
+        self.rt.handle().spawn(async move {
+            let mut mount_handle = match mount::mount(path).await {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::error!(error = %e, "FUSE mount failed");
+                    return;
+                }
+            };
+
+            tokio::select! {
+                res = &mut mount_handle => {
+                    if let Err(e) = res {
+                        tracing::error!(error = %e, "FUSE mount exited with error");
+                    }
+                },
+                _ = shutdown.cancelled() => {
+                    tracing::info!("shutdown requested, unmounting...");
+                }
+            }
+
+            if let Err(e) = mount_handle.unmount().await {
+                tracing::error!(error = %e, "failed to unmount");
+            }
+            tracing::info!("FUSE unmounted");
+        });
+        AppState::Ready { session, drive_client, mount_path }
+    }
 }
 
 impl eframe::App for ProtonDrive {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         tray::poll_events();
+
+        // If shutdown was requested (e.g. ctrl+c), close the window
+        if self.shutdown.is_cancelled() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             match &mut self.state {
@@ -100,7 +187,7 @@ impl eframe::App for ProtonDrive {
                         match result {
                             Ok(session) => {
                                 tracing::info!(user = %session.username, "session restored");
-                                self.state = AppState::Authenticated(session);
+                                self.state = self.start_mount(session);
                             }
                             Err(ref e) => {
                                 tracing::warn!(error = %e, "session restore failed, clearing credentials");
@@ -112,21 +199,61 @@ impl eframe::App for ProtonDrive {
                 }
 
                 AppState::Login(screen) => {
-                    if let Some(session) = screen.ui(ui, self.rt.handle()) {
-                        self.state = AppState::Authenticated(session);
+                    if let Some(session) = screen.ui(ui, self.rt.handle(), self.cache.entity_repository()) {
+                        self.state = self.start_mount(session);
                     }
                 }
 
-                AppState::Authenticated(session) => {
-                    ui.heading(format!("Welcome, {}", session.username));
+                AppState::Ready { session, drive_client: _, mount_path } => {
+                    let username = session.username.clone();
+                    let mp = mount_path.display().to_string();
 
-                    if ui.button("Sign out").clicked() {
-                        tracing::info!(user = %session.username, "user signed out");
+                    egui::Panel::left("sidebar")
+                        .resizable(false)
+                        .default_size(160.0)
+                        .show_inside(ui, |ui| {
+                            ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| {
+                                ui.selectable_value(&mut self.page, Page::Status, "📊 Status");
+
+                                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                                    ui.selectable_value(&mut self.page, Page::Settings, "⚙ Settings");
+                                    ui.selectable_value(&mut self.page, Page::Account, "👤 Account");
+                                });
+                            });
+                        });
+
+                    let mut sign_out = false;
+
+                    egui::CentralPanel::default().show_inside(ui, |ui| {
+                        match self.page {
+                            Page::Status => {
+                                self.status_page(ui);
+                            }
+                            Page::Account => {
+                                ProtonDrive::account_page(ui, &mut sign_out, &username, &mp);
+                            }
+                            Page::Settings => {
+                                self.settings_page(ui);
+                            }
+                        }
+                    });
+
+                    if sign_out {
+                        tracing::info!(user = %username, "user signed out");
                         credentials::remove();
                         self.state = AppState::Login(auth::AuthScreen::new());
                     }
                 }
             }
         });
+    }
+}
+
+impl Drop for ProtonDrive {
+    fn drop(&mut self) {
+        tracing::info!("ProtonDrive dropping, requesting shutdown...");
+        self.shutdown.cancel();
+        // Give the mount task a moment to unmount cleanly
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 }

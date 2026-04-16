@@ -13,10 +13,10 @@ name = "pdcli"
 path = "src/main.rs"
 
 [dependencies]
-proton-drive-sdk = { path = "../proton-drive-sdk" }
+proton-drive-sdk = { path = "../proton-drive-sdk", features = ["cache-sqlite", "cache-keyring"] }
 proton-sdk-rs2 = { path = "../proton-sdk-rs2" }
 tokio = { version = "1.50", features = ["full"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 fuse3 = { version = "0.9", features = ["tokio-runtime", "unprivileged"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -51,6 +51,7 @@ toml = "0.8"
 eframe = "0.34"
 egui = "0.34"
 tray-icon = "0.22"
+rfd = "0.15"
 
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 gtk = "0.18"

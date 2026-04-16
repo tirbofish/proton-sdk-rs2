@@ -1,538 +1,239 @@
-//! Authentication module for pdcli.
-//!
-//! Handles login, logout, and session persistence using:
-//! - `.ron` file for session tokens (access/refresh tokens, session ID)
-//! - SQLite cache for entity data and passphrases
-//! - Never stores passwords
-
-use std::path::PathBuf;
-use std::sync::Arc;
-
-use anyhow::{Context, Result};
-use console::style;
-use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password};
-use indicatif::{ProgressBar, ProgressStyle};
-use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
-
-use proton_drive_sdk::cache::sqlite::SqliteCacheRepository;
 use proton_sdk_rs2::{
-    cache::CacheRepository,
     client::ProtonClientOptions,
     session::ProtonAPISession,
-    ser::StoredCredentials,
     AppVersionConfiguration,
-    PasswordMode,
 };
 
-/// Session tokens stored in a .ron file for resumption.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionTokens {
-    pub session_id: String,
-    pub username: String,
-    pub user_id: String,
-    pub access_token: String,
-    pub refresh_token: String,
-    pub scopes: Vec<String>,
-    pub is_waiting_for_second_factor_code: bool,
-    pub password_mode: PasswordMode,
+use crate::{credentials, task::AsyncTask};
+
+/// Result of the initial login attempt — either a ready session or one awaiting 2FA.
+enum LoginResult {
+    Ready(ProtonAPISession),
+    Needs2FA(ProtonAPISession, String),
 }
 
-impl From<StoredCredentials> for SessionTokens {
-    fn from(cred: StoredCredentials) -> Self {
+/// Encapsulates the login form state and the in-flight authentication task.
+pub struct AuthScreen {
+    username: String,
+    password: String,
+    error: Option<String>,
+    login_task: Option<AsyncTask<anyhow::Result<LoginResult>>>,
+    phase: AuthPhase,
+}
+
+enum AuthPhase {
+    /// Collecting username + password.
+    Credentials,
+    /// Waiting for a TOTP code. `session` is `None` while the verification task owns it.
+    TwoFactor {
+        session: Option<ProtonAPISession>,
+        password: String,
+        totp_code: String,
+        totp_task: Option<AsyncTask<anyhow::Result<ProtonAPISession>>>,
+        error: Option<String>,
+    },
+}
+
+impl AuthScreen {
+    pub fn new() -> Self {
         Self {
-            session_id: cred.session_id().to_string(),
-            username: cred.username().to_string(),
-            user_id: cred.user_id().to_string(),
-            access_token: cred.access_token().to_string(),
-            refresh_token: cred.refresh_token().to_string(),
-            scopes: cred.scopes().to_vec(),
-            is_waiting_for_second_factor_code: cred.is_waiting_for_second_factor_code(),
-            password_mode: cred.password_mode(),
-        }
-    }
-}
-
-impl SessionTokens {
-    pub fn to_stored_credentials(&self) -> StoredCredentials {
-        StoredCredentials::new(
-            self.session_id.clone(),
-            self.username.clone(),
-            self.user_id.clone(),
-            self.access_token.clone(),
-            self.refresh_token.clone(),
-            self.scopes.clone(),
-            self.is_waiting_for_second_factor_code,
-            self.password_mode,
-        )
-    }
-}
-
-/// Authentication state for the CLI.
-pub struct ProtonAuth {
-    /// Current session, if authenticated
-    session: RwLock<Option<ProtonAPISession>>,
-    /// Path to config directory
-    config_dir: PathBuf,
-    /// Path to session tokens file
-    tokens_path: PathBuf,
-    /// Path to cache database
-    cache_path: PathBuf,
-    /// App version for API requests
-    app_version: AppVersionConfiguration,
-}
-
-impl ProtonAuth {
-    /// Create a new ProtonAuth instance.
-    pub fn new() -> Result<Self> {
-        let config_dir = dirs::config_dir()
-            .context("Could not determine config directory")?
-            .join("pdcli");
-        
-        std::fs::create_dir_all(&config_dir)
-            .context("Failed to create config directory")?;
-        
-        let tokens_path = config_dir.join("session.ron");
-        let cache_path = config_dir.join("cache.db");
-        
-        let app_version = AppVersionConfiguration::new("pdcli", 0, 1, 0);
-        
-        Ok(Self {
-            session: RwLock::new(None),
-            config_dir,
-            tokens_path,
-            cache_path,
-            app_version,
-        })
-    }
-
-    /// Get the config directory path.
-    pub fn config_dir(&self) -> &PathBuf {
-        &self.config_dir
-    }
-
-    /// Check if session tokens exist on disk.
-    pub fn has_stored_session(&self) -> bool {
-        self.tokens_path.exists()
-    }
-
-    /// Load session tokens from disk.
-    fn load_tokens(&self) -> Result<Option<SessionTokens>> {
-        if !self.tokens_path.exists() {
-            return Ok(None);
-        }
-        
-        let content = std::fs::read_to_string(&self.tokens_path)
-            .context("Failed to read session tokens")?;
-        
-        let tokens: SessionTokens = ron::from_str(&content)
-            .context("Failed to parse session tokens")?;
-        
-        Ok(Some(tokens))
-    }
-
-    /// Save session tokens to disk.
-    fn save_tokens(&self, tokens: &SessionTokens) -> Result<()> {
-        let content = ron::ser::to_string_pretty(tokens, ron::ser::PrettyConfig::default())
-            .context("Failed to serialize session tokens")?;
-        
-        std::fs::write(&self.tokens_path, content)
-            .context("Failed to write session tokens")?;
-        
-        Ok(())
-    }
-
-    /// Delete stored session tokens.
-    fn delete_tokens(&self) -> Result<()> {
-        if self.tokens_path.exists() {
-            std::fs::remove_file(&self.tokens_path)
-                .context("Failed to delete session tokens")?;
-        }
-        Ok(())
-    }
-
-    /// Create a cache repository.
-    fn create_cache_repository(&self) -> Result<Arc<dyn CacheRepository>> {
-        let repo = SqliteCacheRepository::open_file(&self.cache_path, Some(10000))
-            .context("Failed to open cache database")?;
-        Ok(Arc::new(repo))
-    }
-
-    /// Try to resume an existing session.
-    /// This validates session tokens but does NOT prompt for password.
-    /// Keys may not be unlocked - caller should handle that.
-    pub async fn try_resume(&self) -> Result<bool> {
-        let tokens = match self.load_tokens()? {
-            Some(t) => t,
-            None => return Ok(false),
-        };
-
-        let spinner = ProgressBar::new_spinner();
-        spinner.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.cyan} {msg}")
-                .unwrap()
-        );
-        spinner.set_message("Resuming session...");
-        spinner.enable_steady_tick(std::time::Duration::from_millis(80));
-
-        let cache_repo = self.create_cache_repository()?;
-        
-        let session = ProtonAPISession::from_stored_credentials(
-            tokens.to_stored_credentials(),
-            self.app_version.clone(),
-            cache_repo,
-        );
-
-        // Try to ensure the session is still valid
-        let mut session = session;
-        match session.ensure_authenticated().await {
-            Ok(()) => {
-                spinner.finish_with_message(format!(
-                    "{} Session valid for {}",
-                    style("✓").green().bold(),
-                    style(&tokens.username).cyan()
-                ));
-                
-                // Save updated tokens (they may have been refreshed)
-                let new_tokens: SessionTokens = session.to_stored_credentials().into();
-                self.save_tokens(&new_tokens)?;
-                
-                // Store session - keys may or may not be unlocked depending on cache
-                *self.session.write().await = Some(session);
-                Ok(true)
-            }
-            Err(e) => {
-                spinner.finish_with_message(format!(
-                    "{} Session expired or invalid",
-                    style("✗").red().bold()
-                ));
-                tracing::debug!("Session resume failed: {}", e);
-                Ok(false)
-            }
+            username: String::new(),
+            password: String::new(),
+            error: None,
+            login_task: None,
+            phase: AuthPhase::Credentials,
         }
     }
 
-    /// Prompt for password and unlock keys.
-    /// Call this when an operation fails due to locked keys.
-    pub async fn unlock_keys_with_password(&self) -> Result<bool> {
-        let mut session_guard = self.session.write().await;
-        let session = match session_guard.as_mut() {
-            Some(s) => s,
-            None => return Err(anyhow::anyhow!("No session to unlock")),
-        };
+    fn begin_login(&mut self, rt: &tokio::runtime::Handle) {
+        self.error = None;
+        let username = self.username.clone();
+        let password = self.password.clone();
 
-        let theme = ColorfulTheme::default();
-        println!();
-        
-        let password: String = Password::with_theme(&theme)
-            .with_prompt("Password (to unlock keys)")
-            .interact()
-            .context("Failed to read password")?;
+        tracing::info!(username = %username, "starting authentication");
 
-        let spinner = ProgressBar::new_spinner();
-        spinner.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.cyan} {msg}")
-                .unwrap()
-        );
-        spinner.set_message("Unlocking keys...");
-        spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+        self.login_task = Some(AsyncTask::spawn(rt, async move {
+            let session = ProtonAPISession::begin(
+                username,
+                &password,
+                AppVersionConfiguration::new("pdcli", 0, 1, 0),
+                ProtonClientOptions::default(),
+            )
+            .await?;
 
-        match session.apply_data_password(&password).await {
-            Ok(()) => {
-                spinner.finish_with_message(format!(
-                    "{} Keys unlocked",
-                    style("✓").green().bold()
-                ));
-                Ok(true)
-            }
-            Err(e) => {
-                spinner.finish_with_message(format!(
-                    "{} Failed to unlock keys: {}",
-                    style("✗").red().bold(),
-                    e
-                ));
-                Ok(false)
-            }
-        }
-    }
-
-    /// Prompt user for login credentials and authenticate.
-    pub async fn login_interactive(&self) -> Result<()> {
-        let theme = ColorfulTheme::default();
-
-        println!();
-        println!("{}", style("Proton Drive Login").bold().cyan());
-        println!();
-
-        // Get username
-        let username: String = Input::with_theme(&theme)
-            .with_prompt("Email or username")
-            .interact_text()
-            .context("Failed to read username")?;
-
-        // Get password (not stored anywhere)
-        let password: String = Password::with_theme(&theme)
-            .with_prompt("Password")
-            .interact()
-            .context("Failed to read password")?;
-
-        // Show spinner while authenticating
-        let spinner = ProgressBar::new_spinner();
-        spinner.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.cyan} {msg}")
-                .unwrap()
-        );
-        spinner.set_message("Authenticating...");
-        spinner.enable_steady_tick(std::time::Duration::from_millis(80));
-
-        // Create cache repository for persisting passphrases
-        let cache_repo = self.create_cache_repository()?;
-        let options = ProtonClientOptions {
-            secret_cache_repository: Some(cache_repo),
-            ..Default::default()
-        };
-
-        // Attempt authentication (this also calls apply_data_password internally if not 2FA)
-        let session = ProtonAPISession::begin(
-            &username,
-            &password,
-            self.app_version.clone(),
-            options,
-        ).await;
-
-        let mut session = match session {
-            Ok(s) => s,
-            Err(e) => {
-                spinner.finish_with_message(format!(
-                    "{} Authentication failed",
-                    style("✗").red().bold()
-                ));
-                return Err(e).context("Authentication failed");
-            }
-        };
-
-        // Handle 2FA if required
-        if session.is_waiting_for_second_factor_code {
-            spinner.finish_with_message("Two-factor authentication required");
-            
-            let code: String = Input::with_theme(&theme)
-                .with_prompt("Enter 2FA code")
-                .interact_text()
-                .context("Failed to read 2FA code")?;
-
-            spinner.set_message("Verifying 2FA code...");
-            spinner.enable_steady_tick(std::time::Duration::from_millis(80));
-
-            session.apply_second_factor_code(code).await
-                .context("2FA verification failed")?;
-
-            // After 2FA, we need to apply the data password to unlock keys
-            spinner.set_message("Unlocking keys...");
-            session.apply_data_password(&password).await
-                .context("Failed to unlock keys")?;
-        }
-
-        // Password is no longer needed, clear it
-        drop(password);
-
-        spinner.finish_with_message(format!(
-            "{} Logged in as {}",
-            style("✓").green().bold(),
-            style(&username).cyan()
-        ));
-
-        // Save session tokens
-        let tokens: SessionTokens = session.to_stored_credentials().into();
-        self.save_tokens(&tokens)?;
-
-        *self.session.write().await = Some(session);
-
-        println!();
-        println!("{}", style("Session saved. You can now use pdcli commands.").dim());
-
-        Ok(())
-    }
-
-    /// Logout and clear stored session.
-    pub async fn logout(&self) -> Result<()> {
-        let spinner = ProgressBar::new_spinner();
-        spinner.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.cyan} {msg}")
-                .unwrap()
-        );
-        spinner.set_message("Logging out...");
-        spinner.enable_steady_tick(std::time::Duration::from_millis(80));
-
-        // End session on server if we have one
-        let mut session_guard = self.session.write().await;
-        if let Some(mut session) = session_guard.take() {
-            if let Err(e) = session.end_from_session().await {
-                tracing::warn!("Failed to end session on server: {}", e);
-            }
-        }
-
-        // Delete local tokens
-        self.delete_tokens()?;
-
-        spinner.finish_with_message(format!(
-            "{} Logged out successfully",
-            style("✓").green().bold()
-        ));
-
-        Ok(())
-    }
-
-    /// Ensure we have an authenticated session.
-    /// If not authenticated, prompts for login or exit.
-    pub async fn ensure_authenticated(&self) -> Result<bool> {
-        // Check if already authenticated in memory
-        {
-            let session = self.session.read().await;
-            if session.is_some() {
-                return Ok(true);
-            }
-        }
-
-        // Try to resume from stored tokens
-        if self.try_resume().await? {
-            return Ok(true);
-        }
-
-        // No valid session - prompt user
-        let theme = ColorfulTheme::default();
-        
-        if self.has_stored_session() {
-            // Had a session but it's invalid
-            println!();
-            println!("{}", style("Your session has expired or is invalid.").yellow());
-            
-            let choice = Confirm::with_theme(&theme)
-                .with_prompt("Would you like to login again?")
-                .default(true)
-                .interact()
-                .context("Failed to read user choice")?;
-
-            if choice {
-                self.login_interactive().await?;
-                Ok(true)
+            if session.is_waiting_for_second_factor_code {
+                tracing::info!("2FA required");
+                Ok(LoginResult::Needs2FA(session, password))
             } else {
-                Ok(false)
+                tracing::info!(user = %session.username, "authenticated");
+                Ok(LoginResult::Ready(session))
             }
-        } else {
-            // First time user
-            println!();
-            println!("{}", style("Welcome to Proton Drive CLI!").bold().cyan());
-            println!("You need to login to continue.");
-            println!();
-            
-            let choice = Confirm::with_theme(&theme)
-                .with_prompt("Would you like to login now?")
-                .default(true)
-                .interact()
-                .context("Failed to read user choice")?;
+        }));
+    }
 
-            if choice {
-                self.login_interactive().await?;
-                Ok(true)
-            } else {
-                Ok(false)
-            }
+    fn is_busy(&self) -> bool {
+        self.login_task.is_some()
+    }
+
+    /// Renders the auth UI. Returns `Some(session)` once fully authenticated.
+    pub fn ui(&mut self, ui: &mut egui::Ui, rt: &tokio::runtime::Handle) -> Option<ProtonAPISession> {
+        match &mut self.phase {
+            AuthPhase::Credentials => self.credentials_ui(ui, rt),
+            AuthPhase::TwoFactor { .. } => self.two_factor_ui(ui, rt),
         }
     }
 
-    /// Get a reference to the current session if authenticated.
-    pub async fn session(&self) -> Option<tokio::sync::RwLockReadGuard<'_, Option<ProtonAPISession>>> {
-        let guard = self.session.read().await;
-        if guard.is_some() {
-            Some(guard)
-        } else {
-            None
-        }
-    }
-
-    /// Check if currently authenticated.
-    pub async fn is_authenticated(&self) -> bool {
-        self.session.read().await.is_some()
-    }
-
-    /// Get current account information from stored tokens.
-    pub fn get_account_info(&self) -> Option<AccountInfo> {
-        self.load_tokens().ok().flatten().map(|tokens| AccountInfo {
-            username: tokens.username,
-            user_id: tokens.user_id,
-            session_id: tokens.session_id,
-        })
-    }
-
-    /// Logout and clear ALL stored data (session, cache, etc.).
-    pub async fn logout_clear(&self) -> Result<()> {
-        let spinner = ProgressBar::new_spinner();
-        spinner.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.cyan} {msg}")
-                .unwrap()
-        );
-        spinner.set_message("Clearing all data...");
-        spinner.enable_steady_tick(std::time::Duration::from_millis(80));
-
-        // End session on server if we have one
-        let mut session_guard = self.session.write().await;
-        if let Some(mut session) = session_guard.take() {
-            if let Err(e) = session.end_from_session().await {
-                tracing::warn!("Failed to end session on server: {}", e);
-            }
-        }
-
-        // Delete all stored data
-        self.delete_all_data()?;
-
-        spinner.finish_with_message(format!(
-            "{} All data cleared",
-            style("✓").green().bold()
-        ));
-
-        Ok(())
-    }
-
-    /// Delete all stored data (tokens, cache, etc.).
-    fn delete_all_data(&self) -> Result<()> {
-        // Delete session tokens
-        if self.tokens_path.exists() {
-            std::fs::remove_file(&self.tokens_path)
-                .context("Failed to delete session tokens")?;
-        }
-
-        // Delete cache database
-        if self.cache_path.exists() {
-            std::fs::remove_file(&self.cache_path)
-                .context("Failed to delete cache database")?;
-        }
-
-        // Delete any other files in config directory
-        // Keep the directory itself
-        if self.config_dir.exists() {
-            for entry in std::fs::read_dir(&self.config_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_file() {
-                    std::fs::remove_file(&path)
-                        .with_context(|| format!("Failed to delete {}", path.display()))?;
+    fn credentials_ui(&mut self, ui: &mut egui::Ui, rt: &tokio::runtime::Handle) -> Option<ProtonAPISession> {
+        // Poll the login task
+        if let Some(task) = &mut self.login_task {
+            if let Some(result) = task.poll() {
+                self.login_task = None;
+                match result {
+                    Ok(LoginResult::Ready(session)) => {
+                        persist(&session);
+                        return Some(session);
+                    }
+                    Ok(LoginResult::Needs2FA(session, password)) => {
+                        self.phase = AuthPhase::TwoFactor {
+                            session: Some(session),
+                            password,
+                            totp_code: String::new(),
+                            totp_task: None,
+                            error: None,
+                        };
+                        return None;
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "login failed");
+                        self.error = Some(e.to_string());
+                    }
                 }
             }
         }
 
-        Ok(())
+        ui.vertical_centered(|ui| {
+            ui.add_space(40.0);
+            ui.heading("Sign in to Proton Drive");
+            ui.add_space(20.0);
+
+            ui.add_sized([300.0, 28.0], egui::TextEdit::singleline(&mut self.username).hint_text("Username"));
+            ui.add_space(8.0);
+            ui.add_sized([300.0, 28.0], egui::TextEdit::singleline(&mut self.password).hint_text("Password").password(true));
+            ui.add_space(12.0);
+
+            if self.is_busy() {
+                ui.spinner();
+                ui.label("Authenticating…");
+                ui.ctx().request_repaint();
+            } else {
+                let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let sign_in = ui.add_sized([300.0, 32.0], egui::Button::new("Sign in")).clicked();
+                if (sign_in || enter_pressed) && !self.username.is_empty() && !self.password.is_empty() {
+                    self.begin_login(rt);
+                }
+            }
+
+            if let Some(err) = &self.error {
+                ui.add_space(8.0);
+                ui.colored_label(egui::Color32::RED, err);
+            }
+        });
+
+        None
+    }
+
+    fn two_factor_ui(&mut self, ui: &mut egui::Ui, rt: &tokio::runtime::Handle) -> Option<ProtonAPISession> {
+        let AuthPhase::TwoFactor {
+            session: _,
+            password: _,
+            ref mut totp_code,
+            ref mut totp_task,
+            ref mut error,
+        } = self.phase
+        else {
+            return None;
+        };
+
+        // Poll the 2FA verification task
+        if let Some(task) = totp_task {
+            if let Some(result) = task.poll() {
+                *totp_task = None;
+                match result {
+                    Ok(completed_session) => {
+                        tracing::info!(user = %completed_session.username, "2FA verified");
+                        persist(&completed_session);
+                        return Some(completed_session);
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "2FA verification failed");
+                        *error = Some(e.to_string());
+                    }
+                }
+            }
+        }
+
+        let mut should_submit = false;
+
+        ui.vertical_centered(|ui| {
+            ui.add_space(40.0);
+            ui.heading("Two-factor authentication");
+            ui.add_space(8.0);
+            ui.label("Enter the 6-digit code from your authenticator app.");
+            ui.add_space(20.0);
+
+            ui.add_sized([200.0, 28.0], egui::TextEdit::singleline(totp_code).hint_text("TOTP code"));
+            ui.add_space(12.0);
+
+            if totp_task.is_some() {
+                ui.spinner();
+                ui.label("Verifying…");
+                ui.ctx().request_repaint();
+            } else {
+                let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let verify_clicked = ui.add_sized([200.0, 32.0], egui::Button::new("Verify")).clicked();
+                if (verify_clicked || enter_pressed) && !totp_code.is_empty() {
+                    should_submit = true;
+                }
+            }
+
+            if let Some(err) = error {
+                ui.add_space(8.0);
+                ui.colored_label(egui::Color32::RED, err.as_str());
+            }
+        });
+
+        if should_submit {
+            let AuthPhase::TwoFactor {
+                ref mut session,
+                ref password,
+                ref totp_code,
+                ref mut totp_task,
+                ref mut error,
+            } = self.phase
+            else {
+                return None;
+            };
+
+            // Take the session out — the async task will own it while running.
+            if let Some(mut sess) = session.take() {
+                *error = None;
+                let code = totp_code.clone();
+                let pw = password.clone();
+
+                *totp_task = Some(AsyncTask::spawn(rt, async move {
+                    sess.apply_second_factor_code(code).await?;
+                    sess.apply_data_password(&pw).await?;
+                    Ok(sess)
+                }));
+            }
+        }
+
+        None
     }
 }
 
-/// Information about the current account.
-#[derive(Debug, Clone)]
-pub struct AccountInfo {
-    pub username: String,
-    pub user_id: String,
-    pub session_id: String,
+fn persist(session: &ProtonAPISession) {
+    if let Err(e) = credentials::save(&session.to_stored_credentials()) {
+        tracing::warn!(error = %e, "failed to persist credentials");
+    }
 }

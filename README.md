@@ -17,6 +17,22 @@ You can check it out [here](https://github.com/tirbofish/proton-sdk-rs)
 ## the normal joe
 anyone wanting to use the client will have to clone this repository and compile with cargo (if no release has been made, or you just want cutting edge)
 
+### dependencies
+
+building this from source requires a couple dependencies. 
+
+#### Arch
+```bash
+pacman -S gtk3 xdotool libappindicator-gtk3 #or libayatana-appindicator
+```
+
+#### Ubuntu
+```bash
+sudo apt install libgtk-3-dev libxdo-dev libappindicator3-dev #or libayatana-appindicator3-dev
+```
+
+### building
+
 ```bash
 git clone https://github.com/tirbofish/proton-sdk-rs2
 cd proton-sdk-rs2

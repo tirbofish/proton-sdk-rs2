@@ -88,7 +88,7 @@ impl ProtonClientConfiguration {
             app_version,
             user_agent: options.user_agent.unwrap_or(String::new()),
             tls_policy: options.tls_policy.unwrap_or(ProtonClientTlsPolicy::Strict),
-            custom_http_message_handler_factory: options.custom_http_message_handler_factory, // todo: dont make this null, make it smth else
+            custom_http_message_handler_factory: options.custom_http_message_handler_factory,
             secret_cache_repository: options
                 .secret_cache_repository
                 .unwrap_or(Arc::new(InMemoryCacheRepository::new())),

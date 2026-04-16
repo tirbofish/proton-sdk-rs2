@@ -1,436 +1,132 @@
-pub mod auth;
-pub mod cancellation;
-pub mod fs;
-pub mod index;
-pub mod thumbnail;
-pub mod mount;
+mod auth;
+mod credentials;
+mod db;
+mod task;
+mod tray;
 
-use anyhow::Context;
-use clap::{Parser, Subcommand};
-use console::style;
-use indicatif::{ProgressBar, ProgressStyle};
-use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::select;
 
-use crate::auth::ProtonAuth;
-use crate::cancellation::{CancellationStack, CancellationGuard, spawn_ctrlc_handler};
+use proton_sdk_rs2::{
+    cache::InMemoryCacheRepository,
+    session::ProtonAPISession,
+    AppVersionConfiguration,
+};
 
-#[derive(Parser)]
-#[command(name = "pdcli")]
-#[command(version)]
-#[command(about = "Proton Drive Command Line Interface (pdcli)", long_about = None)]
-struct Cli {
-    /// Clear the file download cache (keeps session)
-    #[arg(long)]
-    clear_cache: bool,
+fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "pdcli=info".into()),
+        )
+        .init();
 
-    /// Clear pending uploads from queue
-    #[arg(long)]
-    clear_pending_uploads: bool,
+    let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    let native_options = eframe::NativeOptions::default();
 
-    #[command(subcommand)]
-    command: Option<Commands>,
+    let icon_path = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/icon.png"));
+    let create_tray = tray::init(&icon_path);
+
+    eframe::run_native(
+        "Proton Drive",
+        native_options,
+        Box::new(move |_| {
+            let tray_handle = create_tray();
+            Ok(Box::new(ProtonDrive::new(rt).with_tray(tray_handle)))
+        }),
+    )
+    .unwrap();
 }
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Login to Proton Drive
-    Login,
-    /// Logout from Proton Drive
-    Logout {
-        /// Clear all stored data (session, cache, etc.)
-        #[arg(long)]
-        clear: bool,
-    },
-    /// Show current account information
-    Whoami,
-    /// Mount Proton Drive to a local path
-    Mount {
-        /// Path to mount the drive
-        path: PathBuf,
-    },
-    /// Download files for offline access
-    Hydrate {
-        /// Path within MyFiles to hydrate (e.g., "Documents" or "Photos/2024")
-        path: String,
-        /// Recursively hydrate all subdirectories
-        #[arg(short, long)]
-        recursive: bool,
-    },
-    /// Show offline index status
-    Status,
+enum AppState {
+    /// Attempting to restore a session from stored credentials.
+    Restoring(task::AsyncTask<anyhow::Result<ProtonAPISession>>),
+    /// No valid session — show the login form.
+    Login(auth::AuthScreen),
+    /// Authenticated and ready.
+    Authenticated(ProtonAPISession),
 }
 
-/// The main CLI application with hierarchical cancellation support.
-/// 
-/// Each Ctrl+C cancels the innermost active operation first.
-/// Subsequent Ctrl+C presses cancel progressively outer operations
-/// until the entire application exits.
-pub struct ProtonDriveCommandLineInterface {
-    /// The cancellation stack for hierarchical Ctrl+C handling
-    cancellation: CancellationStack,
-    /// Authentication handler
-    auth: ProtonAuth,
+pub struct ProtonDrive {
+    state: AppState,
+    rt: tokio::runtime::Runtime,
+    _tray: Option<tray_icon::TrayIcon>,
 }
 
-impl ProtonDriveCommandLineInterface {
-    /// Create a new CLI instance with cancellation support.
-    pub fn new() -> anyhow::Result<Self> {
-        Ok(Self {
-            cancellation: CancellationStack::new(),
-            auth: ProtonAuth::new()?,
-        })
-    }
-
-    /// Get the cancellation stack for spawning the Ctrl+C handler.
-    pub fn cancellation(&self) -> &CancellationStack {
-        &self.cancellation
-    }
-
-    /// Get the auth handler.
-    pub fn auth(&self) -> &ProtonAuth {
-        &self.auth
-    }
-
-    /// Push a new cancellation context for a nested operation.
-    /// The returned guard will automatically clean up when dropped.
-    pub async fn push_context(&self) -> CancellationGuard {
-        self.cancellation.push().await
-    }
-
-    /// Run a command with cancellation support.
-    pub(crate) async fn run(&self, command: Commands) -> anyhow::Result<()> {
-        // Create a cancellation context for this command
-        let guard = self.push_context().await;
-        
-        select! {
-            result = self.execute_command(command, &guard) => result,
-            _ = guard.cancelled() => {
-                tracing::info!("Command cancelled by user");
-                Ok(())
-            }
-        }
-    }
-
-    /// Execute a command within a cancellation context.
-    async fn execute_command(&self, command: Commands, guard: &CancellationGuard) -> anyhow::Result<()> {
-        match command {
-            Commands::Login => {
-                self.auth.login_interactive().await
-            }
-            Commands::Logout { clear } => {
-                if !self.auth.has_stored_session() {
-                    println!("{}", style("You are not logged in.").yellow());
-                    return Ok(());
-                }
-                if clear {
-                    self.auth.logout_clear().await
-                } else {
-                    self.auth.logout().await
-                }
-            }
-            Commands::Whoami => {
-                match self.auth.get_account_info() {
-                    Some(info) => {
-                        println!();
-                        println!("  {} {}", style("Username:").bold(), style(&info.username).cyan());
-                        println!("  {}  {}", style("User ID:").bold(), style(&info.user_id).dim());
-                        println!(" {} {}", style("Session:").bold(), style(&info.session_id).dim());
-                        println!();
-                    }
-                    None => {
-                        println!("{}", style("Not logged in.").yellow());
-                    }
-                }
-                Ok(())
-            }
-            Commands::Mount { path } => {
-                // Ensure authenticated before mounting
-                if !self.auth.ensure_authenticated().await? {
-                    println!("{}", style("Authentication required. Exiting.").red());
-                    return Ok(());
-                }
-                
-                // Handle mount path - may need to create or clean up stale mount
-                // Try to stat the directory - if it fails with EIO/ENOTCONN, it's a stale mount
-                let path_status = std::fs::metadata(&path);
-                match &path_status {
-                    Ok(meta) if meta.is_dir() => {
-                        // Good to go
-                    }
-                    Ok(_) => {
-                        anyhow::bail!("Mount path is not a directory: {}", path.display());
-                    }
-                    Err(e) if e.raw_os_error() == Some(libc::ENOTCONN) || 
-                              e.raw_os_error() == Some(libc::EIO) => {
-                        // Transport endpoint not connected - stale FUSE mount
-                        println!("{}", style("Cleaning up stale mount...").yellow());
-                        let _ = std::process::Command::new("fusermount3")
-                            .args(["-u", "-z"])
-                            .arg(&path)
-                            .output();
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        // Create the directory
-                        std::fs::create_dir_all(&path)
-                            .with_context(|| format!("Failed to create mount directory: {}", path.display()))?;
-                        println!("{}", style(format!("Created mount directory: {}", path.display())).dim());
-                    }
-                    Err(e) => {
-                        anyhow::bail!("Cannot access mount path {}: {}", path.display(), e);
-                    }
-                }
-                
-                // Verify path is now accessible
-                if !path.is_dir() {
-                    anyhow::bail!("Mount path is not a directory: {}", path.display());
-                }
-                
-                // Create spinner for mount progress
-                let spinner = Arc::new(ProgressBar::new_spinner());
-                spinner.set_style(
-                    ProgressStyle::default_spinner()
-                        .template("{spinner:.cyan} {msg}")
-                        .unwrap()
-                        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-                );
-                spinner.enable_steady_tick(std::time::Duration::from_millis(80));
-                spinner.set_message("Initializing...");
-                
-                let spinner_for_progress = spinner.clone();
-                let progress: crate::mount::ProgressCallback = Box::new(move |msg| {
-                    spinner_for_progress.set_message(msg.to_string());
+impl ProtonDrive {
+    fn new(rt: tokio::runtime::Runtime) -> Self {
+        let state = match credentials::load() {
+            Some(cred) => {
+                tracing::info!("found stored credentials, restoring session");
+                let task = task::AsyncTask::spawn(rt.handle(), async move {
+                    let session = ProtonAPISession::from_stored_credentials(
+                        cred,
+                        AppVersionConfiguration::new("pdcli", 0, 1, 0),
+                        Arc::new(InMemoryCacheRepository::new()),
+                    );
+                    Ok(session)
                 });
-                
-                // Channel to signal when mount is ready
-                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-                let spinner_for_ready = spinner.clone();
-                let path_display = path.display().to_string();
-                
-                // Spawn task to wait for ready signal and show success
-                tokio::spawn(async move {
-                    if ready_rx.await.is_ok() {
-                        spinner_for_ready.finish_with_message(format!(
-                            "{} Mounted at {}",
-                            style("✓").green().bold(),
-                            style(&path_display).cyan()
-                        ));
-                        println!("{}", style("Press Ctrl+C to unmount").dim());
-                    }
-                });
-                
-                // Try to mount - may fail if keys are not unlocked
-                let mount_result = {
-                    let session_guard = self.auth.session().await
-                        .ok_or_else(|| anyhow::anyhow!("No session after authentication"))?;
-                    let session = session_guard.as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("Session is None in guard"))?;
-                    
-                    crate::mount::mount(&path, session, guard.token(), Some(progress), Some(ready_tx)).await
-                };
-                
-                // Check if it failed due to locked keys
-                match &mount_result {
-                    Err(e) => {
-                        spinner.finish_and_clear();
-                        let err_str = format!("{:?}", e);
-                        if err_str.contains("none could be unlocked") || 
-                           err_str.contains("passphrase") ||
-                           err_str.contains("Unable to locate passphrase") {
-                            // Keys not unlocked - prompt for password and retry
-                            println!();
-                            println!("{}", style("Keys need to be unlocked.").yellow());
-                            
-                            if !self.auth.unlock_keys_with_password().await? {
-                                println!("{}", style("Failed to unlock keys. Exiting.").red());
-                                return Ok(());
+                AppState::Restoring(task)
+            }
+            None => {
+                tracing::info!("no stored credentials, showing login");
+                AppState::Login(auth::AuthScreen::new())
+            }
+        };
+
+        Self { state, rt, _tray: None }
+    }
+
+    fn with_tray(mut self, tray: Option<tray_icon::TrayIcon>) -> Self {
+        self._tray = tray;
+        self
+    }
+}
+
+impl eframe::App for ProtonDrive {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        tray::poll_events();
+
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            match &mut self.state {
+                AppState::Restoring(task) => {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(60.0);
+                        ui.spinner();
+                        ui.label("Restoring session…");
+                    });
+                    ui.ctx().request_repaint();
+
+                    if let Some(result) = task.poll() {
+                        match result {
+                            Ok(session) => {
+                                tracing::info!(user = %session.username, "session restored");
+                                self.state = AppState::Authenticated(session);
                             }
-                            
-                            // New spinner for retry
-                            let spinner = Arc::new(ProgressBar::new_spinner());
-                            spinner.set_style(
-                                ProgressStyle::default_spinner()
-                                    .template("{spinner:.cyan} {msg}")
-                                    .unwrap()
-                                    .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-                            );
-                            spinner.enable_steady_tick(std::time::Duration::from_millis(80));
-                            spinner.set_message("Retrying mount...");
-                            
-                            let spinner_for_progress = spinner.clone();
-                            let progress: crate::mount::ProgressCallback = Box::new(move |msg| {
-                                spinner_for_progress.set_message(msg.to_string());
-                            });
-                            
-                            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-                            let spinner_for_ready = spinner.clone();
-                            let path_display = path.display().to_string();
-                            
-                            tokio::spawn(async move {
-                                if ready_rx.await.is_ok() {
-                                    spinner_for_ready.finish_with_message(format!(
-                                        "{} Mounted at {}",
-                                        style("✓").green().bold(),
-                                        style(&path_display).cyan()
-                                    ));
-                                    println!("{}", style("Press Ctrl+C to unmount").dim());
-                                }
-                            });
-                            
-                            // Retry mount with unlocked keys
-                            let session_guard = self.auth.session().await
-                                .ok_or_else(|| anyhow::anyhow!("No session"))?;
-                            let session = session_guard.as_ref()
-                                .ok_or_else(|| anyhow::anyhow!("Session is None"))?;
-                            
-                            crate::mount::mount(&path, session, guard.token(), Some(progress), Some(ready_tx)).await
-                        } else {
-                            mount_result
+                            Err(ref e) => {
+                                tracing::warn!(error = %e, "session restore failed, clearing credentials");
+                                credentials::remove();
+                                self.state = AppState::Login(auth::AuthScreen::new());
+                            }
                         }
                     }
-                    Ok(()) => Ok(())
+                }
+
+                AppState::Login(screen) => {
+                    if let Some(session) = screen.ui(ui, self.rt.handle()) {
+                        self.state = AppState::Authenticated(session);
+                    }
+                }
+
+                AppState::Authenticated(session) => {
+                    ui.heading(format!("Welcome, {}", session.username));
+
+                    if ui.button("Sign out").clicked() {
+                        tracing::info!(user = %session.username, "user signed out");
+                        credentials::remove();
+                        self.state = AppState::Login(auth::AuthScreen::new());
+                    }
                 }
             }
-            Commands::Hydrate { path, recursive } => {
-                // Ensure authenticated before hydrating
-                if !self.auth.ensure_authenticated().await? {
-                    println!("{}", style("Authentication required. Exiting.").red());
-                    return Ok(());
-                }
-
-                // Open the index
-                let index_path = dirs::config_dir()
-                    .context("Could not determine config directory")?
-                    .join("pdcli")
-                    .join("index.db");
-                let index = std::sync::Arc::new(crate::index::OfflineIndex::open(&index_path)?);
-
-                println!();
-                println!("  {} {}", style("Hydrating:").bold(), style(&path).cyan());
-                if recursive {
-                    println!("  {} recursive", style("Mode:").bold());
-                }
-                println!();
-
-                // Get the session and drive client
-                let session_guard = self.auth.session().await
-                    .ok_or_else(|| anyhow::anyhow!("No session after authentication"))?;
-                let session = session_guard.as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Session is None in guard"))?;
-
-                // Create drive client
-                let drive_client = proton_drive_sdk::client::ProtonDriveClient::new(session, None)
-                    .context("Failed to create drive client")?;
-
-                // Hydrate the path
-                crate::mount::hydrate(&drive_client, &index, &path, recursive, guard.token()).await?;
-
-                println!();
-                println!("{}", style("Hydration complete!").green().bold());
-
-                Ok(())
-            }
-            Commands::Status => {
-                // Open the index
-                let index_path = dirs::config_dir()
-                    .context("Could not determine config directory")?
-                    .join("pdcli")
-                    .join("index.db");
-
-                if !index_path.exists() {
-                    println!("{}", style("No index found. Run 'pdcli mount' first.").yellow());
-                    return Ok(());
-                }
-
-                let index = crate::index::OfflineIndex::open(&index_path)?;
-                let stats = index.stats()?;
-
-                println!();
-                println!("  {}", style("Offline Index Status").bold().cyan());
-                println!();
-                println!("  {} {}", style("Indexed nodes:").bold(), stats.node_count);
-                println!("    {} files, {} folders", stats.file_count, stats.folder_count);
-                println!();
-                println!("  {} {}", style("Offline files:").bold(), stats.offline_count);
-                println!("    {} total", format_size(stats.offline_size));
-                println!();
-                println!("  {} {}", style("Pending changes:").bold(), stats.mutation_count);
-                if stats.mutation_count > 0 {
-                    println!("    (will sync automatically when mounted)");
-                }
-                println!();
-
-                Ok(())
-            }
-        }
-    }
-}
-
-fn format_size(bytes: i64) -> String {
-    const KB: i64 = 1024;
-    const MB: i64 = KB * 1024;
-    const GB: i64 = MB * 1024;
-
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} bytes", bytes)
-    }
-}
-
-#[tokio::main]
-pub async fn main() -> anyhow::Result<()> {
-    // Configure tracing - only enabled via RUST_LOG env var
-    // Example: RUST_LOG=info pdcli mount ~/ProtonDrive
-    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
-
-    if let Ok(filter) = EnvFilter::try_from_default_env() {
-        tracing_subscriber::registry()
-            .with(fmt::layer())
-            .with(filter)
-            .try_init()
-            .ok();
-    }
-
-    let cli = Cli::parse();
-
-    // Handle standalone flags first
-    if cli.clear_cache {
-        return crate::mount::clear_cache();
-    }
-    if cli.clear_pending_uploads {
-        return crate::mount::clear_pending_uploads();
-    }
-
-    // Require a subcommand if no flags given
-    let Some(command) = cli.command else {
-        use clap::CommandFactory;
-        Cli::command().print_help()?;
-        return Ok(());
-    };
-
-    let pdcli = ProtonDriveCommandLineInterface::new()?;
-    
-    // Spawn the Ctrl+C handler
-    let _ctrlc_handle = spawn_ctrlc_handler(pdcli.cancellation().clone());
-    
-    // Get the root token to know when to exit
-    let root = pdcli.cancellation().root().await;
-    
-    // Run the command with cancellation support
-    select! {
-        result = pdcli.run(command) => {
-            result
-        }
-        _ = root.cancelled() => {
-            println!("Application shutdown requested");
-            Ok(())
-        }
+        });
     }
 }

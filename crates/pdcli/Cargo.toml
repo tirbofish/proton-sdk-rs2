@@ -47,3 +47,10 @@ png = "0.17"
 image = "0.25"
 lru = "0.14"
 toml = "0.8"
+
+eframe = "0.34"
+egui = "0.34"
+tray-icon = "0.22"
+
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+gtk = "0.18"

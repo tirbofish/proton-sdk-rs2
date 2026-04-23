@@ -5,6 +5,8 @@ mod credentials;
 mod db;
 mod app;
 mod tray;
+mod transfer;
+mod flags;
 
 #[tokio::main]
 async fn main() {
@@ -25,7 +27,9 @@ async fn main() {
         native_options,
         Box::new(move |_| {
             let tray_handle = create_tray();
-            Ok(Box::new(ProtonDrive::new().with_tray(tray_handle)))
+            Ok(Box::new({
+                ProtonDrive::new().with_tray(tray_handle).handle_flags()
+            }))
         }),
     )
     .unwrap();

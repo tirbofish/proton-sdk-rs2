@@ -17,7 +17,6 @@ proton-drive-sdk = { path = "../proton-drive-sdk" }
 proton-sdk-rs2 = { path = "../proton-sdk-rs2" }
 tokio = { version = "1.50", features = ["full"] }
 tokio-util = "0.7"
-fuse3 = { version = "0.9", features = ["tokio-runtime", "unprivileged"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
@@ -51,6 +50,8 @@ toml = "0.8"
 eframe = "0.34"
 egui = "0.34"
 tray-icon = "0.22"
+poll-promise = { version = "0.3.0", features = ["tokio"] }
+fuser = { version = "0.17.0", features = ["experimental", "async-trait", "tokio"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 gtk = "0.18"

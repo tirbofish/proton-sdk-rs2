@@ -1,35 +1,32 @@
+use poll_promise::Promise;
 use proton_sdk_rs2::{
     client::ProtonClientOptions,
     session::ProtonAPISession,
     AppVersionConfiguration,
 };
 
-use crate::{credentials, task::AsyncTask};
+use crate::{credentials};
 
-/// Result of the initial login attempt — either a ready session or one awaiting 2FA.
 enum LoginResult {
     Ready(ProtonAPISession),
     Needs2FA(ProtonAPISession, String),
 }
 
-/// Encapsulates the login form state and the in-flight authentication task.
 pub struct AuthScreen {
     username: String,
     password: String,
     error: Option<String>,
-    login_task: Option<AsyncTask<anyhow::Result<LoginResult>>>,
+    login_task: Option<Promise<anyhow::Result<LoginResult>>>,
     phase: AuthPhase,
 }
 
 enum AuthPhase {
-    /// Collecting username + password.
     Credentials,
-    /// Waiting for a TOTP code. `session` is `None` while the verification task owns it.
     TwoFactor {
         session: Option<ProtonAPISession>,
         password: String,
         totp_code: String,
-        totp_task: Option<AsyncTask<anyhow::Result<ProtonAPISession>>>,
+        totp_task: Option<Promise<anyhow::Result<ProtonAPISession>>>,
         error: Option<String>,
     },
 }
@@ -45,14 +42,14 @@ impl AuthScreen {
         }
     }
 
-    fn begin_login(&mut self, rt: &tokio::runtime::Handle) {
+    fn begin_login(&mut self) {
         self.error = None;
         let username = self.username.clone();
         let password = self.password.clone();
 
         tracing::info!(username = %username, "starting authentication");
 
-        self.login_task = Some(AsyncTask::spawn(rt, async move {
+        self.login_task = Some(Promise::spawn_async(async move {
             let session = ProtonAPISession::begin(
                 username,
                 &password,
@@ -71,32 +68,25 @@ impl AuthScreen {
         }));
     }
 
-    fn is_busy(&self) -> bool {
-        self.login_task.is_some()
-    }
-
-    /// Renders the auth UI. Returns `Some(session)` once fully authenticated.
-    pub fn ui(&mut self, ui: &mut egui::Ui, rt: &tokio::runtime::Handle) -> Option<ProtonAPISession> {
+    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<ProtonAPISession> {
         match &mut self.phase {
-            AuthPhase::Credentials => self.credentials_ui(ui, rt),
-            AuthPhase::TwoFactor { .. } => self.two_factor_ui(ui, rt),
+            AuthPhase::Credentials => self.credentials_ui(ui),
+            AuthPhase::TwoFactor { .. } => self.two_factor_ui(ui),
         }
     }
 
-    fn credentials_ui(&mut self, ui: &mut egui::Ui, rt: &tokio::runtime::Handle) -> Option<ProtonAPISession> {
-        // Poll the login task
+    fn credentials_ui(&mut self, ui: &mut egui::Ui) -> Option<ProtonAPISession> {
         if let Some(task) = &mut self.login_task {
-            if let Some(result) = task.poll() {
-                self.login_task = None;
+            if let Some(result) = task.ready() {
                 match result {
                     Ok(LoginResult::Ready(session)) => {
                         persist(&session);
-                        return Some(session);
+                        return Some(session.clone());
                     }
                     Ok(LoginResult::Needs2FA(session, password)) => {
                         self.phase = AuthPhase::TwoFactor {
-                            session: Some(session),
-                            password,
+                            session: Some(session.clone()),
+                            password: password.to_string(),
                             totp_code: String::new(),
                             totp_task: None,
                             error: None,
@@ -121,7 +111,9 @@ impl AuthScreen {
             ui.add_sized([300.0, 28.0], egui::TextEdit::singleline(&mut self.password).hint_text("Password").password(true));
             ui.add_space(12.0);
 
-            if self.is_busy() {
+            let is_loading = self.login_task.as_ref().is_some_and(|t| t.ready().is_none());
+
+            if is_loading {
                 ui.spinner();
                 ui.label("Authenticating…");
                 ui.ctx().request_repaint();
@@ -129,10 +121,10 @@ impl AuthScreen {
                 let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let sign_in = ui.add_sized([300.0, 32.0], egui::Button::new("Sign in")).clicked();
                 if (sign_in || enter_pressed) && !self.username.is_empty() && !self.password.is_empty() {
-                    self.begin_login(rt);
+                    self.begin_login();
                 }
             }
-
+            
             if let Some(err) = &self.error {
                 ui.add_space(8.0);
                 ui.colored_label(egui::Color32::RED, err);
@@ -142,7 +134,7 @@ impl AuthScreen {
         None
     }
 
-    fn two_factor_ui(&mut self, ui: &mut egui::Ui, rt: &tokio::runtime::Handle) -> Option<ProtonAPISession> {
+    fn two_factor_ui(&mut self, ui: &mut egui::Ui) -> Option<ProtonAPISession> {
         let AuthPhase::TwoFactor {
             session: _,
             password: _,
@@ -154,15 +146,13 @@ impl AuthScreen {
             return None;
         };
 
-        // Poll the 2FA verification task
         if let Some(task) = totp_task {
-            if let Some(result) = task.poll() {
-                *totp_task = None;
+            if let Some(result) = task.ready() {
                 match result {
                     Ok(completed_session) => {
                         tracing::info!(user = %completed_session.username, "2FA verified");
                         persist(&completed_session);
-                        return Some(completed_session);
+                        return Some(completed_session.clone());
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "2FA verification failed");
@@ -214,13 +204,12 @@ impl AuthScreen {
                 return None;
             };
 
-            // Take the session out — the async task will own it while running.
             if let Some(mut sess) = session.take() {
                 *error = None;
                 let code = totp_code.clone();
                 let pw = password.clone();
 
-                *totp_task = Some(AsyncTask::spawn(rt, async move {
+                *totp_task = Some(Promise::spawn_async(async move {
                     sess.apply_second_factor_code(code).await?;
                     sess.apply_data_password(&pw).await?;
                     Ok(sess)

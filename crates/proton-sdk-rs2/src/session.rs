@@ -20,6 +20,7 @@ use crate::{
 
 /// Stored the tokens and relavant information related to session management for any Proton-API
 /// based app.
+#[derive(Clone)]
 pub struct ProtonAPISession {
     /// The session id generated through [`proton_srp`].
     pub session_id: SessionId,

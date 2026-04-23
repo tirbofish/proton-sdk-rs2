@@ -38,6 +38,7 @@ pub struct ProtonClientOptions {
     pub bindings_language: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct ProtonClientConfiguration {
     /// Base URL used for the drive API.
     pub base_url: http::Uri,

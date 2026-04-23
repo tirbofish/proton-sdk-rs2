@@ -7,6 +7,7 @@ mod app;
 mod tray;
 mod transfer;
 mod flags;
+mod fs;
 
 #[tokio::main]
 async fn main() {

@@ -6,6 +6,7 @@ use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
 use crate::auth::DefaultAuthenticationApiClient;
+use crate::cache::InMemoryCacheRepository;
 use crate::keys::{DefaultKeysApiClient, KeysApiClient};
 use crate::secret::SessionSecretCache;
 use crate::ser::StoredCredentials;
@@ -151,14 +152,18 @@ impl ProtonAPISession {
     /// * `cred` – Credentials returned by a prior call to [`Self::to_stored_credentials`].
     /// * `app_version` – The current application version configuration, used to build the `x-pm-appversion`
     ///   header on every request.
-    /// * `secret_cache_repository` – Repository used to cache decrypted key material for the
-    ///   duration of the restored session.
+    /// * `options` – Proton client options
     pub fn from_stored_credentials(
         cred: StoredCredentials,
         app_version: AppVersionConfiguration,
-        secret_cache_repository: Arc<dyn CacheRepository>,
+        mut options: ProtonClientOptions,
     ) -> Self {
-        Self::resume(
+        let secret_cache = options
+            .secret_cache_repository
+            .take()
+            .unwrap_or_else(|| Arc::new(InMemoryCacheRepository::new()));
+
+        ProtonAPISession::resume_with_options(
             SessionId::new(cred.session_id().to_string()),
             cred.username(),
             UserId::new(cred.user_id().to_string()),
@@ -168,7 +173,8 @@ impl ProtonAPISession {
             cred.is_waiting_for_second_factor_code(),
             cred.password_mode(),
             app_version,
-            secret_cache_repository,
+            secret_cache,
+            options,
         )
     }
 

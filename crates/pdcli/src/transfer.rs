@@ -68,6 +68,23 @@ impl TransferTracker {
         self.inner.lock().unwrap().clone()
     }
 
+    pub fn mark_complete(&self, index: usize) {
+        if let Ok(mut entries) = self.inner.lock() {
+            if let Some(entry) = entries.get_mut(index) {
+                entry.bytes_transferred = entry.total_bytes;
+            }
+        }
+    }
+
+    pub fn mark_failed(&self, index: usize) {
+        if let Ok(mut entries) = self.inner.lock() {
+            // Remove failed entries so they don't linger.
+            if index < entries.len() {
+                entries.remove(index);
+            }
+        }
+    }
+
     pub fn remove_completed(&self) {
         self.inner.lock().unwrap().retain(|e| e.bytes_transferred < e.total_bytes);
     }

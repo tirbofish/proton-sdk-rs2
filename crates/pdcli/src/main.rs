@@ -8,6 +8,7 @@ mod tray;
 mod transfer;
 mod flags;
 mod fs;
+mod thumbnail;
 
 #[tokio::main]
 async fn main() {
@@ -17,6 +18,20 @@ async fn main() {
                 .unwrap_or_else(|_| "pdcli=info".into()),
         )
         .init();
+
+    // Unmount FUSE on panic.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        fs::force_unmount();
+        default_hook(info);
+    }));
+
+    // Unmount FUSE on SIGTERM / SIGINT / SIGHUP.
+    unsafe {
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::signal(sig, handle_signal as *const () as libc::sighandler_t);
+        }
+    }
 
     let native_options = eframe::NativeOptions::default();
 
@@ -34,4 +49,13 @@ async fn main() {
         }),
     )
     .unwrap();
+}
+
+extern "C" fn handle_signal(sig: libc::c_int) {
+    fs::force_unmount();
+    // Re-raise with default handler so the process exits with the correct code.
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
 }

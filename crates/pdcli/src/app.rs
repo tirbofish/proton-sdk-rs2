@@ -8,7 +8,7 @@ use proton_sdk_rs2::{
 
 use crate::{auth, credentials, flags, transfer::{TransferDirection, TransferTracker, format_bytes}, tray};
 
-enum AppState {
+pub(crate) enum AppState {
     Restoring(Promise<anyhow::Result<ProtonAPISession>>),
     Login(auth::AuthScreen),
     Authenticated(ProtonAPISession),
@@ -28,10 +28,11 @@ enum MenuPage {
 pub struct ProtonDrive {
     flags: flags::ClientFlags,
 
-    state: AppState,
+    pub(crate) state: AppState,
     active_page: MenuPage,
-    transfer_tracker: TransferTracker,
+    pub(crate) transfer_tracker: TransferTracker,
     _tray: Option<tray_icon::TrayIcon>,
+    pub(crate) fuse_session: Option<fuser::BackgroundSession>,
 }
 
 impl ProtonDrive {
@@ -81,6 +82,7 @@ impl ProtonDrive {
             active_page: MenuPage::Status,
             transfer_tracker: TransferTracker::new(),
             _tray: None,
+            fuse_session: None,  // ADD THIS
         }
     }
 
@@ -271,7 +273,23 @@ impl ProtonDrive {
                 }
                 MenuPage::Mount => {
                     ui.heading("Mount");
-                    ui.label("FUSE mount configuration will go here.");
+                    ui.separator();
+                    if self.fuse_session.is_some() {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("●").color(egui::Color32::from_rgb(100, 220, 130)));
+                            ui.label("FUSE filesystem mounted");
+                        });
+                        ui.add_space(8.0);
+                        let mount_path = dirs::home_dir()
+                            .map(|h| h.join("ProtonDrive").display().to_string())
+                            .unwrap_or_else(|| "~/ProtonDrive".into());
+                        ui.label(format!("Mount point: {}", mount_path));
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("●").color(egui::Color32::from_rgb(200, 80, 80)));
+                            ui.label("FUSE filesystem not mounted");
+                        });
+                    }
                 }
                 MenuPage::About => {
                     ui.heading("About");

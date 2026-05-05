@@ -83,7 +83,10 @@ impl Default for ProtonClientOptions {
 }
 
 impl ProtonClientConfiguration {
-    pub fn new(app_version: AppVersionConfiguration, options: ProtonClientOptions) -> anyhow::Result<Self> {
+    pub fn new(
+        app_version: AppVersionConfiguration,
+        options: ProtonClientOptions,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             base_url: options.base_url.unwrap_or(ProtonApiDefaults::base_url()),
             app_version,
@@ -234,8 +237,9 @@ impl ApiClient {
 
 impl ApiClientFactory for ApiClient {}
 
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord,
+)]
 #[repr(i32)]
 pub enum ProtonClientTlsPolicy {
     Strict = 0,

@@ -103,6 +103,7 @@ impl AuthScreen {
                 match result {
                     Ok(LoginResult::Ready(session)) => {
                         persist(&session);
+                        credentials::save_session_tokens_on_refresh(session);
                         return Some(session.clone());
                     }
                     Ok(LoginResult::Needs2FA(session, password)) => {
@@ -190,6 +191,7 @@ impl AuthScreen {
                     Ok(completed_session) => {
                         tracing::info!(user = %completed_session.username, "2FA verified");
                         persist(&completed_session);
+                        credentials::save_session_tokens_on_refresh(completed_session);
                         return Some(completed_session.clone());
                     }
                     Err(e) => {

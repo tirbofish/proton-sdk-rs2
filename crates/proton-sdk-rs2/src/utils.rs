@@ -1,6 +1,6 @@
-use std::fmt::{Display, Formatter};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::fmt::{Display, Formatter};
 
 /// Release channel for the application version.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -47,39 +47,39 @@ impl Display for ReleaseChannel {
 pub struct AppVersionConfiguration {
     /// Project name segments (e.g., "myapp", "swift_sdk").
     /// Will be normalized to lowercase with non-alphanumeric characters replaced by underscores.
-    /// 
+    ///
     /// The `android_sdk` in `external-drive-android_sdk@2.0.0-RC1+build.456`
     pub app_name: String,
     /// Major version number.
-    /// 
+    ///
     /// The `2` in `external-drive-android_sdk@2.0.0-RC1+build.456`
     pub major: u64,
     /// Minor version number.
-    /// 
+    ///
     /// The first `0` in `external-drive-android_sdk@2.0.0-RC1+build.456`
     pub minor: u64,
     /// Patch version number.
-    /// 
+    ///
     /// The second `0` in `external-drive-android_sdk@2.0.0-RC1+build.456`
     pub patch: u64,
     /// Optional build number (fourth version component).
-    /// 
+    ///
     /// The `789` in `external-drive-myapp@1.2.3.789-beta2`
     pub build_number: Option<u64>,
     /// Release channel (stable, beta, RC, alpha).
-    /// 
+    ///
     /// The `RC` in `external-drive-android_sdk@2.0.0-RC1+build.456`
     pub channel: Option<ReleaseChannel>,
     /// Optional numeric suffix for the channel (e.g., "1" in "beta1", "2.3" in "RC2.3").
-    /// 
+    ///
     /// The `1` in `external-drive-android_sdk@2.0.0-RC1+build.456`
     pub channel_suffix: Option<String>,
     /// Whether this is a development build.
-    /// 
+    ///
     /// The `dev` in `external-drive-myapp@1.0.0-dev`
     pub is_dev: bool,
     /// Optional build metadata (appears after `+`).
-    /// 
+    ///
     /// The `build.456` in `external-drive-android_sdk@2.0.0-RC1+build.456`
     pub build_metadata: Option<String>,
 }
@@ -218,10 +218,18 @@ impl AppVersionConfiguration {
 impl Display for AppVersionConfiguration {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let app_name = self.normalized_app_name();
-        let app_name = if app_name.is_empty() { "rust" } else { &app_name };
+        let app_name = if app_name.is_empty() {
+            "rust"
+        } else {
+            &app_name
+        };
 
         // Base: external-drive-{appname}@{major}.{minor}.{patch}
-        write!(f, "external-drive-{}@{}.{}.{}", app_name, self.major, self.minor, self.patch)?;
+        write!(
+            f,
+            "external-drive-{}@{}.{}.{}",
+            app_name, self.major, self.minor, self.patch
+        )?;
 
         // Optional build number (fourth component)
         if let Some(build_num) = self.build_number {
@@ -249,8 +257,6 @@ impl Display for AppVersionConfiguration {
         Ok(())
     }
 }
-
-
 
 /// If a type has a representation as a protobuf, it will convert to that type.
 pub trait AsProtobuf<To> {

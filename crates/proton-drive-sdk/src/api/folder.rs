@@ -147,11 +147,7 @@ impl FoldersApiClient for DefaultFoldersApiClient {
         let builder = self.client.get(url);
         let builder = self.add_auth_headers(builder).await?;
 
-        let resp: FolderChildrenResponse = builder
-            .send()
-            .await?
-            .json()
-            .await?;
+        let resp: FolderChildrenResponse = builder.send().await?.json().await?;
         resp.base.to_result()?;
         Ok(resp)
     }
@@ -167,7 +163,7 @@ impl FoldersApiClient for DefaultFoldersApiClient {
         let builder = self.client.post(url).json(&request);
         let builder = self.add_auth_headers(builder).await?;
         let response = builder.send().await?;
-        
+
         let text = response.text().await?;
         let res: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
             anyhow::anyhow!("Failed to decode response body: {}. Body: {}", e, text)
@@ -175,7 +171,10 @@ impl FoldersApiClient for DefaultFoldersApiClient {
 
         if let Some(code) = res.get("Code").and_then(|c| c.as_u64()) {
             if code != 1000 {
-                let error = res.get("Error").and_then(|e| e.as_str()).unwrap_or("Unknown error");
+                let error = res
+                    .get("Error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("Unknown error");
                 anyhow::bail!("API error: code {}, message: {}", code, error);
             }
         }

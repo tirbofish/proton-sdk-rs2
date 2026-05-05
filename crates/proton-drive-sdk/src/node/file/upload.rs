@@ -57,17 +57,16 @@ impl FileUploader {
             // Sequential implementation for now
         });
 
-        let mut writer =
-            RevisionOperations::open_for_writing(
-                &self.client,
-                draft,
-                release_blocks_action,
-                self.size,
-                self.last_modification_time,
-                self.additional_metadata.clone(),
-                self.media_info.clone(),
-            )
-            .await?;
+        let mut writer = RevisionOperations::open_for_writing(
+            &self.client,
+            draft,
+            release_blocks_action,
+            self.size,
+            self.last_modification_time,
+            self.additional_metadata.clone(),
+            self.media_info.clone(),
+        )
+        .await?;
 
         writer.upload_thumbnails(thumbnails).await?;
 

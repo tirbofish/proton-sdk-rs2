@@ -49,8 +49,8 @@ impl PgpPrivateKey {
 
     pub fn encrypt_session_key(&self, session_key: &PgpSessionKey) -> anyhow::Result<Vec<u8>> {
         let sk = session_key.to_rpgp_sk()?;
-        let encryptor = proton_rpgp::Encryptor::default()
-            .with_encryption_key(self.0.as_public_key());
+        let encryptor =
+            proton_rpgp::Encryptor::default().with_encryption_key(self.0.as_public_key());
         Ok(encryptor.encrypt_session_key(&sk)?)
     }
 

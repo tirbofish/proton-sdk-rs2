@@ -23,16 +23,16 @@
 //! - Keyring operations are blocking and are offloaded to a thread pool.
 
 use crate::cache::secret::DriveSecretCache;
+use crate::node::NodeUid;
 use crate::node::file::{DegradedFileSecrets, FileSecrets};
 use crate::node::folder::{DegradedFolderSecrets, FolderSecrets};
-use crate::node::NodeUid;
 use crate::pgp::PgpPrivateKey;
 use crate::share::ShareId;
 use crate::utils::PotentialObject;
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::sync::Arc;
-use parking_lot::Mutex;
 
 /// A [`DriveSecretCache`] implementation that stores secrets in the system keyring.
 ///
@@ -224,9 +224,8 @@ mod tests {
         println!("Initial get: {:?}", initial);
 
         // set
-        let set_result: anyhow::Result<()> = cache
-            .set_value(test_key.clone(), test_value.clone())
-            .await;
+        let set_result: anyhow::Result<()> =
+            cache.set_value(test_key.clone(), test_value.clone()).await;
         set_result.expect("Failed to set value in keyring");
         println!("Set value: {}", test_value);
 
@@ -235,6 +234,10 @@ mod tests {
         let final_get = final_get.expect("get_value should not error");
         println!("Final get: {:?}", final_get);
 
-        assert_eq!(final_get, Some(test_value), "Value should be retrievable after set");
+        assert_eq!(
+            final_get,
+            Some(test_value),
+            "Value should be retrievable after set"
+        );
     }
 }

@@ -24,7 +24,7 @@ pub trait CacheRepository: Send + Sync {
 /// key material (passphrases, session keys) will be missing and decryption will fail.
 ///
 /// For persistent sessions, use `SqliteCacheRepository` from `proton_drive_sdk::cache::sqlite` (it supports
-/// in memory as well). 
+/// in memory as well).
 pub struct InMemoryCacheRepository {
     entries: DashMap<String, String>,
     key_to_tags: DashMap<String, HashSet<String>>,

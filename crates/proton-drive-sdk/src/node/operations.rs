@@ -113,7 +113,11 @@ impl NodeOperations {
         use std::pin::Pin;
 
         type NodeFuture = Pin<
-            Box<dyn std::future::Future<Output = anyhow::Result<PotentialObject<Node, DegradedNode>>> + Send>,
+            Box<
+                dyn std::future::Future<
+                        Output = anyhow::Result<PotentialObject<Node, DegradedNode>>,
+                    > + Send,
+            >,
         >;
 
         const CONCURRENCY: usize = 8;
@@ -226,9 +230,12 @@ impl NodeOperations {
                 );
             }
 
-            let metadata_result =
-                crate::node::DtoToMetadataConverter::get_fresh_node_metadata(client, uid.clone(), None)
-                    .await?;
+            let metadata_result = crate::node::DtoToMetadataConverter::get_fresh_node_metadata(
+                client,
+                uid.clone(),
+                None,
+            )
+            .await?;
             let (node, node_and_secrets, _, origin_name_hash_digest) =
                 metadata_result.clone().result()?.deconstruct();
             let secrets = match node_and_secrets {
@@ -255,11 +262,12 @@ impl NodeOperations {
 
             let is_anonymous = secrets.passphrase_for_anonymous_move.is_some();
             let (encrypted_passphrase, passphrase_signature) = if is_anonymous {
-                let (passphrase, sig, _) = crate::node::crypto::NodeCrypto::encrypt_and_sign_passphrase(
-                    &secrets.passphrase_session_key.key,
-                    &destination_folder_secrets.base.key,
-                    &PgpPrivateKey(signing_key.clone()),
-                )?;
+                let (passphrase, sig, _) =
+                    crate::node::crypto::NodeCrypto::encrypt_and_sign_passphrase(
+                        &secrets.passphrase_session_key.key,
+                        &destination_folder_secrets.base.key,
+                        &PgpPrivateKey(signing_key.clone()),
+                    )?;
                 (passphrase, sig)
             } else {
                 let passphrase = crate::node::crypto::NodeCrypto::reencrypt_passphrase(
@@ -308,18 +316,24 @@ impl NodeOperations {
         // Update cache for each moved node
         for item in request.batch {
             let uid = NodeUid::new(new_parent_uid.volume_id.clone(), item.link_id);
-            if let Some(mut cached_info) = client.cache().entities().try_get_node(uid.clone()).await? {
+            if let Some(mut cached_info) =
+                client.cache().entities().try_get_node(uid.clone()).await?
+            {
                 if let PotentialObject::Node(ref mut node) = cached_info.node_provision_result {
                     node.set_parent_uid(Some(new_parent_uid.clone()));
                     // Note: name might have changed if we supported new_name in move_multiple,
                     // but currently we don't.
                 }
-                client.cache().entities().set_node(
-                    uid,
-                    cached_info.node_provision_result,
-                    cached_info.membership_share_id,
-                    item.name_hash_digest,
-                ).await?;
+                client
+                    .cache()
+                    .entities()
+                    .set_node(
+                        uid,
+                        cached_info.node_provision_result,
+                        cached_info.membership_share_id,
+                        item.name_hash_digest,
+                    )
+                    .await?;
             }
         }
 
@@ -372,7 +386,11 @@ impl NodeOperations {
             Node::Album(f) => f.base.name.clone(),
         });
 
-        log::debug!("Moving node: name={}, original_hash={}", name_to_use, hex::encode(&origin_name_hash_digest));
+        log::debug!(
+            "Moving node: name={}, original_hash={}",
+            name_to_use,
+            hex::encode(&origin_name_hash_digest)
+        );
 
         let encrypted_name = crate::node::crypto::NodeCrypto::encrypt_name(
             &name_to_use,
@@ -386,13 +404,19 @@ impl NodeOperations {
         let name_hash_digest = hmac.finalize().into_bytes().to_vec();
 
         let is_anonymous = secrets.passphrase_for_anonymous_move.is_some();
-        let (encrypted_passphrase, passphrase_signature, signature_email_address) = if is_anonymous {
-            let (passphrase, sig, _) = crate::node::crypto::NodeCrypto::encrypt_and_sign_passphrase(
-                &secrets.passphrase_session_key.key,
-                &destination_folder_secrets.base.key,
-                &PgpPrivateKey(signing_key.clone()),
-            )?;
-            (passphrase, sig, Some(membership_address.email_address.clone()))
+        let (encrypted_passphrase, passphrase_signature, signature_email_address) = if is_anonymous
+        {
+            let (passphrase, sig, _) =
+                crate::node::crypto::NodeCrypto::encrypt_and_sign_passphrase(
+                    &secrets.passphrase_session_key.key,
+                    &destination_folder_secrets.base.key,
+                    &PgpPrivateKey(signing_key.clone()),
+                )?;
+            (
+                passphrase,
+                sig,
+                Some(membership_address.email_address.clone()),
+            )
         } else {
             let passphrase = crate::node::crypto::NodeCrypto::reencrypt_passphrase(
                 &secrets.passphrase_session_key.key,
@@ -418,11 +442,7 @@ impl NodeOperations {
         client
             .api()
             .links()
-            .move_link(
-                uid.volume_id.clone(),
-                uid.link_id.clone(),
-                request,
-            )
+            .move_link(uid.volume_id.clone(), uid.link_id.clone(), request)
             .await?;
 
         // Update cache
@@ -433,12 +453,16 @@ impl NodeOperations {
             node.set_name(name);
         }
 
-        client.cache().entities().set_node(
-            uid,
-            PotentialObject::Node(node),
-            membership_share_id,
-            name_hash_digest,
-        ).await?;
+        client
+            .cache()
+            .entities()
+            .set_node(
+                uid,
+                PotentialObject::Node(node),
+                membership_share_id,
+                name_hash_digest,
+            )
+            .await?;
 
         Ok(())
     }
@@ -493,13 +517,19 @@ impl NodeOperations {
         let name_hash_digest = Mac::finalize(hmac).into_bytes().to_vec();
 
         let is_anonymous = secrets.passphrase_for_anonymous_move.is_some();
-        let (encrypted_passphrase, passphrase_signature, signature_email_address) = if is_anonymous {
-            let (passphrase, sig, _) = crate::node::crypto::NodeCrypto::encrypt_and_sign_passphrase(
-                &secrets.passphrase_session_key.key,
-                &destination_folder_secrets.base.key,
-                &PgpPrivateKey(signing_key.clone()),
-            )?;
-            (passphrase, sig, Some(membership_address.email_address.clone()))
+        let (encrypted_passphrase, passphrase_signature, signature_email_address) = if is_anonymous
+        {
+            let (passphrase, sig, _) =
+                crate::node::crypto::NodeCrypto::encrypt_and_sign_passphrase(
+                    &secrets.passphrase_session_key.key,
+                    &destination_folder_secrets.base.key,
+                    &PgpPrivateKey(signing_key.clone()),
+                )?;
+            (
+                passphrase,
+                sig,
+                Some(membership_address.email_address.clone()),
+            )
         } else {
             let passphrase = crate::node::crypto::NodeCrypto::reencrypt_passphrase(
                 &secrets.passphrase_session_key.key,
@@ -524,11 +554,7 @@ impl NodeOperations {
         let response = client
             .api()
             .links()
-            .copy_link(
-                uid.volume_id.clone(),
-                uid.link_id.clone(),
-                request,
-            )
+            .copy_link(uid.volume_id.clone(), uid.link_id.clone(), request)
             .await?;
 
         Ok(response.link_id)
@@ -598,12 +624,16 @@ impl NodeOperations {
             if let PotentialObject::Node(ref mut node) = cached_info.node_provision_result {
                 node.set_name(new_name);
             }
-            client.cache().entities().set_node(
-                uid,
-                cached_info.node_provision_result,
-                cached_info.membership_share_id,
-                name_hash_digest,
-            ).await?;
+            client
+                .cache()
+                .entities()
+                .set_node(
+                    uid,
+                    cached_info.node_provision_result,
+                    cached_info.membership_share_id,
+                    name_hash_digest,
+                )
+                .await?;
         }
 
         Ok(())
@@ -914,7 +944,9 @@ impl NodeOperations {
             }
 
             let metadata = Self::get_node_metadata(client, current_uid.clone()).await?;
-            let result = metadata.result().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let result = metadata
+                .result()
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
             if let Some(share_id) = &result.membership_share_id {
                 let share_and_key = ShareOperations::get_share(client, share_id.clone()).await?;

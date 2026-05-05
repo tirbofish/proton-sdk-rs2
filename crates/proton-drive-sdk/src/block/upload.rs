@@ -53,8 +53,7 @@ impl BlockUploader {
             .with_encryption_key(draft.file_key.0.as_public_key())
             .with_signing_key(&draft.signing_key.0);
         let signature_result = signature_encryptor.encrypt(&signature)?;
-        let encrypted_signature =
-            PgpArmoredMessage(String::from_utf8(signature_result.armor()?)?);
+        let encrypted_signature = PgpArmoredMessage(String::from_utf8(signature_result.armor()?)?);
 
         // 3. Encrypt the content using the session key
         let sk = draft.content_key.to_rpgp_sk()?;
@@ -136,7 +135,11 @@ impl BlockUploader {
         client
             .api()
             .storage()
-            .upload_blob(&target.bare_url, &target.token, encrypted_block.encrypted_data.into())
+            .upload_blob(
+                &target.bare_url,
+                &target.token,
+                encrypted_block.encrypted_data.into(),
+            )
             .await?;
 
         Ok(BlockUploadResult {

@@ -24,9 +24,9 @@ use proton_rpgp::AsPublicKeyRef;
 use proton_rpgp::DataEncoding;
 use proton_rpgp::Encryptor;
 use proton_rpgp::Signer;
+use proton_rpgp::pgp::ser::Serialize as _;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
-use proton_rpgp::pgp::ser::Serialize as _;
 use sha2::Digest;
 use sha2::Sha256;
 use std::sync::Arc;
@@ -217,14 +217,17 @@ impl RevisionOperations {
         )
         .await
         .context("Failed to get node metadata")?;
-        
+
         tracing::debug!("Getting secrets for node_uid={}", revision_uid.node_uid);
         let secrets =
             crate::node::file::FileOperations::get_secrets(client, revision_uid.node_uid.clone())
                 .await
                 .context("Failed to get file secrets")?;
 
-        tracing::debug!("Getting revision blocks for revision_id={}", revision_uid.revision_id.raw());
+        tracing::debug!(
+            "Getting revision blocks for revision_id={}",
+            revision_uid.revision_id.raw()
+        );
         let revision_response = client
             .api()
             .files()
@@ -293,7 +296,7 @@ impl RevisionWriter {
     /// Maximum number of blocks being uploaded concurrently.
     /// Matches the TypeScript SDK's MAX_UPLOADING_BLOCKS = 5.
     const MAX_CONCURRENT_UPLOADS: usize = 5;
-    
+
     /// Maximum number of pre-encrypted blocks buffered ahead of uploads.
     /// Matches the TypeScript SDK's MAX_BUFFERED_BLOCKS = 15.
     const MAX_BUFFERED_BLOCKS: usize = 15;
@@ -306,21 +309,25 @@ impl RevisionWriter {
     ) -> anyhow::Result<()> {
         use crate::block::upload::EncryptedBlock;
         use tokio::sync::mpsc;
-        
-        tracing::debug!(expected_size = self.expected_size, "Starting pipelined write");
-        
+
+        tracing::debug!(
+            expected_size = self.expected_size,
+            "Starting pipelined write"
+        );
+
         // Channel to buffer encrypted blocks between producer (encryption) and consumer (upload)
         let (tx, mut rx) = mpsc::channel::<(EncryptedBlock, i32)>(Self::MAX_BUFFERED_BLOCKS);
-        
+
         // Shared state for collecting results
         let uploaded_bytes = Arc::new(std::sync::atomic::AtomicI64::new(0));
-        let block_results: Arc<Mutex<Vec<(i32, BlockUploadResult, i32)>>> = Arc::new(Mutex::new(Vec::new()));
-        
+        let block_results: Arc<Mutex<Vec<(i32, BlockUploadResult, i32)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+
         // Clone what we need for the producer task
         let client = self.client.clone();
         let draft = self.draft.clone();
         let target_block_size = self.target_block_size;
-        
+
         // Producer task: reads blocks, encrypts them, sends to channel
         // Returns (block_count, sha1_hash)
         let producer = tokio::spawn(async move {
@@ -345,14 +352,15 @@ impl RevisionWriter {
 
                 let block_data = buffer[..n].to_vec();
                 let block_size = n as i32;
-                
+
                 // Update SHA1 hash (sequential, in order)
                 sha1::Digest::update(&mut sha1_hasher, &block_data);
 
                 // Encrypt the block (CPU-bound work done in producer)
-                let encrypted_block = client
-                    .block_uploader()
-                    .encrypt_block(&draft, current_block, &block_data)?;
+                let encrypted_block =
+                    client
+                        .block_uploader()
+                        .encrypt_block(&draft, current_block, &block_data)?;
 
                 tracing::trace!(
                     block = current_block,
@@ -372,15 +380,17 @@ impl RevisionWriter {
 
             // Finalize the SHA1 hash
             let sha1_final: [u8; 20] = sha1::Digest::finalize(sha1_hasher).into();
-            
+
             tracing::debug!(blocks_encrypted = current_block - 1, "Producer finished");
             Ok::<(i32, [u8; 20]), anyhow::Error>((current_block - 1, sha1_final))
         });
-        
+
         // Consumer: receives encrypted blocks and uploads them in parallel
-        let mut upload_futures: FuturesUnordered<tokio::task::JoinHandle<anyhow::Result<(i32, BlockUploadResult, i32)>>> = FuturesUnordered::new();
+        let mut upload_futures: FuturesUnordered<
+            tokio::task::JoinHandle<anyhow::Result<(i32, BlockUploadResult, i32)>>,
+        > = FuturesUnordered::new();
         let mut producer_done = false;
-        
+
         loop {
             // Try to receive more encrypted blocks while we have upload capacity
             while !producer_done && upload_futures.len() < Self::MAX_CONCURRENT_UPLOADS {
@@ -388,7 +398,7 @@ impl RevisionWriter {
                     Ok((encrypted_block, block_size)) => {
                         let block_number = encrypted_block.block_number;
                         let plain_size = encrypted_block.plain_size;
-                        
+
                         // Spawn upload task
                         let client = self.client.clone();
                         let draft = self.draft.clone();
@@ -403,7 +413,8 @@ impl RevisionWriter {
                                 .await?;
 
                             // Update progress
-                            let new_total = uploaded_bytes.fetch_add(plain_size as i64, std::sync::atomic::Ordering::SeqCst) 
+                            let new_total = uploaded_bytes
+                                .fetch_add(plain_size as i64, std::sync::atomic::Ordering::SeqCst)
                                 + plain_size as i64;
                             on_progress(new_total, expected_size);
 
@@ -429,14 +440,14 @@ impl RevisionWriter {
                 // All done
                 break;
             }
-            
+
             if upload_futures.is_empty() {
                 // No uploads in progress, wait for producer to send a block
                 match rx.recv().await {
                     Some((encrypted_block, block_size)) => {
                         let block_number = encrypted_block.block_number;
                         let plain_size = encrypted_block.plain_size;
-                        
+
                         let client = self.client.clone();
                         let draft = self.draft.clone();
                         let on_progress = on_progress.clone();
@@ -448,7 +459,8 @@ impl RevisionWriter {
                                 .block_uploader()
                                 .upload_encrypted_block(&client, &draft, encrypted_block)
                                 .await?;
-                            let new_total = uploaded_bytes.fetch_add(plain_size as i64, std::sync::atomic::Ordering::SeqCst) 
+                            let new_total = uploaded_bytes
+                                .fetch_add(plain_size as i64, std::sync::atomic::Ordering::SeqCst)
                                 + plain_size as i64;
                             on_progress(new_total, expected_size);
                             Ok((block_number, result, block_size))
@@ -472,7 +484,7 @@ impl RevisionWriter {
                             Some((encrypted_block, block_size)) => {
                                 let block_number = encrypted_block.block_number;
                                 let plain_size = encrypted_block.plain_size;
-                                
+
                                 let client = self.client.clone();
                                 let draft = self.draft.clone();
                                 let on_progress = on_progress.clone();
@@ -484,7 +496,7 @@ impl RevisionWriter {
                                         .block_uploader()
                                         .upload_encrypted_block(&client, &draft, encrypted_block)
                                         .await?;
-                                    let new_total = uploaded_bytes.fetch_add(plain_size as i64, std::sync::atomic::Ordering::SeqCst) 
+                                    let new_total = uploaded_bytes.fetch_add(plain_size as i64, std::sync::atomic::Ordering::SeqCst)
                                         + plain_size as i64;
                                     on_progress(new_total, expected_size);
                                     Ok((block_number, result, block_size))
@@ -502,7 +514,7 @@ impl RevisionWriter {
 
         // Wait for producer to finish and check for errors
         let (blocks_encrypted, sha1_hash) = producer.await??;
-        
+
         // Store the precomputed SHA1 hash from the producer
         self.precomputed_sha1 = Some(sha1_hash);
 
@@ -581,12 +593,16 @@ impl RevisionWriter {
             .files()
             .prepare_block_upload(request)
             .await?;
-        
+
         if response.thumbnail_upload_targets.len() != encrypted_thumbnails.len() {
             anyhow::bail!("Mismatch in received thumbnail upload targets");
         }
 
-        for (target, (thumb_type, encrypted_data, hash_digest)) in response.thumbnail_upload_targets.iter().zip(encrypted_thumbnails) {
+        for (target, (thumb_type, encrypted_data, hash_digest)) in response
+            .thumbnail_upload_targets
+            .iter()
+            .zip(encrypted_thumbnails)
+        {
             tracing::info!(
                 thumbnail_type = ?thumb_type,
                 url = %target.base.bare_url,
@@ -622,7 +638,7 @@ impl RevisionWriter {
             "Committing revision"
         );
         let signer = Signer::default().with_signing_key(&self.draft.signing_key.0);
-        
+
         let mut manifest = Vec::with_capacity(self.thumbnail_digests.len() + self.digests.len());
         manifest.extend_from_slice(&self.thumbnail_digests);
         manifest.extend_from_slice(&self.digests);
@@ -640,7 +656,10 @@ impl RevisionWriter {
         let mut additional_metadata = std::collections::HashMap::new();
         if let Some(meta) = &self.additional_metadata {
             for prop in meta {
-                additional_metadata.insert(prop.key.clone(), serde_json::Value::String(prop.value.clone()));
+                additional_metadata.insert(
+                    prop.key.clone(),
+                    serde_json::Value::String(prop.value.clone()),
+                );
             }
         }
 
@@ -649,7 +668,9 @@ impl RevisionWriter {
                 size: Some(self.total_written),
                 modification_time: self.last_modification_time,
                 block_sizes: Some(self.block_sizes.clone()),
-                digests: Some(crate::api::file::FileContentDigestsDto { sha1: Some(sha1_digest) }),
+                digests: Some(crate::api::file::FileContentDigestsDto {
+                    sha1: Some(sha1_digest),
+                }),
             }),
             media: self.media_info.clone(),
             additional_metadata,

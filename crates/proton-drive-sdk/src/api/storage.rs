@@ -111,17 +111,22 @@ impl StorageApiClient for DefaultStorageApiClient {
                     // Treat any 2xx with a non-JSON body as success.
                     if body.trim().is_empty() || !body.trim_start().starts_with('{') {
                         if status.is_success() {
-                            return Ok(ApiResponse { code: crate::api::ResponseCode(1000), error_message: None });
+                            return Ok(ApiResponse {
+                                code: crate::api::ResponseCode(1000),
+                                error_message: None,
+                            });
                         } else {
                             last_err = Some(anyhow::anyhow!(
                                 "blob upload failed: status {}, body: {}",
-                                status, body
+                                status,
+                                body
                             ));
                             continue;
                         }
                     }
-                    return serde_json::from_str::<ApiResponse>(&body)
-                        .map_err(|e| anyhow::anyhow!("error decoding response body: {}. Body: {}", e, body));
+                    return serde_json::from_str::<ApiResponse>(&body).map_err(|e| {
+                        anyhow::anyhow!("error decoding response body: {}. Body: {}", e, body)
+                    });
                 }
                 Err(e) => {
                     // retry on network errors

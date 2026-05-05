@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock, Weak},
+};
 
 use http::Uri;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
@@ -18,17 +21,22 @@ use crate::{
 
 #[derive(Clone)]
 pub struct TokenCredential {
-    client: Arc<dyn AuthenticationApiClient>,
     session_id: SessionId,
     #[allow(dead_code)]
     access_token: String,
     #[allow(dead_code)]
     refresh_token: String,
-    tokens_task: Arc<RwLock<Arc<OnceCell<(String, String)>>>>,
+    state: Arc<TokenCredentialState>,
+}
 
+struct TokenCredentialState {
+    client: Arc<dyn AuthenticationApiClient>,
+    tokens_task: RwLock<Arc<OnceCell<(String, String)>>>,
     tokens_refreshed_tx: broadcast::Sender<(String, String)>,
     refresh_token_expired_tx: broadcast::Sender<()>,
 }
+
+static TOKEN_STATES: OnceLock<Mutex<HashMap<String, Weak<TokenCredentialState>>>> = OnceLock::new();
 
 impl TokenCredential {
     /// Creates a new `TokenCredential` seeded with the given access and refresh tokens.
@@ -39,18 +47,34 @@ impl TokenCredential {
         access_token: String,
         refresh_token: String,
     ) -> Self {
-        let tokens_task = OnceCell::new();
-        let _ = tokens_task.set((access_token.clone(), refresh_token.clone()));
+        let registry = TOKEN_STATES.get_or_init(|| Mutex::new(HashMap::new()));
+        let state = {
+            let mut registry = registry.lock().unwrap();
+            if let Some(state) = registry
+                .get(session_id.raw())
+                .and_then(|state| state.upgrade())
+            {
+                state
+            } else {
+                let tokens_task = OnceCell::new();
+                let _ = tokens_task.set((access_token.clone(), refresh_token.clone()));
 
-        let (tokens_refreshed_tx, _) = broadcast::channel(16);
-        let (refresh_token_expired_tx, _) = broadcast::channel(16);
+                let (tokens_refreshed_tx, _) = broadcast::channel(16);
+                let (refresh_token_expired_tx, _) = broadcast::channel(16);
+                let state = Arc::new(TokenCredentialState {
+                    client,
+                    tokens_task: RwLock::new(Arc::new(tokens_task)),
+                    tokens_refreshed_tx,
+                    refresh_token_expired_tx,
+                });
+                registry.insert(session_id.raw().clone(), Arc::downgrade(&state));
+                state
+            }
+        };
 
         Self {
-            client,
             session_id,
-            tokens_task: Arc::new(RwLock::new(Arc::new(tokens_task))),
-            tokens_refreshed_tx,
-            refresh_token_expired_tx,
+            state,
             access_token,
             refresh_token,
         }
@@ -58,7 +82,7 @@ impl TokenCredential {
 
     /// Returns the current valid (access, refresh) token pair, refreshing silently if needed.
     pub async fn get_tokens(&self) -> anyhow::Result<(String, String)> {
-        let task = self.tokens_task.read().await.clone();
+        let task = self.state.tokens_task.read().await.clone();
         let tokens = task
             .get()
             .ok_or_else(|| anyhow::anyhow!("Tokens not initialized"))?;
@@ -73,13 +97,13 @@ impl TokenCredential {
     /// Subscribes to a broadcast channel that fires whenever tokens are successfully refreshed.
     /// The sent value is the new (access, refresh) token pair.
     pub fn subscribe_tokens_refreshed(&self) -> broadcast::Receiver<(String, String)> {
-        self.tokens_refreshed_tx.subscribe()
+        self.state.tokens_refreshed_tx.subscribe()
     }
 
     /// Subscribes to a broadcast channel that fires when the refresh token is irrevocably expired.
     /// Callers should prompt for re-authentication on receipt.
     pub fn subscribe_refresh_token_expired(&self) -> broadcast::Receiver<()> {
-        self.refresh_token_expired_tx.subscribe()
+        self.state.refresh_token_expired_tx.subscribe()
     }
 
     /// Returns the session identifier associated with this credential.
@@ -104,12 +128,15 @@ impl TokenCredential {
     }
 
     fn trigger_tokens_refreshed(&self, access_token: String, refresh_token: String) {
-        let _ = self.tokens_refreshed_tx.send((access_token, refresh_token));
+        let _ = self
+            .state
+            .tokens_refreshed_tx
+            .send((access_token, refresh_token));
     }
 
     #[allow(dead_code)]
     fn trigger_refresh_token_expired(&self) {
-        let _ = self.refresh_token_expired_tx.send(());
+        let _ = self.state.refresh_token_expired_tx.send(());
     }
 
     /// Obtains a fresh access token, triggering a server-side refresh if the given
@@ -118,7 +145,7 @@ impl TokenCredential {
         &self,
         rejected_access_token: String,
     ) -> anyhow::Result<String> {
-        let current_tokens_task = self.tokens_task.read().await.clone();
+        let current_tokens_task = self.state.tokens_task.read().await.clone();
 
         let (current_access_token, current_refresh_token) = {
             let tokens = current_tokens_task
@@ -133,46 +160,42 @@ impl TokenCredential {
         }
 
         let refreshed_tokens_task = Arc::new(OnceCell::new());
-        let refreshed_task_clone = refreshed_tokens_task.clone();
-        let client = self.client.clone();
+        let mut tokens_task_guard = self.state.tokens_task.write().await;
+        let tokens_task_replaced = Arc::ptr_eq(&*tokens_task_guard, &current_tokens_task);
+
+        let selected_tokens_task = if tokens_task_replaced {
+            *tokens_task_guard = refreshed_tokens_task.clone();
+            refreshed_tokens_task
+        } else {
+            tokens_task_guard.clone()
+        };
+        drop(tokens_task_guard);
+
+        let client = self.state.client.clone();
         let session_id = self.session_id.clone();
         let current_access = current_access_token.clone();
         let current_refresh = current_refresh_token.clone();
 
-        let refresh_handle = tokio::spawn(async move {
-            let result = async {
-                let response = client
-                    .refresh_session(session_id, current_access.clone(), current_refresh.clone())
-                    .await?;
-                Ok::<_, anyhow::Error>((response.access_token, response.refresh_token))
-            }
-            .await;
-
-            match result {
-                Ok(tokens) => {
-                    let _ = refreshed_task_clone.set(tokens);
+        let (access_token, refresh_token) = selected_tokens_task
+            .get_or_init(|| async move {
+                let result = async {
+                    let response = client
+                        .refresh_session(
+                            session_id,
+                            current_access.clone(),
+                            current_refresh.clone(),
+                        )
+                        .await?;
+                    Ok::<_, anyhow::Error>((response.access_token, response.refresh_token))
                 }
-                Err(_) => {
-                    let _ = refreshed_task_clone.set((current_access, current_refresh));
+                .await;
+
+                match result {
+                    Ok(tokens) => tokens,
+                    Err(_) => (current_access, current_refresh),
                 }
-            }
-        });
-
-        let mut tokens_task_guard = self.tokens_task.write().await;
-        let tokens_task_replaced = Arc::ptr_eq(&*tokens_task_guard, &current_tokens_task);
-
-        if tokens_task_replaced {
-            *tokens_task_guard = refreshed_tokens_task.clone();
-        }
-        drop(tokens_task_guard);
-
-        refresh_handle
+            })
             .await
-            .map_err(|e| anyhow::anyhow!("Refresh task panicked: {}", e))?;
-
-        let (access_token, refresh_token) = refreshed_tokens_task
-            .get()
-            .ok_or_else(|| anyhow::anyhow!("Failed to get refreshed tokens"))?
             .clone();
 
         if tokens_task_replaced {

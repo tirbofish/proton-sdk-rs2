@@ -63,7 +63,9 @@ impl EventsApiClient for DefaultEventsApiClient {
     }
 
     async fn get_core_events(&self, event_id: &str) -> anyhow::Result<CoreEventsResponse> {
-        let url = self.base_url.join(&format!("/core/v5/events/{}", event_id))?;
+        let url = self
+            .base_url
+            .join(&format!("/core/v5/events/{}", event_id))?;
         let builder = self.client.get(url);
         let builder = self.add_auth_headers(builder).await?;
         let resp: CoreEventsResponse = builder.send().await?.json().await?;
@@ -72,7 +74,9 @@ impl EventsApiClient for DefaultEventsApiClient {
     }
 
     async fn get_volume_latest_event_id(&self, volume_id: VolumeId) -> anyhow::Result<String> {
-        let url = self.base_url.join(&format!("volumes/{}/events/latest", volume_id.raw()))?;
+        let url = self
+            .base_url
+            .join(&format!("volumes/{}/events/latest", volume_id.raw()))?;
         let builder = self.client.get(url);
         let builder = self.add_auth_headers(builder).await?;
         let resp: VolumeLatestEventResponse = builder.send().await?.json().await?;
@@ -85,7 +89,11 @@ impl EventsApiClient for DefaultEventsApiClient {
         volume_id: VolumeId,
         event_id: &str,
     ) -> anyhow::Result<VolumeEventsResponse> {
-        let url = self.base_url.join(&format!("v2/volumes/{}/events/{}", volume_id.raw(), event_id))?;
+        let url = self.base_url.join(&format!(
+            "v2/volumes/{}/events/{}",
+            volume_id.raw(),
+            event_id
+        ))?;
         let builder = self.client.get(url);
         let builder = self.add_auth_headers(builder).await?;
         let resp: VolumeEventsResponse = builder.send().await?.json().await?;
@@ -166,7 +174,7 @@ impl VolumeEventType {
             _ => None,
         }
     }
-    
+
     /// Check if this is any kind of update event
     pub fn is_update(&self) -> bool {
         matches!(self, Self::UpdateMetadata | Self::UpdateContent)

@@ -7,6 +7,7 @@ mod daemon;
 mod db;
 mod flags;
 mod fs;
+mod pdignore;
 mod thumbnail;
 mod transfer;
 mod tray;
@@ -24,7 +25,7 @@ async fn main() {
     flags.apply_flags();
     if flags.daemon {
         install_daemon_exit_hooks();
-        if let Err(e) = daemon::run(flags.force_offline).await {
+        if let Err(e) = daemon::run(flags.force_offline, !flags.no_tray).await {
             tracing::error!(error = %e, "pdcli daemon failed");
             std::process::exit(1);
         }
@@ -33,18 +34,10 @@ async fn main() {
 
     let native_options = eframe::NativeOptions::default();
 
-    let icon_path = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/icon.png"));
-    let create_tray = tray::init(&icon_path);
-
     eframe::run_native(
         "Proton Drive",
         native_options,
-        Box::new(move |_| {
-            let tray_handle = create_tray();
-            Ok(Box::new({
-                ProtonDrive::new().with_tray(tray_handle).handle_flags()
-            }))
-        }),
+        Box::new(move |_| Ok(Box::new(ProtonDrive::new().handle_flags()))),
     )
     .unwrap();
 }

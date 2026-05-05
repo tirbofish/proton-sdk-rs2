@@ -1,4 +1,3 @@
-use serde::{Deserialize, Serialize};
 use crate::account::AddressId;
 use crate::api::ApiResponse;
 use crate::api::block::verification::BlockVerificationOutput;
@@ -8,6 +7,7 @@ use crate::links::LinkId;
 use crate::pgp::PgpArmoredMessage;
 use crate::revision::RevisionId;
 use crate::volume::VolumeId;
+use serde::{Deserialize, Serialize};
 
 pub mod verification;
 

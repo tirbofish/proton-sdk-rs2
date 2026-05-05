@@ -165,6 +165,23 @@ impl FuseDb {
         .unwrap_or_default()
     }
 
+    pub fn cached_file_inodes(&self) -> Vec<(u64, String)> {
+        (|| -> rusqlite::Result<Vec<(u64, String)>> {
+            let mut stmt = self.conn.prepare_cached(
+                "SELECT ino, cached_path
+                 FROM inodes
+                 WHERE is_dir = 0 AND cached_path IS NOT NULL",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let ino: i64 = row.get(0)?;
+                let cached_path: String = row.get(1)?;
+                Ok((ino as u64, cached_path))
+            })?;
+            rows.collect()
+        })()
+        .unwrap_or_default()
+    }
+
     /// Insert a new inode (auto-increment ino). Returns the allocated ino.
     pub fn insert_inode(
         &self,
@@ -295,6 +312,24 @@ impl FuseDb {
         self.lookup_child(1, "MyFiles")
     }
 
+    pub fn inode_path(&self, ino: u64) -> Option<Vec<InodeRow>> {
+        let mut rows = Vec::new();
+        let mut current = self.get_inode(ino)?;
+
+        loop {
+            let parent_ino = current.parent_ino;
+            let current_ino = current.ino;
+            rows.push(current);
+            if current_ino == 1 || current_ino == parent_ino {
+                break;
+            }
+            current = self.get_inode(parent_ino)?;
+        }
+
+        rows.reverse();
+        Some(rows)
+    }
+
     pub fn update_node_uid(
         &self,
         ino: u64,
@@ -361,6 +396,45 @@ impl FuseDb {
         self.conn.execute(
             "UPDATE inodes SET size = ?, mtime = ? WHERE ino = ?",
             params![size as i64, now, ino as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_size_only(&self, ino: u64, size: u64) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE inodes SET size = ? WHERE ino = ?",
+            params![size as i64, ino as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_remote_metadata(
+        &self,
+        ino: u64,
+        size: u64,
+        media_type: &str,
+        revision_uid: Option<&str>,
+        mtime: i64,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE inodes
+             SET size = ?,
+                 media_type = ?,
+                 cached_path = CASE
+                     WHEN revision_uid IS NOT ? THEN NULL
+                     ELSE cached_path
+                 END,
+                 revision_uid = ?,
+                 mtime = ?
+             WHERE ino = ?",
+            params![
+                size as i64,
+                media_type,
+                revision_uid,
+                revision_uid,
+                mtime,
+                ino as i64
+            ],
         )?;
         Ok(())
     }

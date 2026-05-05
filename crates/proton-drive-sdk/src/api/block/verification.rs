@@ -1,11 +1,11 @@
-use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use reqwest_middleware::ClientWithMiddleware;
-use reqwest::Url;
-use proton_sdk_rs2::auth::TokenCredential;
 use crate::links::LinkId;
 use crate::revision::RevisionId;
 use crate::volume::VolumeId;
+use async_trait::async_trait;
+use proton_sdk_rs2::auth::TokenCredential;
+use reqwest::Url;
+use reqwest_middleware::ClientWithMiddleware;
+use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -84,5 +84,5 @@ impl BlockVerificationApiClient for DefaultBlockVerificationApiClient {
             .await?;
 
         Ok(response)
-        }
-        }
+    }
+}

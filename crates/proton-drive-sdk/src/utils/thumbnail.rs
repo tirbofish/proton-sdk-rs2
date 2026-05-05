@@ -1,7 +1,7 @@
+use crate::api::attr::MediaExtendedAttributes;
+use crate::node::thumbnail::{Thumbnail, ThumbnailType};
 use image::GenericImageView;
 use std::io::Cursor;
-use crate::node::thumbnail::{Thumbnail, ThumbnailType};
-use crate::api::attr::MediaExtendedAttributes;
 
 pub struct ThumbnailGenerator;
 
@@ -33,11 +33,18 @@ impl ThumbnailGenerator {
         (thumbnails, media_info)
     }
 
-    fn generate_thumbnail(img: &image::DynamicImage, size: u32, r#type: ThumbnailType) -> Option<Thumbnail> {
+    fn generate_thumbnail(
+        img: &image::DynamicImage,
+        size: u32,
+        r#type: ThumbnailType,
+    ) -> Option<Thumbnail> {
         let thumb = img.thumbnail(size, size);
         let mut buffer = Cursor::new(Vec::new());
         // Use JPEG for thumbnails to keep size small
-        if thumb.write_to(&mut buffer, image::ImageFormat::Jpeg).is_ok() {
+        if thumb
+            .write_to(&mut buffer, image::ImageFormat::Jpeg)
+            .is_ok()
+        {
             Some(Thumbnail {
                 r#type,
                 content: buffer.into_inner(),

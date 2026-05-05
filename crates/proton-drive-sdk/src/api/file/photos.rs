@@ -17,8 +17,8 @@ use crate::api::trash::{DefaultTrashApiClient, TrashApiClient};
 use crate::api::volumes::{DefaultVolumesApiClient, VolumeCreationResponse, VolumesApiClient};
 use crate::api::{AggregateApiResponse, ApiResponse, DriveApiClients};
 use crate::links::LinkId;
-use crate::node::photo::PhotoTag;
 use crate::node::NodeUid;
+use crate::node::photo::PhotoTag;
 use crate::pgp::{PgpArmoredMessage, PgpArmoredPrivateKey, PgpArmoredSignature};
 use crate::volume::VolumeId;
 use async_trait::async_trait;
@@ -618,7 +618,11 @@ impl PhotosApiClient for DefaultPhotosApiClient {
             .post(url)
             .json(&CheckDuplicatesRequest { name_hashes });
         let builder = self.add_auth_headers(builder).await?;
-        Ok(builder.send().await?.json::<CheckDuplicatesResponse>().await?)
+        Ok(builder
+            .send()
+            .await?
+            .json::<CheckDuplicatesResponse>()
+            .await?)
     }
 
     async fn get_albums(
@@ -660,7 +664,11 @@ impl PhotosApiClient for DefaultPhotosApiClient {
         };
         let url = self.base_url.join(&path)?;
         let builder = self.add_auth_headers(self.client.get(url)).await?;
-        Ok(builder.send().await?.json::<AlbumChildrenResponse>().await?)
+        Ok(builder
+            .send()
+            .await?
+            .json::<AlbumChildrenResponse>()
+            .await?)
     }
 
     async fn create_album(
@@ -671,8 +679,14 @@ impl PhotosApiClient for DefaultPhotosApiClient {
         let url = self
             .base_url
             .join(&format!("photos/volumes/{}/albums", volume_id.raw()))?;
-        let builder = self.add_auth_headers(self.client.post(url).json(&request)).await?;
-        Ok(builder.send().await?.json::<AlbumCreationResponse>().await?)
+        let builder = self
+            .add_auth_headers(self.client.post(url).json(&request))
+            .await?;
+        Ok(builder
+            .send()
+            .await?
+            .json::<AlbumCreationResponse>()
+            .await?)
     }
 
     async fn update_album(
@@ -686,7 +700,9 @@ impl PhotosApiClient for DefaultPhotosApiClient {
             volume_id.raw(),
             album_link_id.raw()
         ))?;
-        let builder = self.add_auth_headers(self.client.put(url).json(&request)).await?;
+        let builder = self
+            .add_auth_headers(self.client.put(url).json(&request))
+            .await?;
         builder.send().await?;
         Ok(())
     }
@@ -719,8 +735,14 @@ impl PhotosApiClient for DefaultPhotosApiClient {
             volume_id.raw(),
             album_link_id.raw()
         ))?;
-        let builder = self.add_auth_headers(self.client.post(url).json(&request)).await?;
-        Ok(builder.send().await?.json::<AddPhotosToAlbumResponse>().await?)
+        let builder = self
+            .add_auth_headers(self.client.post(url).json(&request))
+            .await?;
+        Ok(builder
+            .send()
+            .await?
+            .json::<AddPhotosToAlbumResponse>()
+            .await?)
     }
 
     async fn remove_photos_from_album(
@@ -735,7 +757,9 @@ impl PhotosApiClient for DefaultPhotosApiClient {
             album_link_id.raw()
         ))?;
         let request = RemovePhotosFromAlbumRequest { link_ids };
-        let builder = self.add_auth_headers(self.client.post(url).json(&request)).await?;
+        let builder = self
+            .add_auth_headers(self.client.post(url).json(&request))
+            .await?;
         builder.send().await?;
         Ok(())
     }

@@ -44,12 +44,20 @@ impl FileDownloader {
             )
             .await
             .map_err(|e| {
-                tracing::error!("Failed to create download state for {}: {:?}", revision_uid, e);
+                tracing::error!(
+                    "Failed to create download state for {}: {:?}",
+                    revision_uid,
+                    e
+                );
                 e
             })?;
 
             let num_blocks = download_state.revision_dto.blocks.len();
-            tracing::debug!("Download state created: {} blocks, size={}", num_blocks, download_state.revision_dto.revision.size);
+            tracing::debug!(
+                "Download state created: {} blocks, size={}",
+                num_blocks,
+                download_state.revision_dto.revision.size
+            );
 
             let download_state = Arc::new(download_state);
             let reader = RevisionOperations::open_for_reading(
@@ -64,10 +72,10 @@ impl FileDownloader {
                     on_progress(downloaded, total);
                 })
                 .await?;
-            
+
             // Ensure all buffered data is flushed before returning
             content_output_stream.flush()?;
-            
+
             Ok(())
         });
 

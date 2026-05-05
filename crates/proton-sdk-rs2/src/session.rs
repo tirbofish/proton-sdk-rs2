@@ -114,7 +114,10 @@ impl ProtonAPISession {
         let mut default_headers = HeaderMap::new();
 
         let app_version = config.app_version.to_string();
-        log::debug!("Generated x-pm-appversion header for session: {}", app_version);
+        log::debug!(
+            "Generated x-pm-appversion header for session: {}",
+            app_version
+        );
         default_headers.insert("x-pm-appversion", HeaderValue::from_str(&app_version)?);
 
         if let Some((session_id, access_token)) = auth {
@@ -198,9 +201,26 @@ impl ProtonAPISession {
         )
     }
 
-    /// Initialises a new session. 
-    /// 
-    /// It is recommended to store the results of this session. 
+    /// Serializes the current session state using the latest token pair known to the credential.
+    pub async fn to_stored_credentials_with_latest_tokens(
+        &self,
+    ) -> anyhow::Result<StoredCredentials> {
+        let (access_token, refresh_token) = self.token_credential.get_tokens().await?;
+        Ok(StoredCredentials::new(
+            self.session_id.raw().clone(),
+            self.username.clone(),
+            self.user_id.raw().clone(),
+            access_token,
+            refresh_token,
+            self.scopes.clone(),
+            self.is_waiting_for_second_factor_code,
+            self.password_mode,
+        ))
+    }
+
+    /// Initialises a new session.
+    ///
+    /// It is recommended to store the results of this session.
     pub async fn begin(
         username: impl Into<String>,
         password: &str,
@@ -403,7 +423,7 @@ impl ProtonAPISession {
         Ok(())
     }
 
-    /// Applies the second factor code by sending a request to `auth/v4/2fa`. 
+    /// Applies the second factor code by sending a request to `auth/v4/2fa`.
     pub async fn apply_second_factor_code(
         &mut self,
         second_factor_code: String,
@@ -418,9 +438,9 @@ impl ProtonAPISession {
         Ok(())
     }
 
-    /// Apply the data password. 
-    /// 
-    /// This function unlocks the key salts required. 
+    /// Apply the data password.
+    ///
+    /// This function unlocks the key salts required.
     pub async fn apply_data_password(&mut self, password: &str) -> anyhow::Result<()> {
         let response = self.keys_api()?.get_key_salts().await?;
 
@@ -445,7 +465,7 @@ impl ProtonAPISession {
         Ok(())
     }
 
-    /// Refreshes scopes, typically used during reauthentication. 
+    /// Refreshes scopes, typically used during reauthentication.
     pub async fn refresh_scopes(&mut self) -> anyhow::Result<()> {
         let auth_api_client = Self::create_authentication_api_client(&self.client_config)?;
         let scopes_response = auth_api_client.get_scopes().await?;
@@ -453,8 +473,8 @@ impl ProtonAPISession {
         Ok(())
     }
 
-    /// Ensures authentication by sending a request to `/auth/v4/scopes` and 
-    /// verifying the response to be 200, or to refresh tokens and restart `http_client`. 
+    /// Ensures authentication by sending a request to `/auth/v4/scopes` and
+    /// verifying the response to be 200, or to refresh tokens and restart `http_client`.
     pub async fn ensure_authenticated(&mut self) -> anyhow::Result<()> {
         let (probe_access_token, _) = self.token_credential.get_tokens().await?;
         let probe = Self::create_http_client(
@@ -500,7 +520,9 @@ impl ProtonAPISession {
             .await?;
 
         if refreshed_access_token == access_token {
-            anyhow::bail!("Session expired: access token could not be refreshed. Please re-authenticate.");
+            anyhow::bail!(
+                "Session expired: access token could not be refreshed. Please re-authenticate."
+            );
         }
 
         self.http_client = Self::create_http_client(
@@ -526,7 +548,7 @@ impl ProtonAPISession {
         Ok(true)
     }
 
-    /// Creates a new http client or takes the http client from self. 
+    /// Creates a new http client or takes the http client from self.
     pub fn get_http_client(
         &self,
         base_route_path: Option<String>,
@@ -545,7 +567,7 @@ impl ProtonAPISession {
         }
     }
 
-    /// Utility function for deriving secrets from a password+salt. 
+    /// Utility function for deriving secrets from a password+salt.
     pub fn derive_secret_from_password(password: &str, salt: &[u8]) -> anyhow::Result<Vec<u8>> {
         let hash = proton_srp::mailbox_password_hash(password, salt)?;
         Ok(hash.as_bytes()[29..].to_vec())
@@ -558,7 +580,7 @@ impl ProtonAPISession {
 }
 
 impl ProtonAPISession {
-    /// Returns a lazily-initialised client for the Proton Keys API (`/keys`). 
+    /// Returns a lazily-initialised client for the Proton Keys API (`/keys`).
     /// The client is cached on the session after the first call.
     pub fn keys_api(&mut self) -> anyhow::Result<Arc<dyn KeysApiClient>> {
         if let Some(api) = self.keys_api.as_ref() {
@@ -575,7 +597,7 @@ impl ProtonAPISession {
         }
     }
 
-    /// Returns a lazily-initialised client for the Proton Authentication API (`/auth`). 
+    /// Returns a lazily-initialised client for the Proton Authentication API (`/auth`).
     /// The client is cached on the session after the first call.
     pub fn authentication_api(&mut self) -> anyhow::Result<Arc<dyn AuthenticationApiClient>> {
         if let Some(api) = self.authentication_api.as_ref() {

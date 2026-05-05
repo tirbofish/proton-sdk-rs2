@@ -146,7 +146,6 @@ pub trait DevicesApiClient: Send + Sync {
     async fn clear_device_share_name(&self, device_id: &str) -> anyhow::Result<()>;
 }
 
-
 pub struct DefaultDevicesApiClient {
     client: ClientWithMiddleware,
     base_url: reqwest::Url,
@@ -159,7 +158,11 @@ impl DefaultDevicesApiClient {
         base_url: reqwest::Url,
         token_credential: Option<TokenCredential>,
     ) -> Self {
-        Self { client, base_url, token_credential }
+        Self {
+            client,
+            base_url,
+            token_credential,
+        }
     }
 
     async fn add_auth(
@@ -223,7 +226,6 @@ impl DevicesApiClient for DefaultDevicesApiClient {
     }
 }
 
-
 /// Parsed metadata for a device as returned by the API (name still encrypted).
 #[derive(Debug, Clone)]
 pub struct RawDeviceInfo {
@@ -255,9 +257,10 @@ impl TryFrom<DeviceListEntry> for RawDeviceInfo {
                 .timestamp_opt(e.device.create_time, 0)
                 .single()
                 .ok_or_else(|| anyhow::anyhow!("Invalid create_time"))?,
-            last_sync_time: e.device.last_sync_time.and_then(|t| {
-                Utc.timestamp_opt(t, 0).single()
-            }),
+            last_sync_time: e
+                .device
+                .last_sync_time
+                .and_then(|t| Utc.timestamp_opt(t, 0).single()),
             has_deprecated_name: e.share.name.map(|n| !n.is_empty()).unwrap_or(false),
         })
     }

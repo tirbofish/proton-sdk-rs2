@@ -8,9 +8,8 @@ use proton_sdk_rs2::{
 };
 
 use crate::{
-    auth, credentials, daemon, flags,
+    auth, credentials, daemon, flags, pdignore,
     transfer::{TransferDirection, TransferTracker, format_bytes},
-    tray,
 };
 
 pub(crate) enum AppState {
@@ -36,11 +35,11 @@ pub struct ProtonDrive {
     pub(crate) state: AppState,
     active_page: MenuPage,
     pub(crate) transfer_tracker: TransferTracker,
-    _tray: Option<tray_icon::TrayIcon>,
     pub(crate) fuse_session: Option<fuser::BackgroundSession>,
     daemon_started: bool,
-    window_hidden: bool,
-    allow_quit: bool,
+    daemon_error: Option<String>,
+    pdignore_text: String,
+    pdignore_status: Option<String>,
 }
 
 impl ProtonDrive {
@@ -80,6 +79,9 @@ impl ProtonDrive {
                     if !force_offline {
                         session.ensure_authenticated().await?;
                     }
+                    if let Ok(cred) = session.to_stored_credentials_with_latest_tokens().await {
+                        crate::credentials::save(&cred).ok();
+                    }
                     Ok(session)
                 });
                 AppState::Restoring(task)
@@ -90,22 +92,23 @@ impl ProtonDrive {
             }
         };
 
+        let active_page = flags
+            .page
+            .as_deref()
+            .and_then(MenuPage::from_flag)
+            .unwrap_or(MenuPage::Status);
+
         Self {
             state,
             flags,
-            active_page: MenuPage::Status,
+            active_page,
             transfer_tracker: TransferTracker::new(),
-            _tray: None,
             fuse_session: None,
             daemon_started: false,
-            window_hidden: false,
-            allow_quit: false,
+            daemon_error: None,
+            pdignore_text: pdignore::load_global_text(),
+            pdignore_status: None,
         }
-    }
-
-    pub fn with_tray(mut self, tray: Option<tray_icon::TrayIcon>) -> Self {
-        self._tray = tray;
-        self
     }
 
     pub fn handle_flags(self) -> Self {
@@ -115,19 +118,6 @@ impl ProtonDrive {
 
 impl eframe::App for ProtonDrive {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if ui.ctx().input(|i| i.viewport().close_requested()) && !self.allow_quit {
-            self.window_hidden = true;
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-        }
-
-        for action in tray::poll_events() {
-            self.handle_tray_action(action, ui.ctx());
-        }
-        tray::update_state(self._tray.as_ref(), self.tray_state());
-
         egui::CentralPanel::default().show_inside(ui, |ui| match &mut self.state {
             AppState::Restoring(task) => {
                 ui.vertical_centered(|ui| {
@@ -141,6 +131,7 @@ impl eframe::App for ProtonDrive {
                     match result {
                         Ok(session) => {
                             tracing::info!(user = %session.username, "session restored");
+                            credentials::save_session_tokens_on_refresh(session);
                             self.state = AppState::Authenticated(session.clone());
                         }
                         Err(e) => {
@@ -181,79 +172,44 @@ impl eframe::App for ProtonDrive {
     }
 }
 
+impl MenuPage {
+    fn from_flag(value: &str) -> Option<Self> {
+        match value {
+            "status" => Some(Self::Status),
+            "computers" => Some(Self::Computers),
+            "mount" => Some(Self::Mount),
+            "about" => Some(Self::About),
+            "account" => Some(Self::Account),
+            "settings" => Some(Self::Settings),
+            _ => None,
+        }
+    }
+}
+
 impl ProtonDrive {
-    fn tray_state(&self) -> tray::TrayState {
-        match &self.state {
-            AppState::Restoring(_) => tray::TrayState::Restoring,
-            AppState::Login(_) => tray::TrayState::SignedOut,
-            AppState::Error(_) => tray::TrayState::Error,
-            AppState::Authenticated(_) => match daemon::status() {
-                Some(daemon::DaemonStatus::Paused) => tray::TrayState::Paused,
-                Some(daemon::DaemonStatus::Offline) => tray::TrayState::Offline,
-                Some(daemon::DaemonStatus::Online) => {
-                    if !self.transfer_tracker.snapshot().is_empty() {
-                        tray::TrayState::Syncing
-                    } else {
-                        tray::TrayState::Online
-                    }
-                }
-                None => tray::TrayState::Offline,
-            },
+    fn ensure_daemon_running(&mut self) -> bool {
+        if daemon::is_running() {
+            self.daemon_started = true;
+            self.daemon_error = None;
+            return true;
         }
-    }
 
-    fn handle_tray_action(&mut self, action: tray::TrayAction, ctx: &egui::Context) {
-        match action {
-            tray::TrayAction::OpenFolder => {
-                if let Some(path) = dirs::home_dir().map(|h| h.join("ProtonDrive").join("MyFiles"))
-                {
-                    #[cfg(target_os = "macos")]
-                    let opener = "open";
-                    #[cfg(not(target_os = "macos"))]
-                    let opener = "xdg-open";
-                    let _ = std::process::Command::new(opener).arg(path).spawn();
-                }
-            }
-            tray::TrayAction::ShowHideWindow => {
-                self.window_hidden = !self.window_hidden;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(self.window_hidden));
-            }
-            tray::TrayAction::ToggleSyncPause => match daemon::request_toggle_pause() {
-                Ok(status) => tracing::info!(?status, "sync pause toggled from tray"),
-                Err(e) => tracing::warn!(error = %e, "failed to toggle daemon sync pause"),
-            },
-            tray::TrayAction::RetrySyncNow => match daemon::request_retry_sync_now() {
-                Ok(()) => tracing::info!("manual sync retry requested from tray"),
-                Err(e) => tracing::warn!(error = %e, "failed to request daemon sync retry"),
-            },
-            tray::TrayAction::Account => {
-                self.active_page = MenuPage::Account;
-                self.window_hidden = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            }
-            tray::TrayAction::SignOut => {
-                daemon::request_quit().ok();
-                self.daemon_started = false;
-                credentials::remove();
-                self.state = AppState::Login(auth::AuthScreen::new());
-            }
-            tray::TrayAction::Quit => {
-                daemon::request_quit().ok();
-                self.allow_quit = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        }
-    }
-
-    fn ensure_daemon_running(&mut self) {
         if self.daemon_started {
-            return;
+            return self.daemon_error.is_none();
         }
 
         self.daemon_started = true;
-        match daemon::ensure_running(self.flags.force_offline) {
-            Ok(()) => {}
-            Err(e) => tracing::warn!(error = %e, "failed to start pdcli daemon"),
+        match daemon::ensure_running(self.flags.force_offline, !self.flags.no_tray) {
+            Ok(()) => {
+                self.daemon_error = None;
+                true
+            }
+            Err(e) => {
+                let error = e.to_string();
+                tracing::warn!(error = %error, "failed to start pdcli daemon");
+                self.daemon_error = Some(error);
+                false
+            }
         }
     }
 
@@ -280,7 +236,6 @@ impl ProtonDrive {
                     ui.add_space(8.0);
                     if ui.button("Quit").clicked() {
                         daemon::request_quit().ok();
-                        self.allow_quit = true;
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                     Self::sidebar_button(ui, active_page, "Settings", MenuPage::Settings);
@@ -447,6 +402,18 @@ impl ProtonDrive {
                         );
                         ui.label("FUSE filesystem not mounted");
                     });
+                    ui.add_space(8.0);
+                    if ui.button("Mount Proton Drive").clicked() {
+                        self.daemon_started = false;
+                        self.ensure_daemon_running();
+                    }
+                    if let Some(error) = &self.daemon_error {
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(format!("Mount failed: {error}"))
+                                .color(ui.visuals().error_fg_color),
+                        );
+                    }
                 }
             }
             MenuPage::About => {
@@ -466,7 +433,46 @@ impl ProtonDrive {
             }
             MenuPage::Settings => {
                 ui.heading("Settings");
-                ui.label("Settings will go here.");
+                ui.separator();
+                ui.label("Global .pdignore");
+                ui.label(
+                    egui::RichText::new(pdignore::global_path().display().to_string())
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                );
+                ui.add_space(6.0);
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.pdignore_text)
+                        .desired_rows(18)
+                        .code_editor()
+                        .lock_focus(true)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        match pdignore::save_global_text(&self.pdignore_text) {
+                            Ok(()) => {
+                                self.pdignore_status = Some("Saved global .pdignore".into());
+                            }
+                            Err(e) => {
+                                self.pdignore_status = Some(format!("Save failed: {e}"));
+                            }
+                        }
+                    }
+                    if ui.button("Reset defaults").clicked() {
+                        self.pdignore_text = pdignore::DEFAULT_GLOBAL_PDIGNORE.to_string();
+                        self.pdignore_status = Some("Defaults loaded. Save to apply them.".into());
+                    }
+                    if ui.button("Reload").clicked() {
+                        self.pdignore_text = pdignore::load_global_text();
+                        self.pdignore_status = Some("Reloaded global .pdignore".into());
+                    }
+                });
+                if let Some(status) = &self.pdignore_status {
+                    ui.add_space(6.0);
+                    ui.label(status);
+                }
             }
         });
 
@@ -474,6 +480,7 @@ impl ProtonDrive {
             tracing::info!(user = %username, "user signed out");
             daemon::request_quit().ok();
             self.daemon_started = false;
+            self.daemon_error = None;
             credentials::remove();
             self.state = AppState::Login(auth::AuthScreen::new());
         }

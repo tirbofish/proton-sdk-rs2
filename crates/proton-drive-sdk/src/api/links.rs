@@ -181,7 +181,7 @@ impl LinksApiClient for DefaultLinksApiClient {
         let url = self
             .base_url
             .join(&format!("volumes/{}/links/move-multiple", volume_id.raw()))?;
-        
+
         let request_json = serde_json::to_string(&request)?;
         tracing::debug!(url = %url, body = %request_json, "Sending move_multiple request");
 
@@ -190,7 +190,7 @@ impl LinksApiClient for DefaultLinksApiClient {
         let response = builder.send().await?;
         let text = response.text().await?;
         tracing::debug!(body = %text, "move_multiple response received");
-        
+
         let api_response = serde_json::from_str::<ApiResponse>(&text)?;
         api_response.to_result()?;
         Ok(api_response)

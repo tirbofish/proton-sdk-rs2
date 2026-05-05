@@ -2,12 +2,12 @@ pub mod client;
 pub mod entity;
 pub mod secret;
 
-#[cfg(feature = "cache-sqlite")]
-pub mod sqlite;
 #[cfg(feature = "cache-encrypted")]
 pub mod encrypted;
 #[cfg(feature = "cache-keyring")]
 pub mod keyring;
+#[cfg(feature = "cache-sqlite")]
+pub mod sqlite;
 
 use crate::node::{DegradedNode, Node};
 use crate::share::ShareId;

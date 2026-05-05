@@ -680,7 +680,10 @@ impl crate::utils::batch::BatchLoader<crate::links::LinkId, PotentialObject<Node
                 .into_iter()
                 .map(|link_details| {
                     let parent_key = if let Some(pid) = &link_details.link.parent_id {
-                        parent_keys.get(pid).cloned().unwrap_or_else(|| share_key.clone())
+                        parent_keys
+                            .get(pid)
+                            .cloned()
+                            .unwrap_or_else(|| share_key.clone())
                     } else {
                         share_key.clone()
                     };
@@ -954,17 +957,19 @@ impl DtoToMetadataConverter {
                         }),
                     };
 
-                    let passphrase_decryption_output = decryption
-                        .link
-                        .passphrase
-                        .map_err(|e| {
-                            anyhow::anyhow!("Failed to decrypt folder passphrase: {}", e)
-                        })?;
+                    let passphrase_decryption_output = decryption.link.passphrase.map_err(|e| {
+                        anyhow::anyhow!("Failed to decrypt folder passphrase: {}", e)
+                    })?;
                     let passphrase_session_key = passphrase_decryption_output.data.clone();
-                    let passphrase_pgp_session_key = passphrase_decryption_output.session_key.map(|sk| PgpSessionKey {
-                        algorithm: u8::from(sk.algorithm().unwrap_or(proton_rpgp::pgp::crypto::sym::SymmetricKeyAlgorithm::AES256)),
-                        key: sk.as_ref().to_vec(),
-                    });
+                    let passphrase_pgp_session_key =
+                        passphrase_decryption_output
+                            .session_key
+                            .map(|sk| PgpSessionKey {
+                                algorithm: u8::from(sk.algorithm().unwrap_or(
+                                    proton_rpgp::pgp::crypto::sym::SymmetricKeyAlgorithm::AES256,
+                                )),
+                                key: sk.as_ref().to_vec(),
+                            });
 
                     let is_anonymous = link_dto.signature_email_address.is_none();
                     let secrets = FolderSecrets {
@@ -983,7 +988,10 @@ impl DtoToMetadataConverter {
 
                     Ok(PotentialObject::Node(NodeMetadata {
                         inner: NodeAndSecrets::Folder(FolderNode { base: node_base }, secrets),
-                        membership_share_id: link_details.sharing.as_ref().map(|s| s.share_id.clone()),
+                        membership_share_id: link_details
+                            .sharing
+                            .as_ref()
+                            .map(|s| s.share_id.clone()),
                         name_hash_digest: link_dto.name_hash_digest,
                     }))
                 } else {
@@ -1038,14 +1046,17 @@ impl DtoToMetadataConverter {
                     let passphrase_decryption_output = decryption
                         .link
                         .passphrase
-                        .map_err(|e| {
-                            anyhow::anyhow!("Failed to decrypt file passphrase: {}", e)
-                        })?;
+                        .map_err(|e| anyhow::anyhow!("Failed to decrypt file passphrase: {}", e))?;
                     let passphrase_session_key = passphrase_decryption_output.data.clone();
-                    let passphrase_pgp_session_key = passphrase_decryption_output.session_key.map(|sk| PgpSessionKey {
-                        algorithm: u8::from(sk.algorithm().unwrap_or(proton_rpgp::pgp::crypto::sym::SymmetricKeyAlgorithm::AES256)),
-                        key: sk.as_ref().to_vec(),
-                    });
+                    let passphrase_pgp_session_key =
+                        passphrase_decryption_output
+                            .session_key
+                            .map(|sk| PgpSessionKey {
+                                algorithm: u8::from(sk.algorithm().unwrap_or(
+                                    proton_rpgp::pgp::crypto::sym::SymmetricKeyAlgorithm::AES256,
+                                )),
+                                key: sk.as_ref().to_vec(),
+                            });
 
                     let is_anonymous = link_dto.signature_email_address.is_none();
                     let secrets = FileSecrets {
@@ -1120,13 +1131,18 @@ impl DtoToMetadataConverter {
                                         })
                                         .unwrap_or_default(),
                                     additional_claimed_metadata: None,
-                                    content_author: Some(decryption.content_authorship_claim.to_potential_author()),
+                                    content_author: Some(
+                                        decryption.content_authorship_claim.to_potential_author(),
+                                    ),
                                 },
                                 total_size_on_cloud_storage: file_dto.total_size_on_storage,
                             },
                             secrets,
                         ),
-                        membership_share_id: link_details.sharing.as_ref().map(|s| s.share_id.clone()),
+                        membership_share_id: link_details
+                            .sharing
+                            .as_ref()
+                            .map(|s| s.share_id.clone()),
                         name_hash_digest: link_dto.name_hash_digest,
                     }))
                 } else {

@@ -12,6 +12,7 @@ pub enum TrayAction {
     ToggleSyncPause,
     RetrySyncNow,
     Account,
+    Settings,
     SignOut,
     Quit,
 }
@@ -71,6 +72,7 @@ const SHOW_HIDE_ID: &str = "pdcli.show_hide";
 const PAUSE_RESUME_ID: &str = "pdcli.pause_resume";
 const RETRY_NOW_ID: &str = "pdcli.retry_now";
 const ACCOUNT_ID: &str = "pdcli.account";
+const SETTINGS_ID: &str = "pdcli.settings";
 const SIGN_OUT_ID: &str = "pdcli.sign_out";
 const QUIT_ID: &str = "pdcli.quit";
 
@@ -119,7 +121,7 @@ fn build_menu() -> Menu {
         true,
         None,
     );
-    let show_hide = MenuItem::with_id(MenuId::new(SHOW_HIDE_ID), "Show/Hide Window", true, None);
+    let show_hide = MenuItem::with_id(MenuId::new(SHOW_HIDE_ID), "Open Window", true, None);
     let pause_resume = MenuItem::with_id(
         MenuId::new(PAUSE_RESUME_ID),
         "Pause/Resume Sync",
@@ -128,6 +130,7 @@ fn build_menu() -> Menu {
     );
     let retry_now = MenuItem::with_id(MenuId::new(RETRY_NOW_ID), "Retry Sync Now", true, None);
     let account = MenuItem::with_id(MenuId::new(ACCOUNT_ID), "Account", true, None);
+    let settings = MenuItem::with_id(MenuId::new(SETTINGS_ID), "Settings", true, None);
     let sign_out = MenuItem::with_id(MenuId::new(SIGN_OUT_ID), "Sign Out", true, None);
     let quit = MenuItem::with_id(MenuId::new(QUIT_ID), "Quit", true, None);
     let _ = menu.append_items(&[
@@ -138,6 +141,7 @@ fn build_menu() -> Menu {
         &retry_now,
         &PredefinedMenuItem::separator(),
         &account,
+        &settings,
         &sign_out,
         &PredefinedMenuItem::separator(),
         &quit,
@@ -228,6 +232,7 @@ pub fn poll_events() -> Vec<TrayAction> {
             PAUSE_RESUME_ID => Some(TrayAction::ToggleSyncPause),
             RETRY_NOW_ID => Some(TrayAction::RetrySyncNow),
             ACCOUNT_ID => Some(TrayAction::Account),
+            SETTINGS_ID => Some(TrayAction::Settings),
             SIGN_OUT_ID => Some(TrayAction::SignOut),
             QUIT_ID => Some(TrayAction::Quit),
             _ => None,

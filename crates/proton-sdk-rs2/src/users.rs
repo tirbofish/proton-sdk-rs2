@@ -97,10 +97,10 @@ pub struct UserResponse {
 pub struct UserDto {
     #[serde(rename = "Keys", alias = "keys")]
     pub keys: Vec<UserKeyDto>,
-    
+
     #[serde(rename = "MaxSpace", alias = "max_space", default)]
     pub max_space: i64,
-    
+
     #[serde(rename = "UsedSpace", alias = "used_space", default)]
     pub used_space: i64,
 }

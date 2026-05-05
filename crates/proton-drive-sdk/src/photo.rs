@@ -1,15 +1,15 @@
 use crate::api::events::{CoreEventsResponse, VolumeEventsResponse};
 use crate::api::file::photos::{
-    AddPhotoToAlbumItem, AddPhotosToAlbumRequest, AlbumChildItem, AlbumCreationRequest,
-    AlbumInfo, AlbumLinkCreationFields, AlbumNameUpdate, AlbumUpdateRequest,
-    DefaultPhotosApiClient, FavoritePhotoData, FavoritePhotoPayload,
-    PhotoTagUpdate, PhotosApiClient, PhotosApiClients,
+    AddPhotoToAlbumItem, AddPhotosToAlbumRequest, AlbumChildItem, AlbumCreationRequest, AlbumInfo,
+    AlbumLinkCreationFields, AlbumNameUpdate, AlbumUpdateRequest, DefaultPhotosApiClient,
+    FavoritePhotoData, FavoritePhotoPayload, PhotoTagUpdate, PhotosApiClient, PhotosApiClients,
     TimelinePhotoListRequest,
 };
 use crate::api::{DriveApiClients, DriveApiClientsFactory};
 use crate::cache::entity::{DefaultPhotosEntityCache, PhotosEntityCache};
 use crate::client::{ProtonDriveClient, ProtonDriveDefaults};
 use crate::links::LinkId;
+use crate::node::DtoToMetadataConverter;
 use crate::node::crypto::NodeCrypto;
 use crate::node::file::download::FileDownloader;
 use crate::node::file::upload::FileUploader;
@@ -18,7 +18,6 @@ use crate::node::photo::{PhotoTag, PhotosFileUploadMetadata, PhotosTimelineItem,
 use crate::node::{DegradedNode, Node, NodeAndSecrets, NodeUid};
 use crate::pgp::PgpPrivateKey;
 use crate::share_ops::ShareOperations;
-use crate::node::DtoToMetadataConverter;
 use crate::utils::PotentialObject;
 use crate::volume::VolumeId;
 use hmac::{Hmac, KeyInit, Mac};
@@ -89,7 +88,11 @@ impl ProtonPhotosClient {
             session.client_config.entity_cache_repository.clone(),
         ));
 
-        Ok(Self { drive, photos_api, photos_entities })
+        Ok(Self {
+            drive,
+            photos_api,
+            photos_entities,
+        })
     }
 
     /// Resolves the Photos root folder, caching the share and volume IDs for
@@ -216,7 +219,6 @@ impl ProtonPhotosClient {
         Ok(items)
     }
 
-
     /// Fetch a single node by UID (file or folder).
     pub async fn get_node(
         &self,
@@ -286,20 +288,19 @@ impl ProtonPhotosClient {
                 name,
                 media_type,
                 size,
-                metadata.base.last_modification_time
+                metadata
+                    .base
+                    .last_modification_time
                     .map(|dt| std::time::SystemTime::from(dt)),
                 metadata.base.additional_metadata,
-                None, // media_info
+                None,  // media_info
                 false, // override_existing_draft_by_other_client
             )
             .await
     }
 
     /// Creates a downloader for the active revision of a photo or file node.
-    pub async fn get_file_downloader(
-        &self,
-        uid: NodeUid,
-    ) -> anyhow::Result<FileDownloader> {
+    pub async fn get_file_downloader(&self, uid: NodeUid) -> anyhow::Result<FileDownloader> {
         let node = self.drive.get_node(uid.clone()).await?;
         let resolved = node
             .result()
@@ -380,19 +381,18 @@ impl ProtonPhotosClient {
     }
 
     /// List all trashed photo nodes.
-    pub async fn enumerate_trash(
-        &self,
-    ) -> anyhow::Result<Vec<Result<Node, DegradedNode>>> {
+    pub async fn enumerate_trash(&self) -> anyhow::Result<Vec<Result<Node, DegradedNode>>> {
         self.drive.enumerate_trash().await
     }
 
     /// Returns the latest event-ID for the Photos volume. Use this as the
     /// starting cursor for [`poll_volume_events`].
-    pub async fn get_volume_latest_event_id(
-        &self,
-        volume_id: VolumeId,
-    ) -> anyhow::Result<String> {
-        self.drive.api().events().get_volume_latest_event_id(volume_id).await
+    pub async fn get_volume_latest_event_id(&self, volume_id: VolumeId) -> anyhow::Result<String> {
+        self.drive
+            .api()
+            .events()
+            .get_volume_latest_event_id(volume_id)
+            .await
     }
 
     /// Poll for changes since `event_id`. Returns the next cursor and any node
@@ -402,7 +402,11 @@ impl ProtonPhotosClient {
         volume_id: VolumeId,
         event_id: &str,
     ) -> anyhow::Result<VolumeEventsResponse> {
-        self.drive.api().events().get_volume_events(volume_id, event_id).await
+        self.drive
+            .api()
+            .events()
+            .get_volume_events(volume_id, event_id)
+            .await
     }
 
     /// Returns the latest global core event-ID.
@@ -411,10 +415,7 @@ impl ProtonPhotosClient {
     }
 
     /// Poll for core-level events since `event_id`.
-    pub async fn poll_core_events(
-        &self,
-        event_id: &str,
-    ) -> anyhow::Result<CoreEventsResponse> {
+    pub async fn poll_core_events(&self, event_id: &str) -> anyhow::Result<CoreEventsResponse> {
         self.drive.api().events().get_core_events(event_id).await
     }
 
@@ -440,11 +441,15 @@ impl ProtonPhotosClient {
         } else {
             response.photos.last().map(|p| p.id.clone())
         };
-        let entries = response.photos.into_iter().map(|dto| TimelineEntry {
-            uid: NodeUid::new(volume_id.clone(), dto.id),
-            capture_time: dto.capture_time,
-            tags: dto.tags,
-        }).collect();
+        let entries = response
+            .photos
+            .into_iter()
+            .map(|dto| TimelineEntry {
+                uid: NodeUid::new(volume_id.clone(), dto.id),
+                capture_time: dto.capture_time,
+                tags: dto.tags,
+            })
+            .collect();
         Ok((entries, next_cursor))
     }
 
@@ -605,7 +610,8 @@ impl ProtonPhotosClient {
 
         let default_address = self.drive.account().get_default_address().await?;
 
-        let locked_album_key = album_key.to_armored_private_key(Some(album_passphrase.as_bytes()))?;
+        let locked_album_key =
+            album_key.to_armored_private_key(Some(album_passphrase.as_bytes()))?;
 
         let request = AlbumCreationRequest {
             locked: false,
@@ -745,9 +751,7 @@ impl ProtonPhotosClient {
 
             let (file_secrets, photo_name) = match (node, node_and_secrets) {
                 (Node::File(ref f), NodeAndSecrets::File(_, s))
-                | (Node::Photo(ref f), NodeAndSecrets::File(_, s)) => {
-                    (s, f.base.base.name.clone())
-                }
+                | (Node::Photo(ref f), NodeAndSecrets::File(_, s)) => (s, f.base.base.name.clone()),
                 _ => continue,
             };
 
@@ -833,10 +837,7 @@ impl ProtonPhotosClient {
 
     /// Applies tag additions and removals to a batch of photos. For the Favorite tag,
     /// the photo's key material is re-encrypted for the root timeline volume.
-    pub async fn update_photos(
-        &self,
-        updates: Vec<PhotoTagUpdate>,
-    ) -> anyhow::Result<()> {
+    pub async fn update_photos(&self, updates: Vec<PhotoTagUpdate>) -> anyhow::Result<()> {
         let volume_id = self.get_photos_volume_id().await?;
 
         for update in updates {

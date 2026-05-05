@@ -20,10 +20,11 @@ use sha2::{Digest, Sha256};
 
 use crate::app::ProtonDrive;
 use crate::db::{FuseDb, InodeRow};
+use crate::pdignore::IgnoreMatcher;
 use crate::thumbnail::ThumbnailConfig;
 use crate::transfer::{TransferDirection, TransferTracker};
 
-const TTL: Duration = Duration::from_secs(1);
+const TTL: Duration = Duration::from_secs(0);
 const ROOT_INO: u64 = 1;
 const BLOCK_SIZE: u32 = 4096;
 
@@ -96,6 +97,7 @@ pub struct ProtonDriveFs {
     cache_dir: PathBuf,
     drive: ProtonDriveClient,
     rt: tokio::runtime::Handle,
+    storage_info: Arc<RwLock<Option<(i64, i64)>>>,
     next_fh: AtomicU64,
     open_files: RwLock<HashMap<u64, Mutex<OpenFile>>>,
     uid: u32,
@@ -111,6 +113,7 @@ impl ProtonDriveFs {
         drive: ProtonDriveClient,
         rt: tokio::runtime::Handle,
         tracker: TransferTracker,
+        storage_info: Option<(i64, i64)>,
     ) -> Self {
         let thumb_config = ThumbnailConfig::load();
         Self {
@@ -118,6 +121,7 @@ impl ProtonDriveFs {
             cache_dir,
             drive,
             rt,
+            storage_info: Arc::new(RwLock::new(storage_info)),
             next_fh: AtomicU64::new(1),
             open_files: RwLock::new(HashMap::new()),
             uid: unsafe { libc::getuid() },
@@ -132,12 +136,19 @@ impl ProtonDriveFs {
         let db = self.db.clone();
         let drive = self.drive.clone();
         let cache_dir = self.cache_dir.clone();
+        let storage_info = self.storage_info.clone();
 
         // Event poller
         self.rt.spawn(event_poll_loop(db.clone(), drive.clone()));
 
         // Journal flusher
-        self.rt.spawn(journal_flush_loop(db, drive, cache_dir));
+        self.rt
+            .spawn(journal_flush_loop(db, drive.clone(), cache_dir));
+
+        // Quota refresher. FUSE statfs must never do network I/O because file
+        // managers call it synchronously while opening the mount.
+        self.rt
+            .spawn(storage_info_refresh_loop(drive, storage_info));
     }
 
     // ── Helpers ──────────────────────────────────────────────────────
@@ -152,11 +163,12 @@ impl ProtonDriveFs {
         let mtime = UNIX_EPOCH + Duration::from_secs(row.mtime.max(0) as u64);
         let ctime = UNIX_EPOCH + Duration::from_secs(row.ctime.max(0) as u64);
         let nlink = if row.is_dir { 2 } else { 1 };
-        let blocks = (row.size + 511) / 512;
+        let size = self.attr_size(row);
+        let blocks = (size + 511) / 512;
 
         FileAttr {
             ino: INodeNo(row.ino),
-            size: row.size,
+            size,
             blocks,
             atime: mtime,
             mtime,
@@ -171,6 +183,18 @@ impl ProtonDriveFs {
             blksize: BLOCK_SIZE,
             flags: 0,
         }
+    }
+
+    fn attr_size(&self, row: &InodeRow) -> u64 {
+        if row.is_dir {
+            return 0;
+        }
+
+        row.cached_path
+            .as_ref()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map(|metadata| metadata.len())
+            .unwrap_or(row.size)
     }
 
     fn ensure_my_files_root(&self) -> Option<u64> {
@@ -314,10 +338,6 @@ impl ProtonDriveFs {
         let uid = node.uid();
         let uid_raw = uid.raw();
 
-        if db.find_by_node_uid(&uid_raw).is_some() {
-            return; // already present
-        }
-
         let name = node.base().name.clone();
         let is_dir = matches!(node, Node::Folder(_) | Node::Album(_));
         let (size, media_type, revision_uid, mtime) = match node {
@@ -341,6 +361,17 @@ impl ProtonDriveFs {
                 node.base().creation_time.timestamp(),
             ),
         };
+
+        if let Some(existing) = db.find_by_node_uid(&uid_raw) {
+            let _ = db.update_remote_metadata(
+                existing.ino,
+                size,
+                &media_type,
+                revision_uid.as_deref(),
+                mtime,
+            );
+            return;
+        }
 
         let _ = db.insert_inode(
             parent_ino,
@@ -428,6 +459,13 @@ impl ProtonDriveFs {
         if let Some(ref p) = row.cached_path {
             let path = PathBuf::from(p);
             if path.exists() {
+                if let Ok(metadata) = path.metadata() {
+                    let actual_size = metadata.len();
+                    if actual_size != row.size {
+                        let db = self.db.lock().unwrap();
+                        let _ = db.update_size_only(row.ino, actual_size);
+                    }
+                }
                 return Ok(path);
             }
         }
@@ -455,6 +493,9 @@ impl ProtonDriveFs {
             tracing::info!(ino = row.ino, name = %row.name, "serving from offline cache");
             let db = self.db.lock().unwrap();
             let _ = db.set_cached_path(row.ino, cache_path.to_str());
+            if let Ok(metadata) = cache_path.metadata() {
+                let _ = db.update_size_only(row.ino, metadata.len());
+            }
             return Ok(cache_path);
         }
 
@@ -492,6 +533,9 @@ impl ProtonDriveFs {
                 tracing::info!(ino = row.ino, name = %row.name, "download complete");
                 let db = self.db.lock().unwrap();
                 let _ = db.set_cached_path(row.ino, cache_path.to_str());
+                if let Ok(metadata) = cache_path.metadata() {
+                    let _ = db.update_size_only(row.ino, metadata.len());
+                }
                 self.tracker.mark_complete(idx);
                 Self::notify("Download complete", &row.name);
                 Ok(cache_path)
@@ -513,6 +557,16 @@ impl ProtonDriveFs {
     fn enqueue_upload_for_row(&self, mut row: InodeRow) {
         if !row.dirty || row.is_dir {
             return;
+        }
+
+        {
+            let db = self.db.lock().unwrap();
+            if is_upload_ignored(&db, &row) {
+                tracing::info!(ino = row.ino, name = %row.name, "skipping upload ignored by .pdignore");
+                let _ = db.set_dirty(row.ino, false);
+                let _ = db.record_sync_event("local", "ignored", Some(&row.name), None);
+                return;
+            }
         }
 
         if row.node_uid.is_some() && row.revision_uid.is_none() {
@@ -1122,12 +1176,19 @@ impl Filesystem for ProtonDriveFs {
             };
 
         // Enqueue for upstream creation.
-        let payload = serde_json::json!({
-            "ino": new_ino,
-            "parent_ino": parent_ino,
-            "name": name_str,
-        });
-        let _ = db.enqueue_journal("create_folder", new_ino, &payload.to_string());
+        if let Some(row) = db.get_inode(new_ino) {
+            if is_upload_ignored(&db, &row) {
+                tracing::info!(ino = new_ino, name = %name_str, "skipping folder upload ignored by .pdignore");
+                let _ = db.record_sync_event("local", "ignored", Some(name_str), None);
+            } else {
+                let payload = serde_json::json!({
+                    "ino": new_ino,
+                    "parent_ino": parent_ino,
+                    "name": name_str,
+                });
+                let _ = db.enqueue_journal("create_folder", new_ino, &payload.to_string());
+            }
+        }
         drop(db);
 
         let row = InodeRow {
@@ -1323,20 +1384,17 @@ impl Filesystem for ProtonDriveFs {
     }
 
     fn statfs(&self, _req: &Request, _ino: fuser::INodeNo, reply: ReplyStatfs) {
-        // Try to get real quota from the API (with a short timeout for offline).
         let (used, total) = self
-            .rt
-            .block_on(async {
-                tokio::time::timeout(Duration::from_secs(5), self.drive.get_user_storage_info())
-                    .await
-            })
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or((0, 1_000_000_000)); // 1 GB fallback when offline
+            .storage_info
+            .read()
+            .unwrap()
+            .unwrap_or((0, 1_000_000_000)); // 1 GB fallback before quota warmup/offline
 
+        let total = total.max(0) as u64;
+        let used = used.max(0) as u64;
         let bsize = BLOCK_SIZE as u64;
-        let blocks = total as u64 / bsize;
-        let bfree = (total - used).max(0) as u64 / bsize;
+        let blocks = total / bsize;
+        let bfree = total.saturating_sub(used) / bsize;
 
         reply.statfs(
             blocks,       // blocks
@@ -1361,7 +1419,102 @@ impl Filesystem for ProtonDriveFs {
     }
 }
 
+fn is_upload_ignored(db: &FuseDb, row: &InodeRow) -> bool {
+    if row.ino == ROOT_INO {
+        return false;
+    }
+
+    let path = match db.inode_path(row.ino) {
+        Some(path) => path,
+        None => return false,
+    };
+    let my_files_index = path
+        .iter()
+        .position(|part| part.name == "MyFiles")
+        .map(|index| index + 1)
+        .unwrap_or(1);
+    if path.len() <= my_files_index {
+        return false;
+    }
+
+    let relative_parts = path[my_files_index..]
+        .iter()
+        .map(|part| part.name.as_str())
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    if relative_parts.is_empty() {
+        return false;
+    }
+
+    let relative_path = relative_parts.join("/");
+    let mut global_matcher = IgnoreMatcher::new();
+    global_matcher.add_ignore_text(&crate::pdignore::load_global_text());
+    let mut ignored = global_matcher
+        .check(&relative_path, row.is_dir)
+        .unwrap_or(false);
+
+    let target_index = path.len() - 1;
+    for scope_index in my_files_index.saturating_sub(1)..target_index {
+        let scope = &path[scope_index];
+        if !scope.is_dir {
+            continue;
+        }
+
+        let scoped_parts = path[(scope_index + 1)..]
+            .iter()
+            .map(|part| part.name.as_str())
+            .filter(|name| !name.is_empty())
+            .collect::<Vec<_>>();
+        if scoped_parts.is_empty() {
+            continue;
+        }
+
+        let Some(ignore_row) = db.lookup_child(scope.ino, ".pdignore") else {
+            continue;
+        };
+        let Some(ignore_path) = ignore_row.cached_path else {
+            continue;
+        };
+        let Ok(ignore_text) = std::fs::read_to_string(ignore_path) else {
+            continue;
+        };
+
+        let mut matcher = IgnoreMatcher::new();
+        matcher.add_ignore_text(&ignore_text);
+        if let Some(scoped_ignored) = matcher.check(&scoped_parts.join("/"), row.is_dir) {
+            ignored = scoped_ignored;
+        }
+    }
+
+    ignored
+}
+
 // ── Background event-poll loop ───────────────────────────────────────
+
+async fn storage_info_refresh_loop(
+    drive: ProtonDriveClient,
+    storage_info: Arc<RwLock<Option<(i64, i64)>>>,
+) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(300)).await;
+
+        if FORCE_OFFLINE.load(Ordering::Relaxed) {
+            continue;
+        }
+
+        match tokio::time::timeout(Duration::from_secs(10), drive.get_user_storage_info()).await {
+            Ok(Ok(info)) => {
+                *storage_info.write().unwrap() = Some(info);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "failed to refresh storage quota");
+            }
+            Err(_) => {
+                tracing::warn!("timed out refreshing storage quota");
+            }
+        }
+    }
+}
 
 async fn event_poll_loop(db: Arc<Mutex<FuseDb>>, drive: ProtonDriveClient) {
     use proton_drive_sdk::api::events::VolumeEventType;
@@ -1657,6 +1810,33 @@ async fn process_journal_entry(
 ) -> anyhow::Result<()> {
     let payload: serde_json::Value = serde_json::from_str(&entry.payload)?;
 
+    if matches!(
+        entry.event_type.as_str(),
+        "create_folder" | "create_file" | "update_revision"
+    ) {
+        let ignored = {
+            let db_guard = db.lock().unwrap();
+            db_guard
+                .get_inode(entry.ino)
+                .map(|row| is_upload_ignored(&db_guard, &row))
+                .unwrap_or(false)
+        };
+        if ignored {
+            let db_guard = db.lock().unwrap();
+            if let Some(row) = db_guard.get_inode(entry.ino) {
+                tracing::info!(
+                    ino = row.ino,
+                    name = %row.name,
+                    event = %entry.event_type,
+                    "skipping pending upload ignored by .pdignore"
+                );
+                let _ = db_guard.set_dirty(row.ino, false);
+                let _ = db_guard.record_sync_event("local", "ignored", Some(&row.name), None);
+            }
+            return Ok(());
+        }
+    }
+
     match entry.event_type.as_str() {
         "create_folder" => {
             let row = {
@@ -1878,7 +2058,7 @@ async fn process_journal_entry(
 
 // ── Mount entry-point (called from app.rs) ───────────────────────────
 
-pub fn spawn_fuse_session(
+pub async fn spawn_fuse_session(
     session: &ProtonAPISession,
     transfer_tracker: TransferTracker,
     force_offline: bool,
@@ -1919,9 +2099,25 @@ pub fn spawn_fuse_session(
         tracing::error!(error = %e, "failed to insert MyFiles inode");
         return None;
     }
+    reconcile_cached_file_sizes(&db);
 
     let rt = tokio::runtime::Handle::current();
-    let fs = ProtonDriveFs::new(db, cache_dir, drive, rt, transfer_tracker);
+    let storage_info = if force_offline {
+        None
+    } else {
+        match tokio::time::timeout(Duration::from_secs(10), drive.get_user_storage_info()).await {
+            Ok(Ok(info)) => Some(info),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "failed to load storage quota before mounting");
+                None
+            }
+            Err(_) => {
+                tracing::warn!("timed out loading storage quota before mounting");
+                None
+            }
+        }
+    };
+    let fs = ProtonDriveFs::new(db, cache_dir, drive, rt, transfer_tracker, storage_info);
     fs.spawn_background_workers();
 
     tracing::info!(mount = %mountpoint.display(), "mounting FUSE filesystem");
@@ -1949,6 +2145,15 @@ pub fn spawn_fuse_session(
             tracing::error!(error = %e, "FUSE mount failed");
             None
         }
+    }
+}
+
+fn reconcile_cached_file_sizes(db: &FuseDb) {
+    for (ino, cached_path) in db.cached_file_inodes() {
+        let Ok(metadata) = std::fs::metadata(&cached_path) else {
+            continue;
+        };
+        let _ = db.update_size_only(ino, metadata.len());
     }
 }
 

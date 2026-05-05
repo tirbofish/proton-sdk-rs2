@@ -97,17 +97,17 @@ impl FileOperations {
                         processed_link_ids.insert(node.uid().link_id.raw().to_string());
 
                         match node {
-                            Node::File(file_node) | Node::Photo(file_node) => {
-                                Some(FileNodeInfo {
-                                    uid: file_node.base.base.uid.clone(),
-                                    thumbnails: file_node.active_revision.thumbnails.clone(),
-                                })
-                            }
+                            Node::File(file_node) | Node::Photo(file_node) => Some(FileNodeInfo {
+                                uid: file_node.base.base.uid.clone(),
+                                thumbnails: file_node.active_revision.thumbnails.clone(),
+                            }),
                             Node::Folder(_) | Node::Album(_) => {
                                 errors.push(FileThumbnail {
                                     file_uid: node.uid().clone(),
                                     result: PotentialObject::Degraded(
-                                        ProtonDriveError::InternalError("Node is not a file".to_string()),
+                                        ProtonDriveError::InternalError(
+                                            "Node is not a file".to_string(),
+                                        ),
                                     ),
                                 });
                                 None
@@ -127,17 +127,21 @@ impl FileOperations {
                                             thumbnails: degraded_revision.thumbnails.clone(),
                                         })
                                     } else {
-                                        let error_msg =
-                                            if let Some(ref content_author) = degraded_revision.content_author {
-                                                match content_author {
-                                                    PotentialObject::Degraded(e) => {
-                                                        format!("Cannot decrypt degraded file: {}", e.message)
-                                                    }
-                                                    _ => "Cannot decrypt degraded file".to_string(),
+                                        let error_msg = if let Some(ref content_author) =
+                                            degraded_revision.content_author
+                                        {
+                                            match content_author {
+                                                PotentialObject::Degraded(e) => {
+                                                    format!(
+                                                        "Cannot decrypt degraded file: {}",
+                                                        e.message
+                                                    )
                                                 }
-                                            } else {
-                                                "Cannot decrypt degraded file".to_string()
-                                            };
+                                                _ => "Cannot decrypt degraded file".to_string(),
+                                            }
+                                        } else {
+                                            "Cannot decrypt degraded file".to_string()
+                                        };
                                         errors.push(FileThumbnail {
                                             file_uid: degraded_file.base.uid.clone(),
                                             result: PotentialObject::Degraded(
@@ -150,7 +154,9 @@ impl FileOperations {
                                     errors.push(FileThumbnail {
                                         file_uid: degraded_file.base.uid.clone(),
                                         result: PotentialObject::Degraded(
-                                            ProtonDriveError::InternalError("File has no active revision".to_string()),
+                                            ProtonDriveError::InternalError(
+                                                "File has no active revision".to_string(),
+                                            ),
                                         ),
                                     });
                                     None
@@ -160,7 +166,9 @@ impl FileOperations {
                                 errors.push(FileThumbnail {
                                     file_uid: degraded_node.uid().clone(),
                                     result: PotentialObject::Degraded(
-                                        ProtonDriveError::InternalError("Node is not a file".to_string()),
+                                        ProtonDriveError::InternalError(
+                                            "Node is not a file".to_string(),
+                                        ),
                                     ),
                                 });
                                 None
@@ -175,11 +183,15 @@ impl FileOperations {
                     if info.thumbnails.is_empty() {
                         errors.push(FileThumbnail {
                             file_uid: info.uid.clone(),
-                            result: PotentialObject::Degraded(
-                                ProtonDriveError::InternalError("Node has no thumbnails".to_string()),
-                            ),
+                            result: PotentialObject::Degraded(ProtonDriveError::InternalError(
+                                "Node has no thumbnails".to_string(),
+                            )),
                         });
-                    } else if !info.thumbnails.iter().any(|t| t.r#type == thumbnail_type_i32) {
+                    } else if !info
+                        .thumbnails
+                        .iter()
+                        .any(|t| t.r#type == thumbnail_type_i32)
+                    {
                         errors.push(FileThumbnail {
                             file_uid: info.uid.clone(),
                             result: PotentialObject::Degraded(ProtonDriveError::InternalError(
@@ -226,15 +238,16 @@ impl FileOperations {
                 .await
                 .context("Failed to get thumbnail blocks from server")?;
 
-            let processed_thumbnail_ids: HashSet<String> =
-                response.blocks.iter().map(|b| b.thumbnail_id.clone()).collect();
+            let processed_thumbnail_ids: HashSet<String> = response
+                .blocks
+                .iter()
+                .map(|b| b.thumbnail_id.clone())
+                .collect();
 
             // Download thumbnails in parallel with concurrency limit
             const CONCURRENCY: usize = 8;
 
-            type ThumbnailFuture = Pin<
-                Box<dyn std::future::Future<Output = FileThumbnail> + Send>,
-            >;
+            type ThumbnailFuture = Pin<Box<dyn std::future::Future<Output = FileThumbnail> + Send>>;
 
             let mut in_flight: FuturesUnordered<ThumbnailFuture> = FuturesUnordered::new();
             let mut block_iter = response.blocks.into_iter();

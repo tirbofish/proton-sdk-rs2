@@ -1,9 +1,11 @@
-use reqwest_middleware::ClientWithMiddleware;
-use reqwest::Url;
-use proton_sdk_rs2::auth::TokenCredential;
-use crate::pgp::{PgpSessionKey, PgpPrivateKey};
+use crate::api::block::verification::{
+    BlockVerificationApiClient, DefaultBlockVerificationApiClient,
+};
 use crate::node::revision::RevisionUid;
-use crate::api::block::verification::{BlockVerificationApiClient, DefaultBlockVerificationApiClient};
+use crate::pgp::{PgpPrivateKey, PgpSessionKey};
+use proton_sdk_rs2::auth::TokenCredential;
+use reqwest::Url;
+use reqwest_middleware::ClientWithMiddleware;
 
 #[derive(Clone)]
 pub struct BlockVerifier {
@@ -13,7 +15,10 @@ pub struct BlockVerifier {
 
 impl BlockVerifier {
     pub fn new(session_key: PgpSessionKey, verification_code: Vec<u8>) -> Self {
-        Self { _session_key: session_key, verification_code }
+        Self {
+            _session_key: session_key,
+            verification_code,
+        }
     }
 
     pub fn data_packet_prefix_max_length(&self) -> usize {
@@ -78,13 +83,17 @@ impl BlockVerifierFactory for DefaultBlockVerifierFactory {
         revision_uid: RevisionUid,
         key: &PgpPrivateKey,
     ) -> anyhow::Result<BlockVerifier> {
-        let verification_input = self.api_client.get_verification_input(
-            &revision_uid.node_uid.volume_id,
-            &revision_uid.node_uid.link_id,
-            &revision_uid.revision_id,
-        ).await?;
+        let verification_input = self
+            .api_client
+            .get_verification_input(
+                &revision_uid.node_uid.volume_id,
+                &revision_uid.node_uid.link_id,
+                &revision_uid.revision_id,
+            )
+            .await?;
 
-        let session_key = key.decrypt_session_key(&verification_input.content_key_packet)
+        let session_key = key
+            .decrypt_session_key(&verification_input.content_key_packet)
             .map_err(|e| anyhow::anyhow!("Node key and session key mismatch: {}", e))?;
 
         Ok(BlockVerifier::new(

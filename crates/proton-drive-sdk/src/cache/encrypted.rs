@@ -5,8 +5,8 @@
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::Context;
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use hmac::{Hmac, KeyInit, Mac};
 use proton_sdk_rs2::cache::CacheRepository;
 use rand::RngExt;
@@ -90,11 +90,8 @@ impl EncryptedCacheRepository {
     }
 
     fn decrypt(&self, entry_key: &str, encoded: &str) -> anyhow::Result<Option<String>> {
-        let blob = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            encoded,
-        )
-        .context("Failed to decode Base64 ciphertext")?;
+        let blob = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+            .context("Failed to decode Base64 ciphertext")?;
 
         if blob.len() < SALT_LEN + TAG_LEN {
             anyhow::bail!("Encrypted blob is too short to be valid");
@@ -209,8 +206,8 @@ fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], length: usize) -> anyhow::R
     let mut t: Vec<u8> = Vec::new();
 
     for i in 1..=(n as u8) {
-        let mut mac = HmacSha256::new_from_slice(&prk)
-            .map_err(|_| anyhow::anyhow!("HKDF expand failed"))?;
+        let mut mac =
+            HmacSha256::new_from_slice(&prk).map_err(|_| anyhow::anyhow!("HKDF expand failed"))?;
         mac.update(&t);
         mac.update(info);
         mac.update(&[i]);

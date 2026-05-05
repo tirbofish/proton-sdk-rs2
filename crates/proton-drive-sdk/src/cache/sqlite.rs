@@ -1,10 +1,10 @@
 //! [rusqlite]/SQLite based cache repositories.
-//! 
-//! The `cache-sqlite` feature is required to be enabled (is enabled by default). 
+//!
+//! The `cache-sqlite` feature is required to be enabled (is enabled by default).
 
 use anyhow::Context;
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use proton_sdk_rs2::cache::CacheRepository;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
@@ -49,7 +49,10 @@ impl SqliteCacheRepository {
     /// * `path` – Filesystem path for the SQLite database file.
     /// * `max_cache_size` – Maximum number of entries before LRU eviction
     ///   kicks in.  Pass `None` to disable the size cap.
-    pub fn open_file(path: impl AsRef<Path>, max_cache_size: Option<usize>) -> anyhow::Result<Self> {
+    pub fn open_file(
+        path: impl AsRef<Path>,
+        max_cache_size: Option<usize>,
+    ) -> anyhow::Result<Self> {
         let connection = Connection::open(path).context("Failed to open SQLite file")?;
         Self::init(connection, max_cache_size)
     }
@@ -204,14 +207,12 @@ impl CacheRepository for SqliteCacheRepository {
                 return futures::stream::once(async move {
                     Err(anyhow::anyhow!("Failed to prepare query: {}", e))
                 })
-                .boxed()
+                .boxed();
             }
         };
 
-        let params_refs: Vec<&dyn rusqlite::ToSql> = tags
-            .iter()
-            .map(|t| t as &dyn rusqlite::ToSql)
-            .collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            tags.iter().map(|t| t as &dyn rusqlite::ToSql).collect();
 
         let rows_result: Result<Vec<(String, String)>, _> = stmt
             .query_map(params_refs.as_slice(), |row| {
@@ -225,7 +226,7 @@ impl CacheRepository for SqliteCacheRepository {
                 return futures::stream::once(async move {
                     Err(anyhow::anyhow!("Failed to fetch entries by tags: {}", e))
                 })
-                .boxed()
+                .boxed();
             }
         };
 

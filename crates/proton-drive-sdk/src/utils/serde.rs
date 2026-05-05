@@ -106,7 +106,7 @@ pub(crate) mod base64_bytes {
 
 pub mod base64_bytes_opt {
     use base64::{Engine, engine::general_purpose::STANDARD};
-    use serde::{Deserializer, Serializer, Deserialize};
+    use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
         match bytes {
@@ -119,11 +119,13 @@ pub mod base64_bytes_opt {
         let s = Option::<String>::deserialize(d)?;
         match s {
             None => Ok(None),
-            Some(s) => STANDARD.decode(&s).map(Some).map_err(serde::de::Error::custom),
+            Some(s) => STANDARD
+                .decode(&s)
+                .map(Some)
+                .map_err(serde::de::Error::custom),
         }
     }
 }
-
 
 pub(crate) mod forgiving_hex_bytes {
     use base64::{Engine, engine::general_purpose::STANDARD};

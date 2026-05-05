@@ -348,7 +348,9 @@ impl ProtonAccountClient {
 
     pub async fn get_user_storage_info(&self) -> anyhow::Result<(i64, i64)> {
         let response = self.api.users().get_user().await?;
-        let user = response.user.ok_or(anyhow::anyhow!("Unable to get user info"))?;
+        let user = response
+            .user
+            .ok_or(anyhow::anyhow!("Unable to get user info"))?;
         Ok((user.used_space, user.max_space))
     }
 }

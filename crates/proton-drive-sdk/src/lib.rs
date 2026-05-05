@@ -47,13 +47,13 @@ pub mod memory;
 pub mod meta;
 pub mod node;
 pub mod pgp;
+pub mod photo;
 pub mod revision;
 pub mod share;
 pub mod share_ops;
 pub mod utils;
 pub mod volume;
 pub mod volume_operations;
-pub mod photo;
 
 pub use proton_sdk_rs2;
 

@@ -35,6 +35,16 @@ pub struct JournalEntry {
     pub retry_count: i32,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SyncEvent {
+    pub id: i64,
+    pub created_at: i64,
+    pub source: String,
+    pub event_type: String,
+    pub name: Option<String>,
+    pub detail: Option<String>,
+}
+
 pub struct FuseDb {
     conn: Connection,
 }
@@ -97,6 +107,17 @@ impl FuseDb {
                 scope       TEXT PRIMARY KEY,
                 event_id    TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS sync_events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at  INTEGER NOT NULL,
+                source      TEXT NOT NULL,
+                event_type  TEXT NOT NULL,
+                name        TEXT,
+                detail      TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_sync_events_created_at
+                ON sync_events(created_at DESC);
             ",
         )?;
         Ok(())
@@ -199,6 +220,81 @@ impl FuseDb {
         Ok(())
     }
 
+    pub fn ensure_my_files_root(&self) -> anyhow::Result<u64> {
+        self.insert_root(None, None, None)?;
+        if let Some(row) = self.lookup_child(1, "MyFiles") {
+            if let Some(root) = self.get_inode(1) {
+                if root.node_uid.is_some() || root.volume_id.is_some() || root.link_id.is_some() {
+                    self.conn.execute(
+                        "UPDATE inodes
+                         SET node_uid = NULL, volume_id = NULL, link_id = NULL
+                         WHERE ino = 1",
+                        [],
+                    )?;
+                    self.conn.execute(
+                        "UPDATE inodes
+                         SET node_uid = ?, volume_id = ?, link_id = ?
+                         WHERE ino = ? AND node_uid IS NULL",
+                        params![root.node_uid, root.volume_id, root.link_id, row.ino as i64],
+                    )?;
+                }
+            }
+            self.conn.execute(
+                "UPDATE inodes
+                 SET parent_ino = ?
+                 WHERE parent_ino = 1 AND ino NOT IN (1, ?)",
+                params![row.ino as i64, row.ino as i64],
+            )?;
+            return Ok(row.ino);
+        }
+
+        let old_root = self.get_inode(1);
+        let now = now_unix();
+        self.conn.execute(
+            "INSERT INTO inodes
+                (parent_ino, name, node_uid, volume_id, link_id, is_dir, size,
+                 media_type, mtime, ctime, dirty, children_populated)
+             VALUES (1, 'MyFiles', NULL, NULL, NULL, 1, 0, '', ?, ?, 0, 0)",
+            params![now, now],
+        )?;
+        let my_files_ino = self.conn.last_insert_rowid() as u64;
+
+        if let Some(root) = old_root {
+            if root.node_uid.is_some() || root.volume_id.is_some() || root.link_id.is_some() {
+                self.conn.execute(
+                    "UPDATE inodes
+                     SET node_uid = NULL, volume_id = NULL, link_id = NULL
+                     WHERE ino = 1",
+                    [],
+                )?;
+                self.conn.execute(
+                    "UPDATE inodes
+                     SET node_uid = ?, volume_id = ?, link_id = ?
+                     WHERE ino = ?",
+                    params![
+                        root.node_uid,
+                        root.volume_id,
+                        root.link_id,
+                        my_files_ino as i64
+                    ],
+                )?;
+            }
+        }
+
+        self.conn.execute(
+            "UPDATE inodes
+             SET parent_ino = ?
+             WHERE parent_ino = 1 AND ino NOT IN (1, ?)",
+            params![my_files_ino as i64, my_files_ino as i64],
+        )?;
+
+        Ok(my_files_ino)
+    }
+
+    pub fn my_files_inode(&self) -> Option<InodeRow> {
+        self.lookup_child(1, "MyFiles")
+    }
+
     pub fn update_node_uid(
         &self,
         ino: u64,
@@ -269,12 +365,7 @@ impl FuseDb {
         Ok(())
     }
 
-    pub fn update_revision(
-        &self,
-        ino: u64,
-        revision_uid: &str,
-        size: u64,
-    ) -> anyhow::Result<()> {
+    pub fn update_revision(&self, ino: u64, revision_uid: &str, size: u64) -> anyhow::Result<()> {
         let now = now_unix();
         self.conn.execute(
             "UPDATE inodes SET revision_uid = ?, size = ?, mtime = ?,
@@ -387,6 +478,52 @@ impl FuseDb {
             params![scope, event_id],
         )?;
         Ok(())
+    }
+
+    // ── Sync events ──────────────────────────────────────────────────
+
+    pub fn record_sync_event(
+        &self,
+        source: &str,
+        event_type: &str,
+        name: Option<&str>,
+        detail: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let now = now_unix();
+        self.conn.execute(
+            "INSERT INTO sync_events (created_at, source, event_type, name, detail)
+             VALUES (?, ?, ?, ?, ?)",
+            params![now, source, event_type, name, detail],
+        )?;
+        self.conn.execute(
+            "DELETE FROM sync_events
+             WHERE id NOT IN (
+                 SELECT id FROM sync_events ORDER BY created_at DESC, id DESC LIMIT 100
+             )",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn recent_sync_events(&self, limit: i64) -> Vec<SyncEvent> {
+        (|| -> rusqlite::Result<Vec<SyncEvent>> {
+            let mut stmt = self.conn.prepare_cached(
+                "SELECT id, created_at, source, event_type, name, detail
+                 FROM sync_events ORDER BY created_at DESC, id DESC LIMIT ?",
+            )?;
+            let rows = stmt.query_map(params![limit], |row| {
+                Ok(SyncEvent {
+                    id: row.get(0)?,
+                    created_at: row.get(1)?,
+                    source: row.get(2)?,
+                    event_type: row.get(3)?,
+                    name: row.get(4)?,
+                    detail: row.get(5)?,
+                })
+            })?;
+            rows.collect()
+        })()
+        .unwrap_or_default()
     }
 
     // ── helpers ──────────────────────────────────────────────────────

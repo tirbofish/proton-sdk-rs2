@@ -7,15 +7,16 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, MountOption, OpenAccMode, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
+    Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
+    MountOption, OpenAccMode, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
 };
 use proton_drive_sdk::client::ProtonDriveClient;
 use proton_drive_sdk::node::revision::RevisionUid;
 use proton_drive_sdk::node::{DegradedNode, Node, NodeUid};
 use proton_drive_sdk::utils::PotentialObject;
-use sha2::{Sha256, Digest};
+use proton_sdk_rs2::session::ProtonAPISession;
+use sha2::{Digest, Sha256};
 
 use crate::app::ProtonDrive;
 use crate::db::{FuseDb, InodeRow};
@@ -31,10 +32,34 @@ static MOUNT_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 /// Online/offline state — updated by the event poll loop.
 static ONLINE: AtomicBool = AtomicBool::new(true);
+static FORCE_OFFLINE: AtomicBool = AtomicBool::new(false);
+static SYNC_PAUSED: AtomicBool = AtomicBool::new(false);
+static SYNC_NOW: AtomicBool = AtomicBool::new(false);
 
 /// Returns whether the client currently has connectivity to the Proton API.
 pub fn is_online() -> bool {
-    ONLINE.load(Ordering::Relaxed)
+    ONLINE.load(Ordering::Relaxed) && !FORCE_OFFLINE.load(Ordering::Relaxed)
+}
+
+pub fn set_force_offline(force: bool) {
+    FORCE_OFFLINE.store(force, Ordering::Relaxed);
+    if force {
+        ONLINE.store(false, Ordering::Relaxed);
+    }
+}
+
+pub fn is_sync_paused() -> bool {
+    SYNC_PAUSED.load(Ordering::Relaxed)
+}
+
+pub fn toggle_sync_paused() -> bool {
+    let new_value = !SYNC_PAUSED.load(Ordering::Relaxed);
+    SYNC_PAUSED.store(new_value, Ordering::Relaxed);
+    new_value
+}
+
+pub fn retry_sync_now() {
+    SYNC_NOW.store(true, Ordering::Relaxed);
 }
 
 /// Best-effort unmount via fusermount. Safe to call from signal handlers
@@ -112,8 +137,7 @@ impl ProtonDriveFs {
         self.rt.spawn(event_poll_loop(db.clone(), drive.clone()));
 
         // Journal flusher
-        self.rt
-            .spawn(journal_flush_loop(db, drive, cache_dir));
+        self.rt.spawn(journal_flush_loop(db, drive, cache_dir));
     }
 
     // ── Helpers ──────────────────────────────────────────────────────
@@ -149,11 +173,31 @@ impl ProtonDriveFs {
         }
     }
 
-    /// Make sure the root inode has a real NodeUid (lazy-fetched from API).
-    fn ensure_root_resolved(&self) {
+    fn ensure_my_files_root(&self) -> Option<u64> {
+        let db = self.db.lock().unwrap();
+        match db.ensure_my_files_root() {
+            Ok(ino) => Some(ino),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to ensure MyFiles root");
+                None
+            }
+        }
+    }
+
+    /// Make sure the MyFiles inode has the real Proton "My files" NodeUid.
+    fn ensure_my_files_resolved(&self) {
+        if !is_online() {
+            return;
+        }
+
+        let my_files_ino = match self.ensure_my_files_root() {
+            Some(ino) => ino,
+            None => return,
+        };
+
         let needs_resolve = {
             let db = self.db.lock().unwrap();
-            db.get_inode(ROOT_INO)
+            db.get_inode(my_files_ino)
                 .map(|r| r.node_uid.is_none())
                 .unwrap_or(true)
         };
@@ -168,16 +212,24 @@ impl ProtonDriveFs {
                 let vol = folder.base.uid.volume_id.raw().to_string();
                 let link = folder.base.uid.link_id.raw().to_string();
                 let db = self.db.lock().unwrap();
-                let _ = db.update_node_uid(ROOT_INO, &uid_raw, &vol, &link);
+                let _ = db.update_node_uid(my_files_ino, &uid_raw, &vol, &link);
             }
             Err(e) => {
-                tracing::warn!(error = %e, "failed to resolve root folder from API");
+                tracing::warn!(error = %e, "failed to resolve MyFiles folder from API");
             }
         }
     }
 
     /// Populate the children of a directory if not yet done.
     fn ensure_children_populated(&self, parent_ino: u64) {
+        if parent_ino == ROOT_INO {
+            if self.ensure_my_files_root().is_some() {
+                let db = self.db.lock().unwrap();
+                let _ = db.set_children_populated(ROOT_INO);
+            }
+            return;
+        }
+
         let parent = {
             let db = self.db.lock().unwrap();
             match db.get_inode(parent_ino) {
@@ -189,15 +241,14 @@ impl ProtonDriveFs {
         // Resolve the NodeUid for this parent.
         let node_uid_str = match parent.node_uid {
             Some(ref u) => u.clone(),
-            None if parent_ino == ROOT_INO => {
-                self.ensure_root_resolved();
+            None => {
+                self.ensure_my_files_resolved();
                 let db = self.db.lock().unwrap();
-                match db.get_inode(ROOT_INO).and_then(|r| r.node_uid) {
+                match db.get_inode(parent_ino).and_then(|r| r.node_uid) {
                     Some(u) => u,
                     None => return,
                 }
             }
-            None => return,
         };
 
         let node_uid = match NodeUid::try_parse(&node_uid_str) {
@@ -205,22 +256,28 @@ impl ProtonDriveFs {
             None => return,
         };
 
+        if !is_online() {
+            let db = self.db.lock().unwrap();
+            if !db.list_children(parent_ino).is_empty() {
+                let _ = db.set_children_populated(parent_ino);
+            }
+            return;
+        }
+
         // Fetch children from Proton Drive API with a timeout so offline
         // doesn't block FUSE operations for the full HTTP timeout duration.
         use proton_drive_sdk::futures::StreamExt;
         let children = match self.rt.block_on(async {
-            let result = tokio::time::timeout(
-                Duration::from_secs(10),
-                async {
-                    let stream = self.drive.enumerate_folder_children(node_uid).await?;
-                    tokio::pin!(stream);
-                    let mut out = Vec::new();
-                    while let Some(item) = stream.next().await {
-                        out.push(item?);
-                    }
-                    Ok::<_, anyhow::Error>(out)
+            let result = tokio::time::timeout(Duration::from_secs(10), async {
+                let stream = self.drive.enumerate_folder_children(node_uid).await?;
+                tokio::pin!(stream);
+                let mut out = Vec::new();
+                while let Some(item) = stream.next().await {
+                    out.push(item?);
                 }
-            ).await;
+                Ok::<_, anyhow::Error>(out)
+            })
+            .await;
             match result {
                 Ok(inner) => inner,
                 Err(_) => Err(anyhow::anyhow!("timed out (offline?)")),
@@ -265,8 +322,10 @@ impl ProtonDriveFs {
         let is_dir = matches!(node, Node::Folder(_) | Node::Album(_));
         let (size, media_type, revision_uid, mtime) = match node {
             Node::File(f) | Node::Photo(f) => {
-                let sz = f.active_revision.claimed_size.unwrap_or(f.total_size_on_cloud_storage)
-                    as u64;
+                let sz = f
+                    .active_revision
+                    .claimed_size
+                    .unwrap_or(f.total_size_on_cloud_storage) as u64;
                 let rev = f.active_revision.uid.to_string();
                 let mt = f
                     .active_revision
@@ -275,7 +334,12 @@ impl ProtonDriveFs {
                     .unwrap_or_else(|| node.base().creation_time.timestamp());
                 (sz, f.base.media_type.clone(), Some(rev), mt)
             }
-            _ => (0u64, String::new(), None, node.base().creation_time.timestamp()),
+            _ => (
+                0u64,
+                String::new(),
+                None,
+                node.base().creation_time.timestamp(),
+            ),
         };
 
         let _ = db.insert_inode(
@@ -394,6 +458,15 @@ impl ProtonDriveFs {
             return Ok(cache_path);
         }
 
+        if !is_online() {
+            tracing::info!(
+                ino = row.ino,
+                name = %row.name,
+                "file is not cached and network is unavailable"
+            );
+            return Err(Some("file is not available offline".to_string()));
+        }
+
         // Register with transfer tracker for dashboard visibility.
         let idx = self.tracker.add(
             row.name.clone(),
@@ -436,16 +509,64 @@ impl ProtonDriveFs {
     fn alloc_fh(&self) -> u64 {
         self.next_fh.fetch_add(1, Ordering::Relaxed)
     }
+
+    fn enqueue_upload_for_row(&self, mut row: InodeRow) {
+        if !row.dirty || row.is_dir {
+            return;
+        }
+
+        if row.node_uid.is_some() && row.revision_uid.is_none() {
+            if let Some(ref node_uid_str) = row.node_uid {
+                if let Some(uid) = NodeUid::try_parse(node_uid_str) {
+                    match self.rt.block_on(self.drive.get_node_uncached(uid)) {
+                        Ok(PotentialObject::Node(Node::File(f)))
+                        | Ok(PotentialObject::Node(Node::Photo(f))) => {
+                            row.revision_uid = Some(f.active_revision.uid.to_string());
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                ino = row.ino,
+                                "failed to refresh revision before queuing file update"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let payload = serde_json::json!({
+            "ino": row.ino,
+            "cached_path": row.cached_path,
+            "parent_ino": row.parent_ino,
+            "name": row.name,
+            "node_uid": row.node_uid,
+            "revision_uid": row.revision_uid,
+            "size": row.size,
+            "media_type": row.media_type,
+            "mtime": row.mtime,
+        });
+        let event = if row.node_uid.is_some() && row.revision_uid.is_some() {
+            "update_revision"
+        } else if row.node_uid.is_some() {
+            tracing::warn!(
+                ino = row.ino,
+                "remote file is dirty but has no active revision; deferring upload"
+            );
+            return;
+        } else {
+            "create_file"
+        };
+        let db = self.db.lock().unwrap();
+        let _ = db.enqueue_journal(event, row.ino, &payload.to_string());
+    }
 }
 
 // ── Filesystem trait implementation ──────────────────────────────────
 
 impl Filesystem for ProtonDriveFs {
-    fn init(
-        &mut self,
-        _req: &Request,
-        _config: &mut fuser::KernelConfig,
-    ) -> std::io::Result<()> {
+    fn init(&mut self, _req: &Request, _config: &mut fuser::KernelConfig) -> std::io::Result<()> {
         tracing::info!("ProtonDriveFs: FUSE init");
         // Ensure root inode row exists.
         let db = self.db.lock().unwrap();
@@ -453,6 +574,8 @@ impl Filesystem for ProtonDriveFs {
             db.insert_root(None, None, None)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         }
+        db.ensure_my_files_root()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         Ok(())
     }
 
@@ -470,7 +593,17 @@ impl Filesystem for ProtonDriveFs {
             }
         };
 
-        // Lazily populate children on first lookup into a directory.
+        {
+            let db = self.db.lock().unwrap();
+            if let Some(row) = db.lookup_child(parent_ino, name_str) {
+                let attr = self.inode_to_attr(&row);
+                reply.entry(&TTL, &attr, Generation(0));
+                return;
+            }
+        }
+
+        // Lazily populate children only after the local cache misses. This
+        // keeps Nautilus folder naming responsive for local/offline creates.
         self.ensure_children_populated(parent_ino);
 
         let db = self.db.lock().unwrap();
@@ -520,22 +653,30 @@ impl Filesystem for ProtonDriveFs {
         reply: ReplyAttr,
     ) {
         let ino_u64: u64 = ino.0;
-        let db = self.db.lock().unwrap();
 
         // Handle truncation.
         if let Some(new_size) = size {
-            let _ = db.update_size(ino_u64, new_size);
+            let row_to_enqueue = {
+                let db = self.db.lock().unwrap();
+                let _ = db.update_size(ino_u64, new_size);
 
-            // Truncate the cached file if present.
-            if let Some(row) = db.get_inode(ino_u64) {
-                if let Some(ref cp) = row.cached_path {
-                    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(cp) {
-                        let _ = f.set_len(new_size);
+                // Truncate the cached file if present.
+                if let Some(row) = db.get_inode(ino_u64) {
+                    if let Some(ref cp) = row.cached_path {
+                        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(cp) {
+                            let _ = f.set_len(new_size);
+                        }
                     }
                 }
+                let _ = db.set_dirty(ino_u64, true);
+                db.get_inode(ino_u64)
+            };
+            if let Some(row) = row_to_enqueue {
+                self.enqueue_upload_for_row(row);
             }
         }
 
+        let db = self.db.lock().unwrap();
         match db.get_inode(ino_u64) {
             Some(row) => {
                 let attr = self.inode_to_attr(&row);
@@ -607,13 +748,7 @@ impl Filesystem for ProtonDriveFs {
         reply.ok();
     }
 
-    fn open(
-        &self,
-        req: &Request,
-        ino: fuser::INodeNo,
-        flags: fuser::OpenFlags,
-        reply: ReplyOpen,
-    ) {
+    fn open(&self, req: &Request, ino: fuser::INodeNo, flags: fuser::OpenFlags, reply: ReplyOpen) {
         let ino_u64: u64 = ino.0;
         let row = {
             let db = self.db.lock().unwrap();
@@ -632,7 +767,9 @@ impl Filesystem for ProtonDriveFs {
         }
 
         // Block thumbnailer processes from triggering downloads of uncached files.
-        let is_cached = row.cached_path.as_ref()
+        let is_cached = row
+            .cached_path
+            .as_ref()
             .map(|p| std::path::Path::new(p).exists())
             .unwrap_or(false);
         if !is_cached && self.thumb_config.is_blocked_process(req.pid()) {
@@ -664,12 +801,19 @@ impl Filesystem for ProtonDriveFs {
             Err(Some(msg)) => {
                 // Download actually failed — report I/O error to caller.
                 tracing::error!(ino = ino_u64, error = %msg, "cannot open file: download failed");
-                reply.error(Errno::EIO);
+                if !is_online() {
+                    reply.error(Errno::EHOSTUNREACH);
+                } else {
+                    reply.error(Errno::EIO);
+                }
                 return;
             }
         };
 
-        let writable = matches!(flags.acc_mode(), OpenAccMode::O_WRONLY | OpenAccMode::O_RDWR);
+        let writable = matches!(
+            flags.acc_mode(),
+            OpenAccMode::O_WRONLY | OpenAccMode::O_RDWR
+        );
 
         let file = match std::fs::OpenOptions::new()
             .read(true)
@@ -810,27 +954,12 @@ impl Filesystem for ProtonDriveFs {
         self.open_files.write().unwrap().remove(&fh_u64);
 
         // If the file was dirtied, enqueue a journal entry for upload.
-        let db = self.db.lock().unwrap();
-        if let Some(row) = db.get_inode(ino_u64) {
-            if row.dirty {
-                let payload = serde_json::json!({
-                    "ino": ino_u64,
-                    "cached_path": row.cached_path,
-                    "parent_ino": row.parent_ino,
-                    "name": row.name,
-                    "node_uid": row.node_uid,
-                    "revision_uid": row.revision_uid,
-                    "size": row.size,
-                    "media_type": row.media_type,
-                    "mtime": row.mtime,
-                });
-                let event = if row.node_uid.is_some() && row.revision_uid.is_some() {
-                    "update_revision"
-                } else {
-                    "create_file"
-                };
-                let _ = db.enqueue_journal(event, ino_u64, &payload.to_string());
-            }
+        let row = {
+            let db = self.db.lock().unwrap();
+            db.get_inode(ino_u64)
+        };
+        if let Some(row) = row {
+            self.enqueue_upload_for_row(row);
         }
 
         reply.ok();
@@ -855,6 +984,11 @@ impl Filesystem for ProtonDriveFs {
             }
         };
 
+        if parent_ino == ROOT_INO {
+            reply.error(Errno::EACCES);
+            return;
+        }
+
         let db = self.db.lock().unwrap();
         // Reject duplicates.
         if db.lookup_child(parent_ino, name_str).is_some() {
@@ -866,7 +1000,16 @@ impl Filesystem for ProtonDriveFs {
             .first_or_octet_stream()
             .to_string();
         let new_ino = match db.insert_inode(
-            parent_ino, name_str, None, None, None, false, 0, &media_type, None, 0,
+            parent_ino,
+            name_str,
+            None,
+            None,
+            None,
+            false,
+            0,
+            &media_type,
+            None,
+            0,
         ) {
             Ok(ino) => ino,
             Err(e) => {
@@ -930,7 +1073,13 @@ impl Filesystem for ProtonDriveFs {
             children_populated: false,
         };
         let attr = self.inode_to_attr(&row_for_attr);
-        reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
+        reply.created(
+            &TTL,
+            &attr,
+            Generation(0),
+            FileHandle(fh),
+            FopenFlags::empty(),
+        );
     }
 
     fn mkdir(
@@ -951,20 +1100,26 @@ impl Filesystem for ProtonDriveFs {
             }
         };
 
+        if parent_ino == ROOT_INO {
+            reply.error(Errno::EACCES);
+            return;
+        }
+
         let db = self.db.lock().unwrap();
         if db.lookup_child(parent_ino, name_str).is_some() {
             reply.error(Errno::EEXIST);
             return;
         }
 
-        let new_ino = match db.insert_inode(parent_ino, name_str, None, None, None, true, 0, "", None, 0) {
-            Ok(ino) => ino,
-            Err(e) => {
-                tracing::warn!(error = %e, "mkdir db insert failed");
-                reply.error(Errno::EIO);
-                return;
-            }
-        };
+        let new_ino =
+            match db.insert_inode(parent_ino, name_str, None, None, None, true, 0, "", None, 0) {
+                Ok(ino) => ino,
+                Err(e) => {
+                    tracing::warn!(error = %e, "mkdir db insert failed");
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            };
 
         // Enqueue for upstream creation.
         let payload = serde_json::json!({
@@ -1006,6 +1161,11 @@ impl Filesystem for ProtonDriveFs {
             }
         };
 
+        if parent_ino == ROOT_INO {
+            reply.error(Errno::EACCES);
+            return;
+        }
+
         let db = self.db.lock().unwrap();
         let row = match db.lookup_child(parent_ino, name_str) {
             Some(r) => r,
@@ -1044,6 +1204,11 @@ impl Filesystem for ProtonDriveFs {
             }
         };
 
+        if parent_ino == ROOT_INO {
+            reply.error(Errno::EACCES);
+            return;
+        }
+
         let db = self.db.lock().unwrap();
         let row = match db.lookup_child(parent_ino, name_str) {
             Some(r) => r,
@@ -1057,6 +1222,10 @@ impl Filesystem for ProtonDriveFs {
             reply.error(Errno::ENOTDIR);
             return;
         }
+
+        drop(db);
+        self.ensure_children_populated(row.ino);
+        let db = self.db.lock().unwrap();
 
         // Check if directory is empty.
         if !db.list_children(row.ino).is_empty() {
@@ -1100,6 +1269,11 @@ impl Filesystem for ProtonDriveFs {
             }
         };
 
+        if parent_ino == ROOT_INO || newparent_ino == ROOT_INO {
+            reply.error(Errno::EACCES);
+            return;
+        }
+
         let db = self.db.lock().unwrap();
         let row = match db.lookup_child(parent_ino, name_str) {
             Some(r) => r,
@@ -1114,6 +1288,10 @@ impl Filesystem for ProtonDriveFs {
             if existing.is_dir && !db.list_children(existing.ino).is_empty() {
                 reply.error(Errno::ENOTEMPTY);
                 return;
+            }
+            if let Some(ref node_uid) = existing.node_uid {
+                let payload = serde_json::json!({ "node_uid": node_uid });
+                let _ = db.enqueue_journal("delete", existing.ino, &payload.to_string());
             }
             let _ = db.delete_inode(existing.ino);
         }
@@ -1149,10 +1327,8 @@ impl Filesystem for ProtonDriveFs {
         let (used, total) = self
             .rt
             .block_on(async {
-                tokio::time::timeout(
-                    Duration::from_secs(5),
-                    self.drive.get_user_storage_info(),
-                ).await
+                tokio::time::timeout(Duration::from_secs(5), self.drive.get_user_storage_info())
+                    .await
             })
             .ok()
             .and_then(|r| r.ok())
@@ -1193,11 +1369,11 @@ async fn event_poll_loop(db: Arc<Mutex<FuseDb>>, drive: ProtonDriveClient) {
     // Wait a moment for the root to be resolved before starting.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // Resolve volume_id from root inode.
+    // Resolve volume_id from the Proton "My files" inode.
     let volume_id = {
         let cached_vol = {
             let db = db.lock().unwrap();
-            db.get_inode(ROOT_INO).and_then(|r| r.volume_id)
+            db.my_files_inode().and_then(|r| r.volume_id)
         };
         match cached_vol {
             Some(v) => proton_drive_sdk::volume::VolumeId::new(v),
@@ -1219,15 +1395,9 @@ async fn event_poll_loop(db: Arc<Mutex<FuseDb>>, drive: ProtonDriveClient) {
         let stored = db.lock().unwrap().get_event_cursor(volume_id.raw());
         match stored {
             Some(c) => c,
-            None => match drive
-                .get_volume_latest_event_id(volume_id.clone())
-                .await
-            {
+            None => match drive.get_volume_latest_event_id(volume_id.clone()).await {
                 Ok(c) => {
-                    let _ = db
-                        .lock()
-                        .unwrap()
-                        .set_event_cursor(volume_id.raw(), &c);
+                    let _ = db.lock().unwrap().set_event_cursor(volume_id.raw(), &c);
                     c
                 }
                 Err(e) => {
@@ -1241,10 +1411,12 @@ async fn event_poll_loop(db: Arc<Mutex<FuseDb>>, drive: ProtonDriveClient) {
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;
 
-        let resp = match drive
-            .poll_volume_events(volume_id.clone(), &cursor)
-            .await
-        {
+        if FORCE_OFFLINE.load(Ordering::Relaxed) {
+            ONLINE.store(false, Ordering::Relaxed);
+            continue;
+        }
+
+        let resp = match drive.poll_volume_events(volume_id.clone(), &cursor).await {
             Ok(r) => {
                 if !ONLINE.swap(true, Ordering::Relaxed) {
                     tracing::info!("connectivity restored — back online");
@@ -1265,17 +1437,26 @@ async fn event_poll_loop(db: Arc<Mutex<FuseDb>>, drive: ProtonDriveClient) {
                 Some(VolumeEventType::Delete) => {
                     let db = db.lock().unwrap();
                     if let Some(row) = db.find_by_link_id(&link_id_str) {
+                        let _ = db.record_sync_event(
+                            "web",
+                            "delete",
+                            Some(&row.name),
+                            Some(&link_id_str),
+                        );
                         // Remove cached file.
                         if let Some(ref cp) = row.cached_path {
                             let _ = std::fs::remove_file(cp);
                         }
                         let _ = db.delete_inode(row.ino);
+                    } else {
+                        let _ = db.record_sync_event("web", "delete", None, Some(&link_id_str));
                     }
                 }
                 Some(VolumeEventType::Create) => {
                     // Invalidate parent so next readdir re-fetches.
+                    let db = db.lock().unwrap();
+                    let _ = db.record_sync_event("web", "create", None, Some(&link_id_str));
                     if let Some(parent_link_id) = &event.link.parent_link_id {
-                        let db = db.lock().unwrap();
                         if let Some(parent_row) = db.find_by_link_id(parent_link_id.raw()) {
                             let _ = db.clear_children_populated(parent_row.ino);
                         }
@@ -1283,7 +1464,17 @@ async fn event_poll_loop(db: Arc<Mutex<FuseDb>>, drive: ProtonDriveClient) {
                 }
                 Some(VolumeEventType::UpdateMetadata) | Some(VolumeEventType::UpdateContent) => {
                     let db = db.lock().unwrap();
+                    let event_type = match event.event_type() {
+                        Some(VolumeEventType::UpdateContent) => "update-content",
+                        _ => "update-metadata",
+                    };
                     if let Some(row) = db.find_by_link_id(&link_id_str) {
+                        let _ = db.record_sync_event(
+                            "web",
+                            event_type,
+                            Some(&row.name),
+                            Some(&link_id_str),
+                        );
                         // Invalidate cache so next open re-downloads.
                         if let Some(ref cp) = row.cached_path {
                             let _ = std::fs::remove_file(cp);
@@ -1292,6 +1483,8 @@ async fn event_poll_loop(db: Arc<Mutex<FuseDb>>, drive: ProtonDriveClient) {
 
                         // Also invalidate parent children so metadata refreshes.
                         let _ = db.clear_children_populated(row.parent_ino);
+                    } else {
+                        let _ = db.record_sync_event("web", event_type, None, Some(&link_id_str));
                     }
                 }
                 _ => {}
@@ -1308,16 +1501,23 @@ async fn event_poll_loop(db: Arc<Mutex<FuseDb>>, drive: ProtonDriveClient) {
 
 // ── Background journal-flush loop ────────────────────────────────────
 
-async fn journal_flush_loop(
-    db: Arc<Mutex<FuseDb>>,
-    drive: ProtonDriveClient,
-    _cache_dir: PathBuf,
-) {
+async fn journal_flush_loop(db: Arc<Mutex<FuseDb>>, drive: ProtonDriveClient, cache_dir: PathBuf) {
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
 
         // Skip flush attempts when offline to avoid spamming failed requests.
-        if !ONLINE.load(Ordering::Relaxed) {
+        if !is_online() || SYNC_PAUSED.load(Ordering::Relaxed) {
+            if !SYNC_NOW.swap(false, Ordering::Relaxed) {
+                continue;
+            }
+            if !is_online() || SYNC_PAUSED.load(Ordering::Relaxed) {
+                continue;
+            }
+        } else {
+            let _ = SYNC_NOW.swap(false, Ordering::Relaxed);
+        }
+
+        if FORCE_OFFLINE.load(Ordering::Relaxed) {
             continue;
         }
 
@@ -1327,7 +1527,7 @@ async fn journal_flush_loop(
         };
 
         for entry in entries {
-            let result = process_journal_entry(&db, &drive, &entry).await;
+            let result = process_journal_entry(&db, &drive, &cache_dir, &entry).await;
 
             let db = db.lock().unwrap();
             match result {
@@ -1386,14 +1586,21 @@ async fn resolve_parent_node_uid(
     }
 
     // Not resolved — try to resolve it from the API.
-    if parent_ino == ROOT_INO {
-        let folder = drive.get_my_files_folder().await
+    let my_files_ino = {
+        let db_guard = db.lock().unwrap();
+        db_guard.ensure_my_files_root().ok()
+    };
+
+    if Some(parent_ino) == my_files_ino {
+        let folder = drive
+            .get_my_files_folder()
+            .await
             .map_err(|e| anyhow::anyhow!("failed to resolve root from API: {}", e))?;
         let uid_raw = folder.base.uid.raw();
         let vol = folder.base.uid.volume_id.raw().to_string();
         let link = folder.base.uid.link_id.raw().to_string();
         let db_guard = db.lock().unwrap();
-        let _ = db_guard.update_node_uid(ROOT_INO, &uid_raw, &vol, &link);
+        let _ = db_guard.update_node_uid(parent_ino, &uid_raw, &vol, &link);
         return Ok(uid_raw);
     }
 
@@ -1421,27 +1628,54 @@ async fn resolve_parent_node_uid(
     Err(anyhow::anyhow!("parent not resolved"))
 }
 
+fn cache_path_for_revision_in(cache_dir: &std::path::Path, rev_str: &str) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(rev_str.as_bytes());
+    let hash = format!("{:x}", hasher.finalize());
+    cache_dir.join(hash)
+}
+
+fn move_cache_to_revision_path(current_path: &str, stable_cache_path: PathBuf) -> PathBuf {
+    let current_path = PathBuf::from(current_path);
+    if current_path == stable_cache_path {
+        return stable_cache_path;
+    }
+    if let Some(parent) = stable_cache_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::rename(&current_path, &stable_cache_path).is_err() {
+        let _ = std::fs::copy(&current_path, &stable_cache_path);
+    }
+    stable_cache_path
+}
+
 async fn process_journal_entry(
     db: &Arc<Mutex<FuseDb>>,
     drive: &ProtonDriveClient,
+    cache_dir: &std::path::Path,
     entry: &crate::db::JournalEntry,
 ) -> anyhow::Result<()> {
     let payload: serde_json::Value = serde_json::from_str(&entry.payload)?;
 
     match entry.event_type.as_str() {
         "create_folder" => {
-            let parent_ino = payload["parent_ino"].as_u64().unwrap_or(ROOT_INO);
-            let name = payload["name"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("missing name"))?;
+            let row = {
+                let db_guard = db.lock().unwrap();
+                match db_guard.get_inode(entry.ino) {
+                    Some(row) => row,
+                    None => return Ok(()),
+                }
+            };
+            if row.node_uid.is_some() {
+                return Ok(());
+            }
+            let parent_ino = row.parent_ino;
+            let name = row.name.clone();
 
             let parent_node_uid = resolve_parent_node_uid(db, drive, parent_ino).await?;
-            let parent_uid = NodeUid::parse(&parent_node_uid)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let parent_uid = NodeUid::parse(&parent_node_uid).map_err(|e| anyhow::anyhow!(e))?;
 
-            let folder = drive
-                .create_folder(parent_uid, name.to_string(), None)
-                .await?;
+            let folder = drive.create_folder(parent_uid, name, None).await?;
 
             let uid_raw = folder.base.uid.raw();
             let db = db.lock().unwrap();
@@ -1454,38 +1688,44 @@ async fn process_journal_entry(
         }
 
         "create_file" => {
-            let parent_ino = payload["parent_ino"].as_u64().unwrap_or(ROOT_INO);
-            let name = payload["name"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("missing name"))?;
-            let cached_path = payload["cached_path"]
-                .as_str()
+            let row = {
+                let db_guard = db.lock().unwrap();
+                match db_guard.get_inode(entry.ino) {
+                    Some(row) => row,
+                    None => return Ok(()),
+                }
+            };
+            if row.node_uid.is_some() && row.revision_uid.is_some() {
+                return Ok(());
+            }
+            let parent_ino = row.parent_ino;
+            let name = row.name.clone();
+            let cached_path = row
+                .cached_path
+                .clone()
+                .or_else(|| payload["cached_path"].as_str().map(ToOwned::to_owned))
                 .ok_or_else(|| anyhow::anyhow!("missing cached_path"))?;
-            let size = payload["size"].as_u64().unwrap_or(0) as i64;
-            let media_type = payload["media_type"].as_str().unwrap_or("application/octet-stream");
+            let size = row.size as i64;
+            let media_type = if row.media_type.is_empty() {
+                "application/octet-stream".to_string()
+            } else {
+                row.media_type.clone()
+            };
 
             let parent_node_uid = resolve_parent_node_uid(db, drive, parent_ino).await?;
-            let parent_uid =
-                NodeUid::parse(&parent_node_uid).map_err(|e| anyhow::anyhow!(e))?;
+            let parent_uid = NodeUid::parse(&parent_node_uid).map_err(|e| anyhow::anyhow!(e))?;
 
-            let last_mod = payload["mtime"].as_i64()
+            let last_mod = Some(row.mtime)
                 .filter(|&t| t > 0)
                 .map(|t| UNIX_EPOCH + Duration::from_secs(t as u64));
 
             let uploader = drive
                 .get_file_uploader(
-                    parent_uid,
-                    name.to_string(),
-                    media_type.to_string(),
-                    size,
-                    last_mod,
-                    None,
-                    None,
-                    false,
+                    parent_uid, name, media_type, size, last_mod, None, None, false,
                 )
                 .await?;
 
-            let file = tokio::fs::File::open(cached_path).await?;
+            let file = tokio::fs::File::open(&cached_path).await?;
             let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(file);
             let node_uid = uploader
                 .upload_from_stream(reader, vec![], Box::new(|_, _| {}))
@@ -1507,35 +1747,47 @@ async fn process_journal_entry(
             // Without this, subsequent edits queue another create_file instead
             // of update_revision, causing "already exists" errors.
             if let Ok(PotentialObject::Node(Node::File(f)))
-            | Ok(PotentialObject::Node(Node::Photo(f))) =
-                drive.get_node_uncached(node_uid).await
+            | Ok(PotentialObject::Node(Node::Photo(f))) = drive.get_node_uncached(node_uid).await
             {
                 let rev_uid = f.active_revision.uid.to_string();
-                let size = f.active_revision.claimed_size
+                let size = f
+                    .active_revision
+                    .claimed_size
                     .unwrap_or(f.total_size_on_cloud_storage);
                 let db_guard = db.lock().unwrap();
                 let _ = db_guard.update_revision(entry.ino, &rev_uid, size as u64);
-                // Restore cached_path since update_revision clears it.
-                let _ = db_guard.set_cached_path(entry.ino, Some(cached_path));
+                let stable_cache_path = cache_path_for_revision_in(cache_dir, &rev_uid);
+                let stable_cache_path =
+                    move_cache_to_revision_path(&cached_path, stable_cache_path);
+                let _ = db_guard.set_cached_path(entry.ino, stable_cache_path.to_str());
             }
         }
 
         "update_revision" => {
+            let current_row = {
+                let db_guard = db.lock().unwrap();
+                db_guard.get_inode(entry.ino)
+            };
+            let current_row = match current_row {
+                Some(row) => row,
+                None => return Ok(()),
+            };
             let _node_uid_str = payload["node_uid"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("missing node_uid"))?;
             let rev_uid_str = payload["revision_uid"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("missing revision_uid"))?;
-            let cached_path = payload["cached_path"]
-                .as_str()
+            let cached_path = current_row
+                .cached_path
+                .clone()
+                .or_else(|| payload["cached_path"].as_str().map(ToOwned::to_owned))
                 .ok_or_else(|| anyhow::anyhow!("missing cached_path"))?;
-            let size = payload["size"].as_u64().unwrap_or(0) as i64;
+            let size = current_row.size as i64;
 
-            let revision_uid = RevisionUid::parse(rev_uid_str)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let revision_uid = RevisionUid::parse(rev_uid_str).map_err(|e| anyhow::anyhow!(e))?;
 
-            let last_mod = payload["mtime"].as_i64()
+            let last_mod = Some(current_row.mtime)
                 .filter(|&t| t > 0)
                 .map(|t| UNIX_EPOCH + Duration::from_secs(t as u64));
 
@@ -1543,7 +1795,7 @@ async fn process_journal_entry(
                 .get_file_revision_uploader(revision_uid, size, last_mod, None, None)
                 .await?;
 
-            let file = tokio::fs::File::open(cached_path).await?;
+            let file = tokio::fs::File::open(&cached_path).await?;
             let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(file);
             let new_node_uid = uploader
                 .upload_from_stream(reader, vec![], Box::new(|_, _| {}))
@@ -1554,17 +1806,25 @@ async fn process_journal_entry(
             | Ok(PotentialObject::Node(Node::Photo(f))) =
                 drive.get_node_uncached(new_node_uid).await
             {
+                let rev_uid = f.active_revision.uid.to_string();
+                let stable_cache_path = cache_path_for_revision_in(cache_dir, &rev_uid);
+                let stable_cache_path =
+                    move_cache_to_revision_path(&cached_path, stable_cache_path);
                 let db = db.lock().unwrap();
                 let _ = db.update_revision(
                     entry.ino,
-                    &f.active_revision.uid.to_string(),
+                    &rev_uid,
                     f.active_revision.claimed_size.unwrap_or(size) as u64,
                 );
+                let _ = db.set_cached_path(entry.ino, stable_cache_path.to_str());
                 let _ = db.set_dirty(entry.ino, false);
             }
         }
 
         "rename" => {
+            if db.lock().unwrap().get_inode(entry.ino).is_none() {
+                return Ok(());
+            }
             let node_uid_str = payload["node_uid"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("missing node_uid"))?;
@@ -1577,6 +1837,9 @@ async fn process_journal_entry(
         }
 
         "move" => {
+            if db.lock().unwrap().get_inode(entry.ino).is_none() {
+                return Ok(());
+            }
             let node_uid_str = payload["node_uid"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("missing node_uid"))?;
@@ -1586,12 +1849,9 @@ async fn process_journal_entry(
             let new_name = payload["new_name"].as_str();
 
             let uid = NodeUid::parse(node_uid_str).map_err(|e| anyhow::anyhow!(e))?;
-            let new_parent =
-                NodeUid::parse(new_parent_str).map_err(|e| anyhow::anyhow!(e))?;
+            let new_parent = NodeUid::parse(new_parent_str).map_err(|e| anyhow::anyhow!(e))?;
 
-            drive
-                .move_nodes(vec![uid.clone()], new_parent)
-                .await?;
+            drive.move_nodes(vec![uid.clone()], new_parent).await?;
 
             // Apply rename if name also changed.
             if let Some(name) = new_name {
@@ -1618,95 +1878,88 @@ async fn process_journal_entry(
 
 // ── Mount entry-point (called from app.rs) ───────────────────────────
 
-impl ProtonDrive {
-    pub fn mount_fuse(&mut self) {
-        // Only mount once.
-        if self.fuse_session.is_some() {
-            return;
+pub fn spawn_fuse_session(
+    session: &ProtonAPISession,
+    transfer_tracker: TransferTracker,
+    force_offline: bool,
+) -> Option<fuser::BackgroundSession> {
+    let config_dir = platform_dirs::AppDirs::new(Some("pdcli"), false)
+        .expect("config dir")
+        .config_dir;
+    let cache_dir = config_dir.join("fuse_cache");
+    std::fs::create_dir_all(&cache_dir).ok();
+    let db_path = config_dir.join("fuse.db");
+    let mountpoint = dirs::home_dir().expect("home dir").join("ProtonDrive");
+    std::fs::create_dir_all(&mountpoint).ok();
+
+    let db = match FuseDb::open(&db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to open FUSE database");
+            return None;
         }
+    };
 
-        let session = match &self.state {
-            crate::app::AppState::Authenticated(s) => s.clone(),
-            _ => return,
-        };
-
-        let config_dir = platform_dirs::AppDirs::new(Some("pdcli"), false)
-            .expect("config dir")
-            .config_dir;
-        let cache_dir = config_dir.join("fuse_cache");
-        std::fs::create_dir_all(&cache_dir).ok();
-        let db_path = config_dir.join("fuse.db");
-        let mountpoint = dirs::home_dir()
-            .expect("home dir")
-            .join("ProtonDrive");
-        std::fs::create_dir_all(&mountpoint).ok();
-
-        let db = match FuseDb::open(&db_path) {
-            Ok(db) => db,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to open FUSE database");
-                return;
-            }
-        };
-
-        let drive = match ProtonDriveClient::new(&session, None) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to create ProtonDriveClient");
-                return;
-            }
-        };
-
-        // Seed root inode.
-        if let Err(e) = db.insert_root(None, None, None) {
-            tracing::error!(error = %e, "failed to insert root inode");
-            return;
+    let drive = match ProtonDriveClient::new(session, None) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to create ProtonDriveClient");
+            return None;
         }
+    };
 
-        let rt = tokio::runtime::Handle::current();
-        let fs = ProtonDriveFs::new(db, cache_dir, drive, rt, self.transfer_tracker.clone());
-        fs.spawn_background_workers();
+    set_force_offline(force_offline);
 
-        tracing::info!(mount = %mountpoint.display(), "mounting FUSE filesystem");
+    // Seed root inode.
+    if let Err(e) = db.insert_root(None, None, None) {
+        tracing::error!(error = %e, "failed to insert root inode");
+        return None;
+    }
+    if let Err(e) = db.ensure_my_files_root() {
+        tracing::error!(error = %e, "failed to insert MyFiles inode");
+        return None;
+    }
 
-        // Clean up any stale mount from a previous crash.
-        let _ = std::process::Command::new("fusermount3")
-            .args(["-u", "-z", &*mountpoint.to_string_lossy()])
-            .status()
-            .or_else(|_| {
-                std::process::Command::new("fusermount")
-                    .args(["-u", "-z", &*mountpoint.to_string_lossy()])
-                    .status()
-            });
+    let rt = tokio::runtime::Handle::current();
+    let fs = ProtonDriveFs::new(db, cache_dir, drive, rt, transfer_tracker);
+    fs.spawn_background_workers();
 
-        let mut config = Config::default();
-        config.mount_options = vec![MountOption::FSName("proton-drive".into())];
-        match fuser::spawn_mount2(
-            fs,
-            &mountpoint,
-            &config,
-        ) {
-            Ok(bg) => {
-                // Register globally so signal/panic handlers can unmount.
-                let _ = MOUNT_PATH.set(mountpoint);
-                self.fuse_session = Some(bg);
-                tracing::info!("FUSE filesystem mounted successfully");
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "FUSE mount failed");
-            }
+    tracing::info!(mount = %mountpoint.display(), "mounting FUSE filesystem");
+
+    // Clean up any stale mount from a previous crash.
+    let _ = std::process::Command::new("fusermount3")
+        .args(["-u", "-z", &*mountpoint.to_string_lossy()])
+        .status()
+        .or_else(|_| {
+            std::process::Command::new("fusermount")
+                .args(["-u", "-z", &*mountpoint.to_string_lossy()])
+                .status()
+        });
+
+    let mut config = Config::default();
+    config.mount_options = vec![MountOption::FSName("proton-drive".into())];
+    match fuser::spawn_mount2(fs, &mountpoint, &config) {
+        Ok(bg) => {
+            // Register globally so signal/panic handlers can unmount.
+            let _ = MOUNT_PATH.set(mountpoint);
+            tracing::info!("FUSE filesystem mounted successfully");
+            Some(bg)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "FUSE mount failed");
+            None
         }
     }
 }
 
 impl Drop for ProtonDrive {
     fn drop(&mut self) {
-        // Drop the BackgroundSession first (triggers fuser's own unmount).
+        // Only unmount when this process owns the FUSE session. The GUI normally
+        // delegates mounting to the daemon, so ordinary window shutdown must not
+        // tear down the daemon-owned mount.
         if let Some(session) = self.fuse_session.take() {
             drop(session);
+            force_unmount();
         }
-        // Belt-and-suspenders: also call fusermount in case fuser's unmount
-        // failed or was skipped.
-        force_unmount();
     }
 }

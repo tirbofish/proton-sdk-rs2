@@ -86,7 +86,10 @@ impl TransferTracker {
     }
 
     pub fn remove_completed(&self) {
-        self.inner.lock().unwrap().retain(|e| e.bytes_transferred < e.total_bytes);
+        self.inner
+            .lock()
+            .unwrap()
+            .retain(|e| e.bytes_transferred < e.total_bytes);
     }
 }
 

@@ -3,10 +3,11 @@ use std::sync::Arc;
 use poll_promise::Promise;
 use proton_drive_sdk::cache::sqlite::SqliteCacheRepository;
 use proton_sdk_rs2::{
-    AppVersionConfiguration, cache::CacheRepository, client::ProtonClientOptions, session::ProtonAPISession
+    AppVersionConfiguration, cache::CacheRepository, client::ProtonClientOptions,
+    session::ProtonAPISession,
 };
 
-use crate::{credentials};
+use crate::credentials;
 
 enum LoginResult {
     Ready(ProtonAPISession),
@@ -127,12 +128,23 @@ impl AuthScreen {
             ui.heading("Sign in to Proton Drive");
             ui.add_space(20.0);
 
-            ui.add_sized([300.0, 28.0], egui::TextEdit::singleline(&mut self.username).hint_text("Username"));
+            ui.add_sized(
+                [300.0, 28.0],
+                egui::TextEdit::singleline(&mut self.username).hint_text("Username"),
+            );
             ui.add_space(8.0);
-            ui.add_sized([300.0, 28.0], egui::TextEdit::singleline(&mut self.password).hint_text("Password").password(true));
+            ui.add_sized(
+                [300.0, 28.0],
+                egui::TextEdit::singleline(&mut self.password)
+                    .hint_text("Password")
+                    .password(true),
+            );
             ui.add_space(12.0);
 
-            let is_loading = self.login_task.as_ref().is_some_and(|t| t.ready().is_none());
+            let is_loading = self
+                .login_task
+                .as_ref()
+                .is_some_and(|t| t.ready().is_none());
 
             if is_loading {
                 ui.spinner();
@@ -140,12 +152,17 @@ impl AuthScreen {
                 ui.ctx().request_repaint();
             } else {
                 let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let sign_in = ui.add_sized([300.0, 32.0], egui::Button::new("Sign in")).clicked();
-                if (sign_in || enter_pressed) && !self.username.is_empty() && !self.password.is_empty() {
+                let sign_in = ui
+                    .add_sized([300.0, 32.0], egui::Button::new("Sign in"))
+                    .clicked();
+                if (sign_in || enter_pressed)
+                    && !self.username.is_empty()
+                    && !self.password.is_empty()
+                {
                     self.begin_login();
                 }
             }
-            
+
             if let Some(err) = &self.error {
                 ui.add_space(8.0);
                 ui.colored_label(egui::Color32::RED, err);
@@ -192,7 +209,10 @@ impl AuthScreen {
             ui.label("Enter the 6-digit code from your authenticator app.");
             ui.add_space(20.0);
 
-            ui.add_sized([200.0, 28.0], egui::TextEdit::singleline(totp_code).hint_text("TOTP code"));
+            ui.add_sized(
+                [200.0, 28.0],
+                egui::TextEdit::singleline(totp_code).hint_text("TOTP code"),
+            );
             ui.add_space(12.0);
 
             if totp_task.is_some() {
@@ -201,7 +221,9 @@ impl AuthScreen {
                 ui.ctx().request_repaint();
             } else {
                 let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let verify_clicked = ui.add_sized([200.0, 32.0], egui::Button::new("Verify")).clicked();
+                let verify_clicked = ui
+                    .add_sized([200.0, 32.0], egui::Button::new("Verify"))
+                    .clicked();
                 if (verify_clicked || enter_pressed) && !totp_code.is_empty() {
                     should_submit = true;
                 }

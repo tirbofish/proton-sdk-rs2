@@ -5,6 +5,8 @@ use anyhow::Context;
 
 use crate::account::{AccountClient, AccountClientAdapter};
 use crate::api::DriveApiClients;
+use crate::api::devices::DeviceType;
+use crate::api::events::{CoreEventsResponse, VolumeEventsResponse};
 use crate::api::{DefaultDriveApiClientsFactory, DriveApiClientsFactory};
 use crate::block::download::BlockDownloader;
 use crate::block::upload::BlockUploader;
@@ -12,6 +14,8 @@ use crate::block::verify::{BlockVerifierFactory, DefaultBlockVerifierFactory};
 use crate::cache::client::{DefaultDriveClientCache, DriveClientCache};
 use crate::cache::entity::{DefaultDriveEntityCache, DriveEntityCache};
 use crate::cache::secret::{DefaultDriveSecretCache, DriveSecretCache};
+use crate::device_ops::{Device, DeviceOperations};
+use crate::links::LinkId;
 use crate::meta::AdditionalMetadataProperty;
 use crate::node::draft::{NewFileDraftProvider, NewRevisionDraftProvider, RevisionDraftProvider};
 use crate::node::file::FileOperations;
@@ -20,16 +24,14 @@ use crate::node::file::download::FileDownloader;
 use crate::node::file::upload::FileUploader;
 use crate::node::folder::{FolderNode, FolderOperations};
 use crate::node::operations::NodeOperations;
-use crate::node::revision::{REVISION_WRITER_DEFAULT_BLOCK_SIZE, RevisionInfo, RevisionState, RevisionUid};
+use crate::node::revision::{
+    REVISION_WRITER_DEFAULT_BLOCK_SIZE, RevisionInfo, RevisionState, RevisionUid,
+};
 use crate::node::thumbnail::ThumbnailType;
 use crate::node::{DegradedNode, Node, NodeUid};
-use crate::api::events::{CoreEventsResponse, VolumeEventsResponse};
-use crate::device_ops::{Device, DeviceOperations};
-use crate::api::devices::DeviceType;
-use crate::volume::VolumeId;
-use crate::links::LinkId;
 use crate::utils::PotentialObject;
 use crate::utils::semaphore::FifoFlexibleSemaphore;
+use crate::volume::VolumeId;
 use crate::volume_operations::VolumeOperations;
 use proton_sdk_rs2::auth::TokenCredential;
 use proton_sdk_rs2::client::ProtonApiDefaults;
@@ -52,9 +54,9 @@ pub struct ProtonDriveClientOptions {
     ///
     /// By default, it is `None`, but when constructed in the x-pm-appversion, it is considered as `rust`.
     pub bindings_language: Option<String>,
-    /// The amount of time in seconds before a timeout. 
+    /// The amount of time in seconds before a timeout.
     pub api_call_timeout: Option<u32>,
-    /// The amount of time in seconds before a timeout for storage-based api's. 
+    /// The amount of time in seconds before a timeout for storage-based api's.
     pub storage_call_timeout: Option<u32>,
 }
 
@@ -77,11 +79,11 @@ pub struct ProtonDriveClient {
 
 // initialisers
 impl ProtonDriveClient {
-    const MIN_DEGREE_OF_BLOCK_TRANSFER_PARALLELISM: usize = 2;
-    const MAX_DEGREE_OF_BLOCK_TRANSFER_PARALLELISM: usize = 6;
+    const DEFAULT_DEGREE_OF_BLOCK_TRANSFER_PARALLELISM: usize = 6;
+    const MAX_DEGREE_OF_THUMBNAIL_DOWNLOAD_PARALLELISM: usize = 8;
 
-    /// Creates a new [`ProtonDriveClient`] based on an existing [`ProtonAPISession`]. 
-    /// 
+    /// Creates a new [`ProtonDriveClient`] based on an existing [`ProtonAPISession`].
+    ///
     /// The defacto initialiser.
     ///
     /// The `uid` is an optional unique identifier for this client instance, useful for logging
@@ -94,8 +96,8 @@ impl ProtonDriveClient {
         )
     }
 
-    /// Creates a new [`ProtonDriveClient`] by ensuring that the session is authenticated. 
-    /// 
+    /// Creates a new [`ProtonDriveClient`] by ensuring that the session is authenticated.
+    ///
     /// Can throw an error if any issues occur with authentication.
     ///
     /// The `uid` is an optional unique identifier for this client instance, useful for logging
@@ -112,8 +114,8 @@ impl ProtonDriveClient {
         )
     }
 
-    /// Creates a new [`ProtonDriveClient`] from custom implementations of clients and caches. 
-    /// 
+    /// Creates a new [`ProtonDriveClient`] from custom implementations of clients and caches.
+    ///
     /// Use this if you want full control, however this is typically derived
     /// from [`ProtonAPISession`] in [`Self::new`]
     pub fn from_http_client_factory(
@@ -304,7 +306,8 @@ impl ProtonDriveClient {
 
         let block_uploader = BlockUploader::new(max_degree_of_block_transfer_parallelism);
         let block_downloader = BlockDownloader::new(max_degree_of_block_transfer_parallelism);
-        let thumbnail_block_downloader = BlockDownloader::new(8);
+        let thumbnail_block_downloader =
+            BlockDownloader::new(Self::MAX_DEGREE_OF_THUMBNAIL_DOWNLOAD_PARALLELISM);
 
         Self {
             uid,
@@ -451,15 +454,18 @@ impl ProtonDriveClient {
     /// Fetch and decrypt a thumbnail block belonging to the file identified by
     /// `node_uid`.  `thumbnail_id` is the server-assigned ID stored in the
     /// node's `Revision.thumbnails` list.  Returns the raw (decrypted) image
-    /// bytes on success, which you will have to construct yourself with a crate like `image`. 
+    /// bytes on success, which you will have to construct yourself with a crate like `image`.
     pub async fn fetch_thumbnail(
         &self,
         node_uid: NodeUid,
         thumbnail_id: String,
     ) -> anyhow::Result<Vec<u8>> {
-        use proton_rpgp::{DataEncoding, Decryptor, SessionKey, pgp::crypto::sym::SymmetricKeyAlgorithm};
+        use proton_rpgp::{
+            DataEncoding, Decryptor, SessionKey, pgp::crypto::sym::SymmetricKeyAlgorithm,
+        };
 
-        let secrets = FileOperations::get_secrets(self, node_uid.clone()).await
+        let secrets = FileOperations::get_secrets(self, node_uid.clone())
+            .await
             .context("Failed to get file secrets for thumbnail")?;
         let volume_id = node_uid.volume_id.clone();
 
@@ -474,16 +480,25 @@ impl ProtonDriveClient {
             "Looking for thumbnail_id='{}' in {} blocks: {:?}",
             thumbnail_id,
             resp.blocks.len(),
-            resp.blocks.iter().map(|b| b.thumbnail_id.as_str()).collect::<Vec<_>>()
+            resp.blocks
+                .iter()
+                .map(|b| b.thumbnail_id.as_str())
+                .collect::<Vec<_>>()
         );
 
-        let available_ids: Vec<String> = resp.blocks.iter().map(|b| b.thumbnail_id.clone()).collect();
+        let available_ids: Vec<String> =
+            resp.blocks.iter().map(|b| b.thumbnail_id.clone()).collect();
         let block = resp
             .blocks
             .into_iter()
             .find(|b| b.thumbnail_id == thumbnail_id)
-            .ok_or_else(|| anyhow::anyhow!("thumbnail block not returned by server: requested '{}' but got {:?}", 
-                thumbnail_id, available_ids))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "thumbnail block not returned by server: requested '{}' but got {:?}",
+                    thumbnail_id,
+                    available_ids
+                )
+            })?;
 
         tracing::debug!(
             "Downloading thumbnail from {} (token len={})",
@@ -499,11 +514,17 @@ impl ProtonDriveClient {
             .context("Failed to initiate thumbnail blob download")?;
 
         let content_length = response.content_length();
-        tracing::debug!("Thumbnail response content_length={:?}, status={}", content_length, response.status());
+        tracing::debug!(
+            "Thumbnail response content_length={:?}, status={}",
+            content_length,
+            response.status()
+        );
 
-        let blob_bytes = response.bytes().await
+        let blob_bytes = response
+            .bytes()
+            .await
             .context("Failed to read thumbnail blob bytes")?;
-        
+
         tracing::debug!("Read {} bytes from thumbnail blob", blob_bytes.len());
 
         let alg = SymmetricKeyAlgorithm::from(secrets.content_key.algorithm);
@@ -550,7 +571,11 @@ impl ProtonDriveClient {
     > {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let client = self.clone();
-        tokio::spawn(FolderOperations::enumerate_children_to_channel(client, folder_id.into(), tx));
+        tokio::spawn(FolderOperations::enumerate_children_to_channel(
+            client,
+            folder_id.into(),
+            tx,
+        ));
         Ok(futures::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
         }))
@@ -643,10 +668,7 @@ impl ProtonDriveClient {
 
     /// Returns all non-draft revisions for the given file, decrypting extended attributes
     /// (size, modification time, SHA1 digest) with the node key where possible.
-    pub async fn iterate_revisions(
-        &self,
-        node_uid: NodeUid,
-    ) -> anyhow::Result<Vec<RevisionInfo>> {
+    pub async fn iterate_revisions(&self, node_uid: NodeUid) -> anyhow::Result<Vec<RevisionInfo>> {
         use crate::api::attr::ExtendedAttributes;
         use crate::author::Author;
         use crate::node::authorship::AuthorshipClaim;
@@ -673,35 +695,29 @@ impl ProtonDriveClient {
                 continue;
             }
 
-            let (claimed_size, claimed_modification_time, claimed_sha1) =
-                if let Some(xattr_msg) = &dto.extended_attributes {
-                    match NodeCrypto::decrypt_message(
-                        xattr_msg,
-                        None,
-                        [&node_key],
-                        &authorship_claim,
-                    ) {
-                        Ok((bytes, _, _)) => {
-                            if let Ok(xattr) =
-                                serde_json::from_slice::<ExtendedAttributes>(&bytes)
-                            {
-                                let common = xattr.common.as_ref();
-                                (
-                                    common.and_then(|c| c.size),
-                                    common.and_then(|c| c.modification_time),
-                                    common
-                                        .and_then(|c| c.digests.as_ref())
-                                        .and_then(|d| d.sha1.clone()),
-                                )
-                            } else {
-                                (None, None, None)
-                            }
+            let (claimed_size, claimed_modification_time, claimed_sha1) = if let Some(xattr_msg) =
+                &dto.extended_attributes
+            {
+                match NodeCrypto::decrypt_message(xattr_msg, None, [&node_key], &authorship_claim) {
+                    Ok((bytes, _, _)) => {
+                        if let Ok(xattr) = serde_json::from_slice::<ExtendedAttributes>(&bytes) {
+                            let common = xattr.common.as_ref();
+                            (
+                                common.and_then(|c| c.size),
+                                common.and_then(|c| c.modification_time),
+                                common
+                                    .and_then(|c| c.digests.as_ref())
+                                    .and_then(|d| d.sha1.clone()),
+                            )
+                        } else {
+                            (None, None, None)
                         }
-                        Err(_) => (None, None, None),
                     }
-                } else {
-                    (None, None, None)
-                };
+                    Err(_) => (None, None, None),
+                }
+            } else {
+                (None, None, None)
+            };
 
             results.push(RevisionInfo {
                 uid: RevisionUid::new(node_uid.clone(), dto.id),
@@ -839,7 +855,10 @@ impl ProtonDriveClient {
             (Vec::new(), None)
         };
         #[cfg(not(feature = "thumbnail-generation"))]
-        let (thumbnails, media_info): (Vec<crate::node::thumbnail::Thumbnail>, Option<crate::api::attr::MediaExtendedAttributes>) = (Vec::new(), None);
+        let (thumbnails, media_info): (
+            Vec<crate::node::thumbnail::Thumbnail>,
+            Option<crate::api::attr::MediaExtendedAttributes>,
+        ) = (Vec::new(), None);
 
         let uploader = self
             .get_file_uploader(
@@ -855,7 +874,11 @@ impl ProtonDriveClient {
             .await?;
 
         uploader
-            .upload_from_stream(Box::new(std::io::Cursor::new(file_data)), thumbnails, on_progress)
+            .upload_from_stream(
+                Box::new(std::io::Cursor::new(file_data)),
+                thumbnails,
+                on_progress,
+            )
             .await
     }
 
@@ -877,7 +900,6 @@ impl ProtonDriveClient {
     ) -> anyhow::Result<()> {
         NodeOperations::move_multiple(self, uids, new_parent_folder_uid).await
     }
-
 
     /// Copies a single node to `new_parent_folder_uid`, optionally renaming it with `new_name`.
     /// Returns the `LinkId` of the newly created copy.
@@ -957,11 +979,11 @@ impl ProtonDriveClient {
 
     /// Returns the latest known event-ID for the given volume. Use this cursor
     /// to start polling with [`poll_volume_events`].
-    pub async fn get_volume_latest_event_id(
-        &self,
-        volume_id: VolumeId,
-    ) -> anyhow::Result<String> {
-        self.api().events().get_volume_latest_event_id(volume_id).await
+    pub async fn get_volume_latest_event_id(&self, volume_id: VolumeId) -> anyhow::Result<String> {
+        self.api()
+            .events()
+            .get_volume_latest_event_id(volume_id)
+            .await
     }
 
     /// Polls for volume events since `event_id`. The [`VolumeEventsResponse`]
@@ -973,7 +995,10 @@ impl ProtonDriveClient {
         volume_id: VolumeId,
         event_id: &str,
     ) -> anyhow::Result<VolumeEventsResponse> {
-        self.api().events().get_volume_events(volume_id, event_id).await
+        self.api()
+            .events()
+            .get_volume_events(volume_id, event_id)
+            .await
     }
 
     /// Returns the latest known global core event-ID.
@@ -982,10 +1007,7 @@ impl ProtonDriveClient {
     }
 
     /// Polls for core-level events since `event_id`.
-    pub async fn poll_core_events(
-        &self,
-        event_id: &str,
-    ) -> anyhow::Result<CoreEventsResponse> {
+    pub async fn poll_core_events(&self, event_id: &str) -> anyhow::Result<CoreEventsResponse> {
         self.api().events().get_core_events(event_id).await
     }
 
@@ -1018,7 +1040,8 @@ impl ProtonDriveClient {
         DeviceOperations::delete_device(self, device_id).await
     }
 
-    async fn get_file_uploader_from_draft_provider(        &self,
+    async fn get_file_uploader_from_draft_provider(
+        &self,
         revision_draft_provider: Box<dyn RevisionDraftProvider>,
         size: i64,
         last_modification_time: Option<std::time::SystemTime>,
@@ -1038,21 +1061,7 @@ impl ProtonDriveClient {
 }
 
 fn default_block_transfer_parallelism() -> usize {
-    // Use a high default to allow multiple large files to upload concurrently.
-    // FileUploader::create acquires permits for ALL blocks upfront, so we need
-    // enough permits for several files at once (e.g., 3 × 40 blocks = 120 permits).
-    // Using 128 as minimum gives us ~132 permits in the revision_creation_semaphore.
-    let cpu_based = (std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(ProtonDriveClient::MIN_DEGREE_OF_BLOCK_TRANSFER_PARALLELISM)
-        / 2)
-    .clamp(
-        ProtonDriveClient::MIN_DEGREE_OF_BLOCK_TRANSFER_PARALLELISM,
-        ProtonDriveClient::MAX_DEGREE_OF_BLOCK_TRANSFER_PARALLELISM,
-    );
-    
-    // Ensure at least 128 for concurrent large file uploads
-    cpu_based.max(128)
+    ProtonDriveClient::DEFAULT_DEGREE_OF_BLOCK_TRANSFER_PARALLELISM
 }
 
 fn generate_uid() -> String {

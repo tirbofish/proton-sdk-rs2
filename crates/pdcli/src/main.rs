@@ -1,14 +1,15 @@
 use crate::app::ProtonDrive;
 
+mod app;
 mod auth;
 mod credentials;
+mod daemon;
 mod db;
-mod app;
-mod tray;
-mod transfer;
 mod flags;
 mod fs;
 mod thumbnail;
+mod transfer;
+mod tray;
 
 #[tokio::main]
 async fn main() {
@@ -19,18 +20,15 @@ async fn main() {
         )
         .init();
 
-    // Unmount FUSE on panic.
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        fs::force_unmount();
-        default_hook(info);
-    }));
-
-    // Unmount FUSE on SIGTERM / SIGINT / SIGHUP.
-    unsafe {
-        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-            libc::signal(sig, handle_signal as *const () as libc::sighandler_t);
+    let mut flags = flags::ClientFlags::default();
+    flags.apply_flags();
+    if flags.daemon {
+        install_daemon_exit_hooks();
+        if let Err(e) = daemon::run(flags.force_offline).await {
+            tracing::error!(error = %e, "pdcli daemon failed");
+            std::process::exit(1);
         }
+        return;
     }
 
     let native_options = eframe::NativeOptions::default();
@@ -49,6 +47,22 @@ async fn main() {
         }),
     )
     .unwrap();
+}
+
+fn install_daemon_exit_hooks() {
+    // Unmount FUSE on panic.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        fs::force_unmount();
+        default_hook(info);
+    }));
+
+    // Unmount FUSE on SIGTERM / SIGINT / SIGHUP.
+    unsafe {
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::signal(sig, handle_signal as *const () as libc::sighandler_t);
+        }
+    }
 }
 
 extern "C" fn handle_signal(sig: libc::c_int) {

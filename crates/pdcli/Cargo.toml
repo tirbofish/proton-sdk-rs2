@@ -49,9 +49,6 @@ toml = "0.8"
 
 eframe = "0.34"
 egui = "0.34"
-tray-icon = "0.22"
+ksni = { version = "0.3.4", default-features = false, features = ["async-io"] }
 poll-promise = { version = "0.3.0", features = ["tokio"] }
 fuser = { version = "0.17.0", features = ["experimental", "async-trait", "tokio"] }
-
-[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
-gtk = "0.18"

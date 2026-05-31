@@ -12,7 +12,6 @@ use proton_sdk_rs2::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
-use tokio::sync::mpsc;
 
 use crate::transfer::TransferTracker;
 use crate::{credentials, db::FuseDb, fs, tray};
@@ -138,17 +137,17 @@ pub async fn run(force_offline: bool, enable_tray: bool) -> anyhow::Result<()> {
         anyhow::bail!("pdcli daemon is already running");
     }
 
-    let tray_handle = if enable_tray {
+    let (tray_handle, mut tray_actions) = if enable_tray {
         let icon_path = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/icon.png"));
-        let create_tray = tray::init(&icon_path);
-        create_tray()
+        match tray::init(&icon_path).await {
+            Ok((tray_handle, tray_actions)) => (Some(tray_handle), Some(tray_actions)),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to start tray icon; continuing without tray");
+                (None, None)
+            }
+        }
     } else {
-        None
-    };
-    let mut tray_actions = if enable_tray {
-        Some(spawn_tray_action_forwarder())
-    } else {
-        None
+        (None, None)
     };
 
     let path = socket_path().context("failed to resolve daemon socket path")?;
@@ -190,12 +189,17 @@ pub async fn run(force_offline: bool, enable_tray: bool) -> anyhow::Result<()> {
                     }
                 }
             }
-            _ = tray_update_interval.tick(), if enable_tray => {
-                tray::update_state(tray_handle.as_ref(), daemon_tray_state());
+            _ = tray_update_interval.tick(), if tray_handle.is_some() => {
+                if let Some(tray_handle) = tray_handle.as_ref() {
+                    tray::update_state(tray_handle, daemon_tray_state()).await;
+                }
             }
         }
     }
 
+    if let Some(tray_handle) = tray_handle {
+        tray_handle.shutdown().await;
+    }
     drop(fuse_session);
     fs::force_unmount();
     std::fs::remove_file(&path).ok();
@@ -248,21 +252,6 @@ async fn write_client_response(stream: &mut tokio::net::UnixStream, body: &[u8])
     if let Err(e) = stream.write_all(body).await {
         tracing::debug!(error = %e, "failed to write daemon client response");
     }
-}
-
-fn spawn_tray_action_forwarder() -> mpsc::UnboundedReceiver<tray::TrayAction> {
-    let (tx, rx) = mpsc::unbounded_channel();
-    std::thread::spawn(move || {
-        loop {
-            for action in tray::poll_events() {
-                if tx.send(action).is_err() {
-                    return;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    });
-    rx
 }
 
 fn daemon_tray_state() -> tray::TrayState {

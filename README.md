@@ -19,16 +19,18 @@ anyone wanting to use the client will have to clone this repository and compile 
 
 ### dependencies
 
-building this from source requires a couple dependencies. 
+The tray icon uses the freedesktop/KDE StatusNotifierItem protocol over D-Bus,
+so GTK/libappindicator is not required. Make sure your desktop environment has
+an SNI/AppIndicator host enabled; GNOME may require an AppIndicator extension.
 
 #### Arch
 ```bash
-pacman -S gtk3 xdotool libappindicator-gtk3 #or libayatana-appindicator
+pacman -S dbus xdg-utils fuse3
 ```
 
 #### Ubuntu
 ```bash
-sudo apt install libgtk-3-dev libxdo-dev libappindicator3-dev #or libayatana-appindicator3-dev
+sudo apt install dbus-x11 xdg-utils fuse3
 ```
 
 ### building

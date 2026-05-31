@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use http::Uri;
-use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::header::{ACCEPT, HeaderMap, HeaderValue};
 
 use crate::{
     addresses::DefaultAddressesApiClient,
@@ -126,6 +126,18 @@ impl ProtonClientConfiguration {
             "x-pm-appversion",
             HeaderValue::from_str(app_version_header.as_str())?,
         );
+        default_headers.insert(
+            "x-pm-drive-sdk-version",
+            HeaderValue::from_str(ProtonApiDefaults::sdk_version().as_str())?,
+        );
+        default_headers.insert(
+            "Language",
+            HeaderValue::from_str(self.bindings_language.as_deref().unwrap_or("en"))?,
+        );
+        default_headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("application/vnd.protonmail.v1+json"),
+        );
 
         let mut builder = reqwest::Client::builder().default_headers(default_headers);
 
@@ -169,6 +181,10 @@ impl ProtonApiDefaults {
             env!("CARGO_PKG_VERSION"),
             std::env::consts::OS
         )
+    }
+
+    pub fn sdk_version() -> String {
+        format!("rust@{}", env!("CARGO_PKG_VERSION"))
     }
 
     pub fn base_url() -> http::Uri {

@@ -274,6 +274,47 @@ impl DefaultAuthenticationApiClient {
         headers.insert("x-pm-uid", HeaderValue::from_str(session_id.raw())?);
         Ok(headers)
     }
+
+    async fn error_for_status_with_body(
+        response: reqwest::Response,
+    ) -> anyhow::Result<reqwest::Response> {
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+
+        let url = response.url().clone();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("<failed to read response body: {error}>"));
+        let body = truncate_error_body(&body);
+
+        if status.is_client_error() {
+            anyhow::bail!("HTTP status client error ({status}) for url ({url}): {body}");
+        } else if status.is_server_error() {
+            anyhow::bail!("HTTP status server error ({status}) for url ({url}): {body}");
+        } else {
+            anyhow::bail!("HTTP status error ({status}) for url ({url}): {body}");
+        }
+    }
+}
+
+fn truncate_error_body(body: &str) -> String {
+    const MAX_ERROR_BODY_LEN: usize = 2048;
+    if body.len() <= MAX_ERROR_BODY_LEN {
+        return body.to_string();
+    }
+
+    let truncate_at = body
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= MAX_ERROR_BODY_LEN)
+        .last()
+        .unwrap_or(0);
+    let mut truncated = body[..truncate_at].to_string();
+    truncated.push_str("…<truncated>");
+    truncated
 }
 
 #[derive(Serialize)]
@@ -327,8 +368,8 @@ impl AuthenticationApiClient for DefaultAuthenticationApiClient {
             .header("content-type", "application/json")
             .body(request_body)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        let response = Self::error_for_status_with_body(response).await?;
 
         crate::utils::decode_json::<SesisonInitiationResponse>(response).await
     }
@@ -345,6 +386,14 @@ impl AuthenticationApiClient for DefaultAuthenticationApiClient {
             srp_session_id: initiation_response.srp_session_id,
             username,
         };
+
+        log::debug!(
+            "submitting SRP authentication proof (client_ephemeral_len={}, client_proof_len={}, srp_session_len={})",
+            request.client_ephemeral.len(),
+            request.client_proof.len(),
+            request.srp_session_id.len(),
+        );
+
         let request_body = serde_json::to_vec(&request)?;
 
         let response = self
@@ -353,8 +402,8 @@ impl AuthenticationApiClient for DefaultAuthenticationApiClient {
             .header("content-type", "application/json")
             .body(request_body)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        let response = Self::error_for_status_with_body(response).await?;
 
         crate::utils::decode_json::<AuthenticationResponse>(response).await
     }

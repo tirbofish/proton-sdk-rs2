@@ -1,9 +1,8 @@
 use std::{fmt::Display, sync::Arc, time::Duration};
 
-use base64::{Engine as _, engine::general_purpose};
 use proton_srp::{RPGPVerifier, SRPAuth, SrpHashVersion};
 use reqwest::StatusCode;
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
 
 use crate::auth::DefaultAuthenticationApiClient;
 use crate::cache::InMemoryCacheRepository;
@@ -15,7 +14,7 @@ use crate::{
     PasswordMode, SessionId, UserId,
     auth::{AuthenticationApiClient, TokenCredential},
     cache::CacheRepository,
-    client::{ApiClient, ProtonClientConfiguration, ProtonClientOptions},
+    client::{ApiClient, ProtonApiDefaults, ProtonClientConfiguration, ProtonClientOptions},
     secret::DefaultSecretCache,
 };
 
@@ -119,6 +118,18 @@ impl ProtonAPISession {
             app_version
         );
         default_headers.insert("x-pm-appversion", HeaderValue::from_str(&app_version)?);
+        default_headers.insert(
+            "x-pm-drive-sdk-version",
+            HeaderValue::from_str(ProtonApiDefaults::sdk_version().as_str())?,
+        );
+        default_headers.insert(
+            "Language",
+            HeaderValue::from_str(config.bindings_language.as_deref().unwrap_or("en"))?,
+        );
+        default_headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("application/vnd.protonmail.v1+json"),
+        );
 
         if let Some((session_id, access_token)) = auth {
             let bearer = format!("Bearer {access_token}");
@@ -130,6 +141,8 @@ impl ProtonAPISession {
 
         if !config.user_agent.is_empty() {
             builder = builder.user_agent(config.user_agent.clone());
+        } else {
+            builder = builder.user_agent(ProtonApiDefaults::user_agent());
         }
 
         Ok(builder.build()?)
@@ -237,22 +250,27 @@ impl ProtonAPISession {
             session_init_resp.srp_session_id
         );
 
+        let srp_version = u8::try_from(session_init_resp.version)
+            .ok()
+            .and_then(|version| SrpHashVersion::try_from(version).ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Unsupported SRP version {}", session_init_resp.version)
+            })?;
+
+        log::debug!("SRP version {} negotiated", session_init_resp.version);
+
         let client = SRPAuth::new(
             &RPGPVerifier::default(),
             Some(&username),
             password,
-            SrpHashVersion::V4,
+            srp_version,
             &session_init_resp.salt,
             &session_init_resp.modulus,
             &session_init_resp.server_ephemeral,
         )?;
 
         let proof = client.generate_proofs()?;
-        let client_proof = proton_crypto::srp::ClientProof {
-            ephemeral: general_purpose::STANDARD.encode(proof.client_ephemeral),
-            proof: general_purpose::STANDARD.encode(proof.client_proof),
-            expected_server_proof: general_purpose::STANDARD.encode(proof.expected_server_proof),
-        };
+        let client_proof: proton_crypto::srp::ClientProof = proof.into();
 
         let auth_resp = auth_api_client
             .authenticate(session_init_resp, client_proof, username.clone())

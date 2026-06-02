@@ -14,6 +14,12 @@ enum LoginResult {
     Needs2FA(ProtonAPISession, String),
 }
 
+enum LoginAction {
+    Ready(ProtonAPISession),
+    Needs2FA(ProtonAPISession, String),
+    Error(String),
+}
+
 pub struct AuthScreen {
     username: String,
     password: String,
@@ -98,28 +104,40 @@ impl AuthScreen {
     }
 
     fn credentials_ui(&mut self, ui: &mut egui::Ui) -> Option<ProtonAPISession> {
-        if let Some(task) = &mut self.login_task {
-            if let Some(result) = task.ready() {
-                match result {
-                    Ok(LoginResult::Ready(session)) => {
-                        persist(&session);
-                        credentials::save_session_tokens_on_refresh(session);
-                        return Some(session.clone());
-                    }
-                    Ok(LoginResult::Needs2FA(session, password)) => {
-                        self.phase = AuthPhase::TwoFactor {
-                            session: Some(session.clone()),
-                            password: password.to_string(),
-                            totp_code: String::new(),
-                            totp_task: None,
-                            error: None,
-                        };
-                        return None;
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "login failed");
-                        self.error = Some(e.to_string());
-                    }
+        let login_action = self
+            .login_task
+            .as_ref()
+            .and_then(|task| task.ready())
+            .map(|result| match result {
+                Ok(LoginResult::Ready(session)) => LoginAction::Ready(session.clone()),
+                Ok(LoginResult::Needs2FA(session, password)) => {
+                    LoginAction::Needs2FA(session.clone(), password.clone())
+                }
+                Err(error) => LoginAction::Error(error.to_string()),
+            });
+
+        if let Some(action) = login_action {
+            self.login_task = None;
+
+            match action {
+                LoginAction::Ready(session) => {
+                    persist(&session);
+                    credentials::save_session_tokens_on_refresh(&session);
+                    return Some(session);
+                }
+                LoginAction::Needs2FA(session, password) => {
+                    self.phase = AuthPhase::TwoFactor {
+                        session: Some(session),
+                        password,
+                        totp_code: String::new(),
+                        totp_task: None,
+                        error: None,
+                    };
+                    return None;
+                }
+                LoginAction::Error(error) => {
+                    tracing::error!(error = %error, "login failed");
+                    self.error = Some(error);
                 }
             }
         }
@@ -185,19 +203,31 @@ impl AuthScreen {
             return None;
         };
 
-        if let Some(task) = totp_task {
-            if let Some(result) = task.ready() {
-                match result {
-                    Ok(completed_session) => {
-                        tracing::info!(user = %completed_session.username, "2FA verified");
-                        persist(&completed_session);
-                        credentials::save_session_tokens_on_refresh(completed_session);
-                        return Some(completed_session.clone());
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "2FA verification failed");
-                        *error = Some(e.to_string());
-                    }
+        let totp_action =
+            totp_task
+                .as_ref()
+                .and_then(|task| task.ready())
+                .map(|result| match result {
+                    Ok(completed_session) => LoginAction::Ready(completed_session.clone()),
+                    Err(error) => LoginAction::Error(error.to_string()),
+                });
+
+        if let Some(action) = totp_action {
+            *totp_task = None;
+
+            match action {
+                LoginAction::Ready(completed_session) => {
+                    tracing::info!(user = %completed_session.username, "2FA verified");
+                    persist(&completed_session);
+                    credentials::save_session_tokens_on_refresh(&completed_session);
+                    return Some(completed_session);
+                }
+                LoginAction::Error(message) => {
+                    tracing::error!(error = %message, "2FA verification failed");
+                    *error = Some(message);
+                }
+                LoginAction::Needs2FA(_, _) => {
+                    unreachable!("2FA task cannot request another 2FA transition");
                 }
             }
         }
@@ -249,7 +279,7 @@ impl AuthScreen {
                 return None;
             };
 
-            if let Some(mut sess) = session.take() {
+            if let Some(mut sess) = session.clone() {
                 *error = None;
                 let code = totp_code.clone();
                 let pw = password.clone();

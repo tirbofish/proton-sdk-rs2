@@ -931,7 +931,7 @@ impl NodeOperations {
         DtoToMetadataConverter::get_fresh_node_metadata(client, uid, None).await
     }
 
-    async fn get_membership_address(
+    pub(crate) async fn get_membership_address(
         client: &ProtonDriveClient,
         uid: &NodeUid,
     ) -> anyhow::Result<Address> {

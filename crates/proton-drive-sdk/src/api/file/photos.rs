@@ -116,6 +116,11 @@ pub trait PhotosApiClient: Send + Sync {
         link_id: LinkId,
         payload: Option<FavoritePhotoPayload>,
     ) -> anyhow::Result<()>;
+
+    async fn get_shared_albums(
+        &self,
+        anchor_id: Option<LinkId>,
+    ) -> anyhow::Result<SharedAlbumsResponse>;
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -527,6 +532,26 @@ pub struct PhotoTagUpdate {
     pub tags_to_remove: Vec<PhotoTag>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SharedAlbumDto {
+    #[serde(rename = "VolumeID")]
+    pub volume_id: VolumeId,
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SharedAlbumsResponse {
+    #[serde(flatten)]
+    pub base: ApiResponse,
+    #[serde(rename = "Albums", default)]
+    pub albums: Vec<SharedAlbumDto>,
+    #[serde(rename = "AnchorID")]
+    pub anchor_id: Option<LinkId>,
+    #[serde(rename = "More", default)]
+    pub more: bool,
+}
+
 pub struct DefaultPhotosApiClient {
     client: ClientWithMiddleware,
     base_url: reqwest::Url,
@@ -818,6 +843,29 @@ impl PhotosApiClient for DefaultPhotosApiClient {
         let builder = self.add_auth_headers(builder).await?;
         builder.send().await?;
         Ok(())
+    }
+
+    async fn get_shared_albums(
+        &self,
+        anchor_id: Option<LinkId>,
+    ) -> anyhow::Result<SharedAlbumsResponse> {
+        let path = match &anchor_id {
+            Some(anchor) => format!("photos/albums/shared-with-me?AnchorID={}", anchor.raw()),
+            None => "photos/albums/shared-with-me".to_string(),
+        };
+        let url = self.base_url.join(&path)?;
+        let builder = self.add_auth_headers(self.client.get(url)).await?;
+        let response = builder.send().await?;
+        let text = response.text().await?;
+        let res: SharedAlbumsResponse = serde_json::from_str(&text).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to decode shared albums response: {}. Body: {}",
+                e,
+                text
+            )
+        })?;
+        res.base.to_result()?;
+        Ok(res)
     }
 }
 

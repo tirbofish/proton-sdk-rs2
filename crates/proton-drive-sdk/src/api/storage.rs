@@ -1,13 +1,12 @@
 use crate::api::ApiResponse;
+use crate::error::TooManyRequestsException;
 use async_trait::async_trait;
 use bytes::Bytes;
 use proton_sdk_rs2::auth::TokenCredential;
 use reqwest_middleware::ClientWithMiddleware;
-use std::time::Duration;
 use tokio::time::sleep;
 
 const MAX_RETRIES: u32 = 3;
-const RETRY_BASE_DELAY_MS: u64 = 500;
 
 #[async_trait]
 pub trait StorageApiClient: Send + Sync {
@@ -76,7 +75,7 @@ impl StorageApiClient for DefaultStorageApiClient {
 
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
-                let delay = Duration::from_millis(RETRY_BASE_DELAY_MS * (1 << (attempt - 1)));
+                let delay = crate::error::retry_backoff_delay(attempt);
                 sleep(delay).await;
             }
 
@@ -96,6 +95,15 @@ impl StorageApiClient for DefaultStorageApiClient {
 
             match builder.send().await {
                 Ok(response) => {
+                    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        last_err = Some(
+                            TooManyRequestsException::from_headers(response.headers()).into(),
+                        );
+                        if let Some(wait) = crate::error::parse_retry_after(response.headers()) {
+                            sleep(wait).await;
+                        }
+                        continue;
+                    }
                     if response.status().is_server_error() {
                         last_err = Some(anyhow::anyhow!(
                             "server error on attempt {}: {}",
@@ -164,6 +172,10 @@ impl StorageApiClient for DefaultStorageApiClient {
         let builder = self.add_auth_headers(builder).await?;
 
         let response = builder.send().await?;
+
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(TooManyRequestsException::from_headers(response.headers()).into());
+        }
 
         if !response.status().is_success() {
             anyhow::bail!("blob download failed with status {}", response.status());

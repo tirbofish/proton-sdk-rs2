@@ -36,14 +36,7 @@ impl BlockDownloader {
         let mut hasher = sha2::Sha256::new();
         sha2::Digest::update(&mut hasher, &bytes);
 
-        let alg = proton_rpgp::pgp::crypto::sym::SymmetricKeyAlgorithm::from(content_key.algorithm);
-        let sk = proton_rpgp::SessionKey::new(&content_key.key, alg);
-
-        let result = proton_rpgp::Decryptor::default()
-            .with_session_key(sk)
-            .decrypt(&bytes, proton_rpgp::DataEncoding::Auto)?;
-
-        output_stream.write_all(&result.data).await?;
+        output_stream.write_all(&content_key.decrypt(&bytes)?).await?;
 
         Ok(sha2::Digest::finalize(hasher).to_vec())
     }

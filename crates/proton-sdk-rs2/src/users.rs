@@ -95,6 +95,10 @@ pub struct UserResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UserDto {
+    #[serde(rename = "ID", alias = "id", default)]
+    pub id: String,
+    #[serde(rename = "Name", alias = "name", default)]
+    pub name: String,
     #[serde(rename = "Keys", alias = "keys")]
     pub keys: Vec<UserKeyDto>,
 

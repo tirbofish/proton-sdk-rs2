@@ -6,7 +6,6 @@ use crate::pgp::{PgpPrivateKey, PgpSessionKey};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use log::{debug, error, info};
-use proton_rpgp::{DataEncoding, Decryptor, SessionKey, pgp::crypto::sym::SymmetricKeyAlgorithm};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -168,20 +167,16 @@ impl BlockDownloader {
             if attempt > 0 {
                 let delay = Self::retry_delay(attempt);
 
-                // Handle 429 retry-after if applicable
                 if let Some(e) = &last_err {
                     if let Some(retry_after) = Self::extract_retry_after(e) {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap();
-                        if retry_after > now {
-                            let wait = retry_after - now;
-                            info!(
-                                "Waiting {:?} before retrying blob download due to 429 response",
-                                wait
-                            );
-                            tokio::time::sleep(wait).await;
-                        }
+                        info!(
+                            "Waiting {:?} before retrying blob download due to 429 response",
+                            retry_after
+                        );
+                        self.client.sdk_events().requests_throttled();
+                        tokio::time::sleep(retry_after).await;
+                    } else {
+                        tokio::time::sleep(delay).await;
                     }
                 }
 
@@ -191,7 +186,6 @@ impl BlockDownloader {
                 );
 
                 output.clear();
-                tokio::time::sleep(delay).await;
             }
 
             match self
@@ -236,32 +230,27 @@ impl BlockDownloader {
         let mut hasher = Sha256::new();
         hasher.update(&blob_bytes);
 
-        let alg = SymmetricKeyAlgorithm::from(content_key.algorithm);
-        let sk = SessionKey::new(&content_key.key, alg);
-
-        let result = match Decryptor::default()
-            .with_session_key(sk)
-            .decrypt(&blob_bytes, DataEncoding::Auto)
-        {
-            Ok(r) => r,
+        let data = match content_key.decrypt(&blob_bytes) {
+            Ok(data) => data,
             Err(e) => {
                 error!("Failed to decrypt block: {:?}", e);
-                return Err(FileContentsDecryptionException::WithCause(e.into()).into());
+                return Err(FileContentsDecryptionException::WithCause(e).into());
             }
         };
 
-        debug!("Decrypted to {} bytes", result.data.len());
-        output.extend_from_slice(&result.data);
+        debug!("Decrypted to {} bytes", data.len());
+        output.extend_from_slice(&data);
 
         Ok(hasher.finalize().to_vec())
     }
 
     fn retry_delay(attempt: u32) -> Duration {
-        Duration::from_millis(500 * (1u64 << (attempt - 1).min(4)))
+        crate::error::retry_backoff_delay(attempt)
     }
 
-    fn extract_retry_after(_err: &anyhow::Error) -> Option<Duration> {
-        None
+    fn extract_retry_after(err: &anyhow::Error) -> Option<Duration> {
+        err.downcast_ref::<crate::error::TooManyRequestsException>()
+            .and_then(|e| e.retry_after)
     }
 }
 
@@ -289,6 +278,17 @@ pub struct DownloadController {
 pub enum ControllerState {
     Running,
     Paused,
+}
+
+pub(crate) async fn wait_while_paused(pause_rx: &mut Option<watch::Receiver<ControllerState>>) {
+    let Some(rx) = pause_rx.as_mut() else {
+        return;
+    };
+    while *rx.borrow() == ControllerState::Paused {
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 impl DownloadController {
@@ -385,6 +385,7 @@ impl RevisionReader {
         &self,
         output: &mut W,
         on_progress: impl Fn(i64, i64) + Send + Sync,
+        mut pause_rx: Option<watch::Receiver<ControllerState>>,
     ) -> anyhow::Result<()> {
         let total_blocks = self.state.revision_dto.blocks.len();
         if total_blocks == 0 {
@@ -408,6 +409,7 @@ impl RevisionReader {
         > = FuturesUnordered::new();
 
         // Start initial batch of downloads
+        wait_while_paused(&mut pause_rx).await;
         while download_futures.len() < MAX_CONCURRENT_DOWNLOADS
             && next_download_index.load(Ordering::SeqCst) <= total_blocks as i32
         {
@@ -442,6 +444,7 @@ impl RevisionReader {
                 );
 
                 // Start a new download if there are more blocks
+                wait_while_paused(&mut pause_rx).await;
                 let next_idx = next_download_index.fetch_add(1, Ordering::SeqCst);
                 if next_idx <= total_blocks as i32 {
                     let block_dto = &self.state.revision_dto.blocks[(next_idx - 1) as usize];
@@ -504,6 +507,23 @@ impl RevisionReader {
         Ok(())
     }
 
+    pub async fn download_block_at(&self, block_index: i32) -> anyhow::Result<Vec<u8>> {
+        let total = self.state.revision_dto.blocks.len() as i32;
+        if block_index < 1 || block_index > total {
+            anyhow::bail!("block index {block_index} out of range");
+        }
+        let block_dto = &self.state.revision_dto.blocks[(block_index - 1) as usize];
+        let (_, data, _) = Self::download_and_decrypt_block(
+            &self.client,
+            block_index,
+            &block_dto.bare_url,
+            &block_dto.token,
+            &self.state.content_key,
+        )
+        .await?;
+        Ok(data)
+    }
+
     /// Download and decrypt a single block, returning (block_index, decrypted_data, sha256_digest).
     async fn download_and_decrypt_block(
         client: &ProtonDriveClient,
@@ -524,18 +544,18 @@ impl RevisionReader {
         hasher.update(&blob_bytes);
         let digest = hasher.finalize().to_vec();
 
-        // Decrypt
-        let alg = SymmetricKeyAlgorithm::from(content_key.algorithm);
-        let sk = SessionKey::new(&content_key.key, alg);
-
-        let result = match Decryptor::default()
-            .with_session_key(sk)
-            .decrypt(&blob_bytes, DataEncoding::Auto)
-        {
-            Ok(r) => r,
+        let data = match content_key.decrypt(&blob_bytes) {
+            Ok(data) => data,
             Err(e) => {
                 error!("Failed to decrypt block {}: {:?}", block_index, e);
-                return Err(FileContentsDecryptionException::WithCause(e.into()).into());
+                client
+                    .telemetry()
+                    .record_metric(
+                        "decryptionError".into(),
+                        Some(e.to_string().into_bytes()),
+                    )
+                    .await;
+                return Err(FileContentsDecryptionException::WithCause(e).into());
             }
         };
 
@@ -543,9 +563,9 @@ impl RevisionReader {
             "Block {} decrypted: {} encrypted -> {} decrypted bytes",
             block_index,
             blob_bytes.len(),
-            result.data.len()
+            data.len()
         );
 
-        Ok((block_index, result.data, digest))
+        Ok((block_index, data, digest))
     }
 }

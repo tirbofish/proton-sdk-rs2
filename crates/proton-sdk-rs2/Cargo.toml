@@ -29,6 +29,9 @@ env_logger.workspace = true
 dashmap.workspace = true
 proton-srp.workspace = true
 proton-rpgp.workspace = true
+aes-gcm.workspace = true
+rand.workspace = true
+zeroize = "1"
 
 [build-dependencies]
 prost-build.workspace = true

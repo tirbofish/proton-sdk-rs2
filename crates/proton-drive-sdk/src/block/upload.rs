@@ -48,18 +48,15 @@ impl BlockUploader {
         let signer = proton_rpgp::Signer::default().with_signing_key(&draft.signing_key.0);
         let signature = signer.sign_detached(plain_data, proton_rpgp::DataEncoding::Auto)?;
 
-        // 2. Encrypt the signature using the file key
+        // 2. Encrypt the signature using the file key (unsigned, matching official SDK)
         let signature_encryptor = proton_rpgp::Encryptor::default()
-            .with_encryption_key(draft.file_key.0.as_public_key())
-            .with_signing_key(&draft.signing_key.0);
+            .with_encryption_key(draft.file_key.0.as_public_key());
         let signature_result = signature_encryptor.encrypt(&signature)?;
         let encrypted_signature = PgpArmoredMessage(String::from_utf8(signature_result.armor()?)?);
 
         // 3. Encrypt the content using the session key
         let sk = draft.content_key.to_rpgp_sk()?;
-        let content_encryptor = proton_rpgp::Encryptor::default()
-            .with_session_key(sk)
-            .with_signing_key(&draft.signing_key.0);
+        let content_encryptor = proton_rpgp::Encryptor::default().with_session_key(sk);
 
         let content_result = content_encryptor.encrypt(plain_data)?;
         let encrypted_data = content_result.to_bytes()?;
@@ -164,19 +161,16 @@ impl BlockUploader {
         let signer = proton_rpgp::Signer::default().with_signing_key(&draft.signing_key.0);
         let signature = signer.sign_detached(plain_data, proton_rpgp::DataEncoding::Auto)?;
 
-        // 2. Encrypt the signature using the file key
+        // 2. Encrypt the signature using the file key (unsigned, matching official SDK)
         let signature_encryptor = proton_rpgp::Encryptor::default()
-            .with_encryption_key(draft.file_key.0.as_public_key())
-            .with_signing_key(&draft.signing_key.0);
+            .with_encryption_key(draft.file_key.0.as_public_key());
         let signature_result = signature_encryptor.encrypt(&signature)?;
         let encrypted_signature =
             crate::pgp::PgpArmoredMessage(String::from_utf8(signature_result.armor()?)?);
 
         // 3. Encrypt the content using the session key
         let sk = draft.content_key.to_rpgp_sk()?;
-        let content_encryptor = proton_rpgp::Encryptor::default()
-            .with_session_key(sk)
-            .with_signing_key(&draft.signing_key.0);
+        let content_encryptor = proton_rpgp::Encryptor::default().with_session_key(sk);
 
         let content_result = content_encryptor.encrypt(plain_data)?;
         let encrypted_data = content_result.to_bytes()?;

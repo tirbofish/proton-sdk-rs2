@@ -14,7 +14,7 @@ use crate::{
         ApiResponse,
         response::{
             AuthenticationResponse, ModulusResponse, RefreshSessionResponse, ScopesResponse,
-            SesisonInitiationResponse,
+            SesisonInitiationResponse, SessionForkInitResponse, SessionForkStatusResponse,
         },
     },
 };
@@ -241,6 +241,14 @@ pub trait AuthenticationApiClient: Send + Sync {
     async fn get_scopes(&self) -> anyhow::Result<ScopesResponse>;
 
     async fn get_random_srp_modulus(&self) -> anyhow::Result<ModulusResponse>;
+
+    async fn init_session_fork(&self) -> anyhow::Result<SessionForkInitResponse>;
+
+    /// `Ok(None)` when the browser login has not completed yet (HTTP 422).
+    async fn poll_session_fork(
+        &self,
+        selector: &str,
+    ) -> anyhow::Result<Option<SessionForkStatusResponse>>;
 }
 
 pub struct DefaultAuthenticationApiClient {
@@ -503,5 +511,30 @@ impl AuthenticationApiClient for DefaultAuthenticationApiClient {
             .error_for_status()?;
 
         crate::utils::decode_json::<ModulusResponse>(response).await
+    }
+
+    async fn init_session_fork(&self) -> anyhow::Result<SessionForkInitResponse> {
+        let response = self
+            .http_client
+            .get(self.endpoint("auth/v4/sessions/forks")?)
+            .send()
+            .await?;
+        let response = Self::error_for_status_with_body(response).await?;
+        crate::utils::decode_json::<SessionForkInitResponse>(response).await
+    }
+
+    async fn poll_session_fork(
+        &self,
+        selector: &str,
+    ) -> anyhow::Result<Option<SessionForkStatusResponse>> {
+        let path = format!("auth/v4/sessions/forks/{selector}");
+        let response = self.http_client.get(self.endpoint(&path)?).send().await?;
+        if response.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            return Ok(None);
+        }
+        let response = Self::error_for_status_with_body(response).await?;
+        Ok(Some(
+            crate::utils::decode_json::<SessionForkStatusResponse>(response).await?,
+        ))
     }
 }

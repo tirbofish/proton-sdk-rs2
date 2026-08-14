@@ -1,7 +1,11 @@
+use crate::api::share::ShareTargetType;
 use crate::client::ProtonDriveClient;
+use crate::error::ProtonDriveError;
 use crate::node::secrets::ShareAndKey;
+use crate::node::NodeUid;
 use crate::pgp::{PgpArmoredMessage, PgpArmoredPrivateKey, PgpArmoredSignature, PgpPrivateKey};
 use crate::share::{Share, ShareId};
+use crate::volume::VolumeId;
 
 pub struct ShareOperations;
 
@@ -119,5 +123,81 @@ impl ShareCrypto {
                 anyhow::bail!("Failed to decrypt share passphrase: {}", e)
             }
         }
+    }
+}
+
+pub struct SharingOperations;
+
+impl SharingOperations {
+    pub async fn enumerate_shared_node_uids(
+        client: &ProtonDriveClient,
+        volume_id: VolumeId,
+    ) -> anyhow::Result<Vec<NodeUid>> {
+        let mut uids = Vec::new();
+        let mut anchor_id = None;
+        loop {
+            let response = client
+                .api()
+                .shares()
+                .get_shared_by_me(volume_id.clone(), anchor_id)
+                .await?;
+            for link in &response.links {
+                uids.push(NodeUid::new(volume_id.clone(), link.link_id.clone()));
+            }
+            if !response.more || response.anchor_id.is_none() {
+                break;
+            }
+            anchor_id = response.anchor_id;
+        }
+        Ok(uids)
+    }
+
+    pub async fn enumerate_shared_with_me_node_uids(
+        client: &ProtonDriveClient,
+        share_target_types: &[ShareTargetType],
+    ) -> anyhow::Result<Vec<NodeUid>> {
+        let mut uids = Vec::new();
+        let mut anchor_id = None;
+        loop {
+            let response = client.api().shares().get_shared_with_me(anchor_id).await?;
+            for link in &response.links {
+                if share_target_types.contains(&link.share_target_type) {
+                    uids.push(NodeUid::new(link.volume_id.clone(), link.link_id.clone()));
+                }
+            }
+            if !response.more || response.anchor_id.is_none() {
+                break;
+            }
+            anchor_id = response.anchor_id;
+        }
+        Ok(uids)
+    }
+
+    pub async fn leave_shared_node(
+        client: &ProtonDriveClient,
+        node_uid: NodeUid,
+    ) -> anyhow::Result<()> {
+        let response = client
+            .api()
+            .links()
+            .get_details(node_uid.volume_id.clone(), vec![node_uid.link_id.clone()])
+            .await?;
+
+        let membership = response
+            .links
+            .into_iter()
+            .find(|link| link.link.id == node_uid.link_id)
+            .and_then(|link| link.membership)
+            .ok_or_else(|| {
+                ProtonDriveError::Validation(
+                    "You can leave only an item that is shared with you".into(),
+                )
+            })?;
+
+        client
+            .api()
+            .shares()
+            .remove_member(membership.share_id, membership.membership_id)
+            .await
     }
 }

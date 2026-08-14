@@ -5,10 +5,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::Context;
-use proton_drive_sdk::cache::sqlite::SqliteCacheRepository;
 use proton_sdk_rs2::{
-    AppVersionConfiguration, cache::CacheRepository, client::ProtonClientOptions,
-    session::ProtonAPISession,
+    AppVersionConfiguration, client::ProtonClientOptions, session::ProtonAPISession,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
@@ -90,6 +88,34 @@ pub fn request_retry_sync_now() -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn request_pause() -> anyhow::Result<()> {
+    set_paused(true)
+}
+
+pub fn request_resume() -> anyhow::Result<()> {
+    set_paused(false)
+}
+
+fn set_paused(want_paused: bool) -> anyhow::Result<()> {
+    let status = status().ok_or_else(|| anyhow::anyhow!("pdcli daemon is not running"))?;
+    let is_paused = matches!(status, DaemonStatus::Paused);
+    if is_paused != want_paused {
+        request_toggle_pause()?;
+    }
+    Ok(())
+}
+
+pub fn open_folder() {
+    let path = fs::default_mountpoint()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("MyFiles");
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(not(target_os = "macos"))]
+    let opener = "xdg-open";
+    let _ = std::process::Command::new(opener).arg(path).spawn();
+}
+
 pub fn recent_events() -> Vec<crate::db::SyncEvent> {
     request("events")
         .ok()
@@ -111,7 +137,7 @@ pub fn ensure_running(force_offline: bool, enable_tray: bool) -> anyhow::Result<
 
     let exe = std::env::current_exe()?;
     let mut command = std::process::Command::new(exe);
-    command.arg("--daemon");
+    command.arg("daemon");
     if force_offline {
         command.arg("--force-offline");
     }
@@ -165,7 +191,7 @@ pub async fn run(force_offline: bool, enable_tray: bool) -> anyhow::Result<()> {
         .context("failed to restore daemon session")?;
     let fuse_session = fs::spawn_fuse_session(&session, TransferTracker::new(), force_offline)
         .await
-        .ok_or_else(|| anyhow::anyhow!("failed to mount Proton Drive filesystem"))?;
+        .context("failed to mount Proton Drive filesystem")?;
 
     tracing::info!(socket = %path.display(), "pdcli daemon ready");
 
@@ -278,13 +304,7 @@ fn daemon_tray_state() -> tray::TrayState {
 fn handle_tray_action(action: tray::TrayAction) -> bool {
     match action {
         tray::TrayAction::OpenFolder => {
-            if let Some(path) = dirs::home_dir().map(|h| h.join("ProtonDrive").join("MyFiles")) {
-                #[cfg(target_os = "macos")]
-                let opener = "open";
-                #[cfg(not(target_os = "macos"))]
-                let opener = "xdg-open";
-                let _ = std::process::Command::new(opener).arg(path).spawn();
-            }
+            open_folder();
             false
         }
         tray::TrayAction::ShowHideWindow => {
@@ -322,6 +342,7 @@ fn launch_gui(page: Option<&str>) {
         return;
     };
     let mut command = std::process::Command::new(exe);
+    command.arg("gui");
     if let Some(page) = page {
         command.arg("--page").arg(page);
     }
@@ -343,21 +364,11 @@ fn status_response() -> &'static str {
 }
 
 async fn restore_session(force_offline: bool) -> anyhow::Result<ProtonAPISession> {
-    let cred =
-        credentials::load().ok_or_else(|| anyhow::anyhow!("no stored credentials available"))?;
+    let cred = credentials::load().ok_or_else(|| {
+        anyhow::anyhow!("no stored credentials; run `pdcli login` to sign in")
+    })?;
 
-    let config_dir = platform_dirs::AppDirs::new(Some("pdcli"), false)
-        .ok_or_else(|| anyhow::anyhow!("failed to resolve config directory"))?
-        .config_dir;
-    std::fs::create_dir_all(&config_dir)?;
-    let cache_db_path = config_dir.join("cache.db");
-
-    let entity_cache: std::sync::Arc<dyn CacheRepository> = std::sync::Arc::new(
-        SqliteCacheRepository::open_file(&cache_db_path, Some(10_000))?,
-    );
-    let secret_cache: std::sync::Arc<dyn CacheRepository> = std::sync::Arc::new(
-        SqliteCacheRepository::open_file(&cache_db_path, Some(5_000))?,
-    );
+    let (entity_cache, secret_cache) = credentials::open_session_caches()?;
 
     let mut session = ProtonAPISession::from_stored_credentials(
         cred,

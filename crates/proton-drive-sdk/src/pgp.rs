@@ -39,10 +39,7 @@ impl PgpPrivateKey {
             .with_decryption_key(&self.0)
             .decrypt_session_key(content_key_packet)
         {
-            Ok(sk) => Ok(PgpSessionKey {
-                algorithm: sk.algorithm().map(u8::from).unwrap_or(9), // 9 is AES256
-                key: sk.as_ref().to_vec(),
-            }),
+            Ok(sk) => Ok(PgpSessionKey::from_rpgp(&sk)),
             Err(e) => Err(e.to_string()),
         }
     }
@@ -52,6 +49,17 @@ impl PgpPrivateKey {
         let encryptor =
             proton_rpgp::Encryptor::default().with_encryption_key(self.0.as_public_key());
         Ok(encryptor.encrypt_session_key(&sk)?)
+    }
+
+    /// Detached armored signature using SHA-256, matching Proton Drive / openpgp.js.
+    pub fn sign_detached_armored(&self, data: &[u8]) -> anyhow::Result<PgpArmoredSignature> {
+        let profile = proton_rpgp::ProfileSettings::builder()
+            .preferred_hash_algorithm(proton_rpgp::pgp::crypto::hash::HashAlgorithm::Sha256)
+            .build_into_profile();
+        let bytes = proton_rpgp::Signer::new(profile)
+            .with_signing_key(&self.0)
+            .sign_detached(data, DataEncoding::Armored)?;
+        Ok(PgpArmoredSignature(String::from_utf8(bytes)?))
     }
 
     pub fn to_armored_private_key(
@@ -238,8 +246,42 @@ impl<'de> Deserialize<'de> for PgpSessionKey {
 }
 
 impl PgpSessionKey {
+    pub fn from_rpgp(sk: &proton_rpgp::SessionKey) -> Self {
+        Self {
+            algorithm: sk.algorithm().map(u8::from).unwrap_or(0),
+            key: sk.as_ref().to_vec(),
+        }
+    }
+
     pub fn to_rpgp_sk(&self) -> anyhow::Result<proton_rpgp::SessionKey> {
+        if self.algorithm == 0 {
+            return Ok(proton_rpgp::SessionKey::new_for_seipdv2(&self.key));
+        }
         let algo = proton_rpgp::pgp::crypto::sym::SymmetricKeyAlgorithm::from(self.algorithm);
         Ok(proton_rpgp::SessionKey::new(&self.key, algo))
+    }
+
+    /// Decrypt ciphertext that may be SEIPDv1 or SEIPDv2. Content-key packets from
+    /// current Proton Drive clients are v6/SEIPDv2; reconstructing them with
+    /// `SessionKey::new` (always v3/v4) fails with "v3/4 session keys are not allowed".
+    pub fn decrypt(&self, ciphertext: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let algo = proton_rpgp::pgp::crypto::sym::SymmetricKeyAlgorithm::from(self.algorithm);
+        let keys = [
+            proton_rpgp::SessionKey::new_for_seipdv2(&self.key),
+            proton_rpgp::SessionKey::new(&self.key, algo),
+        ];
+        let mut last_err = None;
+        for sk in keys {
+            match proton_rpgp::Decryptor::default()
+                .with_session_key(sk)
+                .decrypt(ciphertext, DataEncoding::Auto)
+            {
+                Ok(result) => return Ok(result.data),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err
+            .map(Into::into)
+            .unwrap_or_else(|| anyhow::anyhow!("session key decrypt failed")))
     }
 }

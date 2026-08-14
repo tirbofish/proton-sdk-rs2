@@ -2,10 +2,10 @@ use crate::block::verify::BlockVerifier;
 use crate::client::ProtonDriveClient;
 use crate::node::NodeUid;
 use crate::node::revision::RevisionUid;
-use crate::pgp::{PgpArmoredSignature, PgpPrivateKey, PgpSessionKey};
+use crate::pgp::{PgpPrivateKey, PgpSessionKey};
 use crate::revision::RevisionId;
 use async_trait::async_trait;
-use proton_rpgp::{AsPublicKeyRef, DataEncoding, Encryptor, Signer};
+use proton_rpgp::{AsPublicKeyRef, Encryptor};
 use proton_sdk_rs2::protobuf::Address;
 use std::sync::Arc;
 
@@ -39,6 +39,37 @@ pub trait RevisionDraftProvider: Send + Sync {
     async fn get_draft(&self) -> anyhow::Result<RevisionDraft>;
 }
 
+async fn membership_address_for(
+    client: &ProtonDriveClient,
+    uid: &NodeUid,
+) -> anyhow::Result<Address> {
+    match crate::node::operations::NodeOperations::get_membership_address(client, uid).await {
+        Ok(addr) => Ok(addr),
+        Err(error) => {
+            tracing::warn!(%error, "membership address lookup failed, using default");
+            client.account().get_default_address().await
+        }
+    }
+}
+
+async fn signing_key_for(
+    client: &ProtonDriveClient,
+    address_id: &str,
+) -> anyhow::Result<proton_rpgp::PrivateKey> {
+    use proton_rpgp::AccessKeyInfo;
+    let keys = client
+        .account()
+        .get_address_private_keys(&crate::account::AddressId::new(address_id.to_string()))
+        .await?;
+    // Drive's commit endpoint still verifies v4 signatures; skip v6/PQC primaries.
+    if let Some(v4) = keys.iter().find(|k| k.version() < 6) {
+        return Ok(v4.clone());
+    }
+    keys.into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no address keys for {address_id}"))
+}
+
 #[async_trait]
 impl RevisionDraftProvider for NewFileDraftProvider {
     async fn get_draft(&self) -> anyhow::Result<RevisionDraft> {
@@ -48,15 +79,9 @@ impl RevisionDraftProvider for NewFileDraftProvider {
         )
         .await?;
 
-        // Find membership address (simplified for now, use default)
-        let membership_address = self.client.account().get_default_address().await?;
-        let signing_key = self
-            .client
-            .account()
-            .get_address_primary_private_key(&crate::account::AddressId::new(
-                membership_address.address_id.clone(),
-            ))
-            .await?;
+        let membership_address =
+            membership_address_for(&self.client, &self.parent_folder_uid).await?;
+        let signing_key = signing_key_for(&self.client, &membership_address.address_id).await?;
 
         // Create draft via API
         let node_key = crate::crypto::CryptoGenerator::generate_private_key()?;
@@ -95,11 +120,8 @@ impl RevisionDraftProvider for NewFileDraftProvider {
             content_key_packet: Encryptor::default()
                 .with_encryption_key(node_key.0.as_public_key())
                 .encrypt_session_key(&content_key.to_rpgp_sk()?)?,
-            content_key_signature: PgpArmoredSignature(String::from_utf8(
-                Signer::default()
-                    .with_signing_key(&PgpPrivateKey(signing_key.clone()).0)
-                    .sign_detached(&content_key.key, DataEncoding::Armored)?,
-            )?),
+            // Official SDK signs the content key with the node key, not the address key.
+            content_key_signature: node_key.sign_detached_armored(&content_key.key)?,
             signature_email_address: membership_address.email_address.clone(),
             client_uid: None,
             intended_upload_size: None,
@@ -145,14 +167,8 @@ impl RevisionDraftProvider for NewRevisionDraftProvider {
         let node_secrets =
             crate::node::file::FileOperations::get_secrets(&self.client, self.node_uid.clone())
                 .await?;
-        let membership_address = self.client.account().get_default_address().await?;
-        let signing_key = self
-            .client
-            .account()
-            .get_address_primary_private_key(&crate::account::AddressId::new(
-                membership_address.address_id.clone(),
-            ))
-            .await?;
+        let membership_address = membership_address_for(&self.client, &self.node_uid).await?;
+        let signing_key = signing_key_for(&self.client, &membership_address.address_id).await?;
 
         let content_key = node_secrets.content_key.clone();
 

@@ -129,6 +129,8 @@ pub struct RevisionUpdateRequest {
     #[serde(rename = "SignatureAddress")]
     pub signature_email_address: String,
 
+    pub checksum_verified: bool,
+
     #[serde(rename = "XAttr")]
     pub extended_attributes: Option<PgpArmoredMessage>,
 

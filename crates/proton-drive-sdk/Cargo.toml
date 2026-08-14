@@ -10,6 +10,7 @@ description = "Interface with the Proton Drive client"
 
 [dependencies]
 proton-sdk-rs2.workspace = true
+proton-srp.workspace = true
 
 proton-crypto.workspace = true
 reqwest.workspace = true

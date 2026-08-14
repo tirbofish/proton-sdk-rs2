@@ -35,12 +35,17 @@ pub struct BlockDto {
     pub index: i32,
 
     #[serde(rename = "Hash")]
+    #[serde(default)]
     #[serde(with = "crate::utils::serde::forgiving_hex_bytes")]
     pub hash_digest: Vec<u8>,
 
     #[serde(rename = "BareURL")]
+    #[serde(default)]
+    #[serde(deserialize_with = "crate::utils::serde::deserialize_null_default")]
     pub bare_url: String,
 
+    #[serde(default)]
+    #[serde(deserialize_with = "crate::utils::serde::deserialize_null_default")]
     pub token: String,
 }
 
@@ -50,6 +55,7 @@ pub struct BlockListingRevisionDto {
     #[serde(flatten)]
     pub revision: RevisionDto,
 
+    #[serde(default)]
     pub blocks: Vec<BlockDto>,
 }
 

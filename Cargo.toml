@@ -52,6 +52,6 @@ parking_lot = { version = "0.12", features = ["deadlock_detection"] }
 mime_guess = "2.0"
 image = { version = "0.25", features = ["png", "jpeg", "webp"] }
 rpassword = "7.4"
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled-sqlcipher-vendored-openssl"] }
 aes-gcm = "0.10"
 keyring = { version = "3.6", features = ["linux-native", "sync-secret-service", "windows-native", "apple-native"] }

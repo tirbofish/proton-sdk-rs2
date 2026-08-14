@@ -1,10 +1,8 @@
-use std::sync::Arc;
+use std::process::{Command, Stdio};
 
 use poll_promise::Promise;
-use proton_drive_sdk::cache::sqlite::SqliteCacheRepository;
 use proton_sdk_rs2::{
-    AppVersionConfiguration, cache::CacheRepository, client::ProtonClientOptions,
-    session::ProtonAPISession,
+    AppVersionConfiguration, client::ProtonClientOptions, session::ProtonAPISession,
 };
 
 use crate::credentials;
@@ -53,20 +51,8 @@ impl AuthScreen {
     fn begin_login(&mut self) {
         self.error = None;
 
-        let config_dir = platform_dirs::AppDirs::new(Some("pdcli"), false)
-            .expect("failed to resolve config directory")
-            .config_dir;
-        std::fs::create_dir_all(&config_dir).ok();
-        let cache_db_path = config_dir.join("cache.db");
-
-        let entity_cache: Arc<dyn CacheRepository> = Arc::new(
-            SqliteCacheRepository::open_file(&cache_db_path, Some(10_000))
-                .expect("failed to open entity cache"),
-        );
-        let secret_cache: Arc<dyn CacheRepository> = Arc::new(
-            SqliteCacheRepository::open_file(&cache_db_path, Some(5_000))
-                .expect("failed to open secret cache"),
-        );
+        let (entity_cache, secret_cache) =
+            credentials::open_session_caches().expect("failed to open session caches");
 
         let username = self.username.clone();
         let password = self.password.clone();
@@ -299,5 +285,43 @@ impl AuthScreen {
 fn persist(session: &ProtonAPISession) {
     if let Err(e) = credentials::save(&session.to_stored_credentials()) {
         tracing::warn!(error = %e, "failed to persist credentials");
+    }
+}
+
+pub async fn login_cli() -> anyhow::Result<ProtonAPISession> {
+    let (entity_cache, secret_cache) = credentials::open_session_caches()?;
+
+    println!("This is a third-party application not officially supported by Proton.");
+    tracing::info!("starting browser authentication");
+    let session = ProtonAPISession::begin_via_web(
+        AppVersionConfiguration::new("pdcli", 0, 1, 0),
+        ProtonClientOptions {
+            entity_cache_repository: Some(entity_cache),
+            secret_cache_repository: Some(secret_cache),
+            ..Default::default()
+        },
+        |url, user_code| {
+            println!("Complete sign-in in the browser. Keep this terminal open.");
+            println!("Sign-in code: {user_code}");
+            println!("{url}");
+            open_browser(url);
+        },
+    )
+    .await?;
+
+    tracing::info!(user = %session.username, "authenticated");
+    persist(&session);
+    credentials::save_session_tokens_on_refresh(&session);
+    Ok(session)
+}
+
+fn open_browser(url: &str) {
+    for cmd in ["xdg-open", "wslview"] {
+        let _ = Command::new(cmd)
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
     }
 }

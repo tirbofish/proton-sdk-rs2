@@ -33,7 +33,15 @@ impl ProtonAccountClient {
     /// Returns the address matching `address_id`, fetching and caching it from the API if needed.
     pub async fn get_address(&self, address_id: &str) -> anyhow::Result<Address> {
         if let Some(address) = self.cache.entities().try_get_address(address_id).await? {
-            return Ok(address);
+            if self
+                .cache
+                .secrets()
+                .try_get_address_keys(address_id)
+                .await?
+                .is_some()
+            {
+                return Ok(address);
+            }
         }
 
         let response = self.api.addresses().get_address(address_id).await?;

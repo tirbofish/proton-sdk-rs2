@@ -17,7 +17,7 @@ use crate::node::folder::{FolderNode, FolderOperations, FolderSecrets};
 use crate::node::photo::{PhotoTag, PhotosFileUploadMetadata, PhotosTimelineItem, TimelineEntry};
 use crate::node::{DegradedNode, Node, NodeAndSecrets, NodeUid};
 use crate::pgp::PgpPrivateKey;
-use crate::share_ops::ShareOperations;
+use crate::share_ops::{ShareOperations, SharingOperations};
 use crate::utils::PotentialObject;
 use crate::volume::VolumeId;
 use hmac::{Hmac, KeyInit, Mac};
@@ -1000,5 +1000,118 @@ impl ProtonPhotosClient {
                 related_photos: vec![],
             },
         }))
+    }
+
+    /// UIDs of nodes the user has shared from the photos volume.
+    pub async fn enumerate_shared_node_uids(&self) -> anyhow::Result<Vec<NodeUid>> {
+        let volume_id = self.get_photos_volume_id().await?;
+        SharingOperations::enumerate_shared_node_uids(&self.drive, volume_id).await
+    }
+
+    /// UIDs of photos and albums shared with the user, including shared albums
+    /// that the shared-with-me endpoint does not yet return.
+    pub async fn enumerate_shared_with_me_node_uids(&self) -> anyhow::Result<Vec<NodeUid>> {
+        let mut uids = SharingOperations::enumerate_shared_with_me_node_uids(
+            &self.drive,
+            crate::api::share::ShareTargetType::PHOTOS,
+        )
+        .await?;
+        uids.extend(self.enumerate_shared_with_me_album_uids().await?);
+        Ok(uids)
+    }
+
+    async fn enumerate_shared_with_me_album_uids(&self) -> anyhow::Result<Vec<NodeUid>> {
+        let mut uids = Vec::new();
+        let mut anchor = None;
+        loop {
+            let response = self.photos_api.get_shared_albums(anchor).await?;
+            for album in &response.albums {
+                uids.push(NodeUid::new(album.volume_id.clone(), album.link_id.clone()));
+            }
+            if !response.more || response.anchor_id.is_none() {
+                break;
+            }
+            anchor = response.anchor_id.clone();
+        }
+        Ok(uids)
+    }
+
+    /// Leaves a node that was shared with the current user.
+    pub async fn leave_shared_node(&self, node_uid: NodeUid) -> anyhow::Result<()> {
+        SharingOperations::leave_shared_node(&self.drive, node_uid).await
+    }
+
+    pub async fn iterate_invitations(
+        &self,
+    ) -> anyhow::Result<Vec<crate::sharing::ProtonInvitationWithNode>> {
+        crate::sharing::SharingOperations::iterate_invitations(
+            &self.drive,
+            crate::api::share::ShareTargetType::PHOTOS,
+        )
+        .await
+    }
+
+    pub async fn accept_invitation(&self, invitation_uid: &str) -> anyhow::Result<()> {
+        crate::sharing::SharingOperations::accept_invitation(&self.drive, invitation_uid).await
+    }
+
+    pub async fn reject_invitation(&self, invitation_uid: &str) -> anyhow::Result<()> {
+        crate::sharing::SharingOperations::reject_invitation(&self.drive, invitation_uid).await
+    }
+
+    pub async fn share_node(
+        &self,
+        node_uid: NodeUid,
+        settings: crate::sharing::ShareNodeSettings,
+    ) -> anyhow::Result<crate::sharing::ShareResult> {
+        crate::sharing::SharingOperations::share_node(&self.drive, node_uid, settings).await
+    }
+
+    pub async fn unshare_node(
+        &self,
+        node_uid: NodeUid,
+        settings: crate::sharing::UnshareNodeSettings,
+    ) -> anyhow::Result<Option<crate::sharing::ShareResult>> {
+        crate::sharing::SharingOperations::unshare_node(&self.drive, node_uid, settings).await
+    }
+
+    pub async fn get_sharing_info(
+        &self,
+        node_uid: NodeUid,
+    ) -> anyhow::Result<Option<crate::sharing::ShareResult>> {
+        crate::sharing::SharingOperations::get_sharing_info(&self.drive, node_uid).await
+    }
+
+    pub async fn subscribe_to_tree_events(
+        &self,
+        volume_id: VolumeId,
+        callback: std::sync::Arc<dyn Fn(crate::events::DriveEvent) + Send + Sync>,
+    ) -> anyhow::Result<crate::events::EventSubscription> {
+        self.drive.subscribe_to_tree_events(volume_id, callback).await
+    }
+
+    pub async fn subscribe_to_drive_events(
+        &self,
+        callback: std::sync::Arc<dyn Fn(crate::events::DriveEvent) + Send + Sync>,
+    ) -> anyhow::Result<crate::events::EventSubscription> {
+        self.drive.subscribe_to_drive_events(callback).await
+    }
+
+    /// Adds or removes the Favorite tag on a photo.
+    pub async fn favorite_photo(&self, uid: NodeUid, favorite: bool) -> anyhow::Result<()> {
+        let update = PhotoTagUpdate {
+            uid,
+            tags_to_add: if favorite {
+                vec![PhotoTag::Favorite]
+            } else {
+                vec![]
+            },
+            tags_to_remove: if favorite {
+                vec![]
+            } else {
+                vec![PhotoTag::Favorite]
+            },
+        };
+        self.update_photos(vec![update]).await
     }
 }

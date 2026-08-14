@@ -1,10 +1,25 @@
 # pdcli
 
-Mount your Proton Drive client to a FUSE file system.
+Mount your Proton Drive to a FUSE filesystem.
 
 ## Usage
 
-To use this, it is as simple as doing `pdcli mount {location}`, which mounts the filesystem to your FUSE. This will prompt you for your login. 
+```
+pdcli              # GUI (on WSL: mount instead)
+pdcli gui          # graphical app
+pdcli login        # browser sign-in
+pdcli logout       # sign out and unmount
+pdcli mount        # sign in if needed, mount ~/ProtonDrive
+pdcli status       # login + daemon state
+pdcli stop         # unmount and stop
+pdcli pause        # pause background sync
+pdcli resume       # resume background sync
+pdcli sync         # retry sync now
+pdcli open         # open the Drive folder
+pdcli --help
+```
+
+The mount point is `~/ProtonDrive`. Run `pdcli gui` on WSL if you want the window.
 
 ## Disclaimer
 

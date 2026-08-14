@@ -154,12 +154,9 @@ impl CacheRepository for EncryptedCacheRepository {
             return Ok(None);
         };
 
-        match self.decrypt(key, &encrypted)? {
-            Some(plaintext) => Ok(Some(plaintext)),
-            None => {
-                self.inner.clear().await?;
-                Ok(None)
-            }
+        match self.decrypt(key, &encrypted) {
+            Ok(Some(plaintext)) => Ok(Some(plaintext)),
+            Ok(None) | Err(_) => Ok(None),
         }
     }
 
@@ -172,14 +169,9 @@ impl CacheRepository for EncryptedCacheRepository {
 
         let mapped = stream.then(move |item| async move {
             let (key, encrypted) = item?;
-            match self.decrypt(&key, &encrypted)? {
-                Some(plaintext) => Ok((key, plaintext)),
-                None => {
-                    self.inner.clear().await?;
-                    Err(anyhow::anyhow!(
-                        "Authentication tag mismatch: cache cleared"
-                    ))
-                }
+            match self.decrypt(&key, &encrypted) {
+                Ok(Some(plaintext)) => Ok((key, plaintext)),
+                Ok(None) | Err(_) => Err(anyhow::anyhow!("cache decrypt failed")),
             }
         });
 

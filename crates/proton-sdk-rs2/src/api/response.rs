@@ -139,6 +139,34 @@ pub struct AuthenticationResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct SessionForkInitResponse {
+    #[serde(rename = "Selector", alias = "selector")]
+    pub selector: String,
+    #[serde(rename = "UserCode", alias = "user_code")]
+    pub user_code: String,
+    #[serde(flatten)]
+    pub response: ApiResponse,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionForkStatusResponse {
+    #[serde(rename = "Payload", alias = "payload")]
+    pub payload: String,
+    #[serde(rename = "UID", alias = "session_id")]
+    pub session_id: SessionId,
+    #[serde(rename = "AccessToken", alias = "access_token")]
+    pub access_token: String,
+    #[serde(rename = "RefreshToken", alias = "refresh_token", default)]
+    pub refresh_token: String,
+    #[serde(rename = "UserID", alias = "user_id")]
+    pub user_id: UserId,
+    #[serde(rename = "Scopes", alias = "scopes", default)]
+    pub scopes: Vec<String>,
+    #[serde(rename = "PasswordMode", alias = "password_mode", default)]
+    pub password_mode: Option<PasswordMode>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct SecondFactorParameters {
     #[serde(
         rename = "Enabled",

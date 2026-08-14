@@ -18,8 +18,6 @@ use crate::volume::VolumeId;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
-use proton_rpgp::pgp::crypto::sym::SymmetricKeyAlgorithm;
-use proton_rpgp::{DataEncoding, Decryptor, SessionKey};
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 
@@ -334,15 +332,10 @@ impl FileOperations {
             .await
             .context("Failed to read thumbnail blob bytes")?;
 
-        // Decrypt the thumbnail using the content key
-        let alg = SymmetricKeyAlgorithm::from(secrets.content_key.algorithm);
-        let sk = SessionKey::new(&secrets.content_key.key, alg);
-        let result = Decryptor::default()
-            .with_session_key(sk)
-            .decrypt(&blob_bytes, DataEncoding::Auto)
-            .context("Failed to decrypt thumbnail")?;
-
-        Ok(result.data)
+        secrets
+            .content_key
+            .decrypt(&blob_bytes)
+            .context("Failed to decrypt thumbnail")
     }
 }
 

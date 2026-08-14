@@ -75,6 +75,7 @@ pub struct ProtonDriveClient {
     block_uploader: BlockUploader,
     block_downloader: BlockDownloader,
     thumbnail_block_downloader: BlockDownloader,
+    sdk_events: Arc<crate::events::SdkEvents>,
 }
 
 // initialisers
@@ -323,6 +324,7 @@ impl ProtonDriveClient {
             block_uploader,
             block_downloader,
             thumbnail_block_downloader,
+            sdk_events: Arc::new(crate::events::SdkEvents::new()),
         }
     }
 }
@@ -394,6 +396,16 @@ impl ProtonDriveClient {
         &self.telemetry
     }
 
+    /// SDK-level transfer and throttle events.
+    pub fn sdk_events(&self) -> &Arc<crate::events::SdkEvents> {
+        &self.sdk_events
+    }
+
+    /// File and block transfer permits used by upload and download.
+    pub fn transfer_queue(&self) -> &crate::node::transfer::TransferQueue {
+        &self.block_uploader.queue
+    }
+
     /// Returns the feature flag provider used to gate experimental behaviour.
     pub fn feature_flag_provider(&self) -> &Arc<dyn FeatureFlagProvider> {
         &self.feature_flag_provider
@@ -460,10 +472,6 @@ impl ProtonDriveClient {
         node_uid: NodeUid,
         thumbnail_id: String,
     ) -> anyhow::Result<Vec<u8>> {
-        use proton_rpgp::{
-            DataEncoding, Decryptor, SessionKey, pgp::crypto::sym::SymmetricKeyAlgorithm,
-        };
-
         let secrets = FileOperations::get_secrets(self, node_uid.clone())
             .await
             .context("Failed to get file secrets for thumbnail")?;
@@ -527,14 +535,10 @@ impl ProtonDriveClient {
 
         tracing::debug!("Read {} bytes from thumbnail blob", blob_bytes.len());
 
-        let alg = SymmetricKeyAlgorithm::from(secrets.content_key.algorithm);
-        let sk = SessionKey::new(&secrets.content_key.key, alg);
-        let result = Decryptor::default()
-            .with_session_key(sk)
-            .decrypt(&blob_bytes, DataEncoding::Auto)
-            .context("Failed to decrypt thumbnail")?;
-
-        Ok(result.data)
+        secrets
+            .content_key
+            .decrypt(&blob_bytes)
+            .context("Failed to decrypt thumbnail")
     }
 
     /// Fetches and decrypts multiple nodes in parallel, returning results in an unordered stream.
@@ -1038,6 +1042,179 @@ impl ProtonDriveClient {
     /// Unregisters a Computer, removing it from the account.
     pub async fn delete_device(&self, device_id: &str) -> anyhow::Result<()> {
         DeviceOperations::delete_device(self, device_id).await
+    }
+
+    /// Builds a node UID from raw volume and link IDs (`volumeId~linkId`).
+    pub fn generate_node_uid(volume_id: impl Into<String>, node_id: impl Into<String>) -> NodeUid {
+        NodeUid::from_parts(volume_id, node_id)
+    }
+
+    /// Proton Drive (or Docs) web URL for opening this node in the production web app.
+    pub async fn get_node_url(&self, node_uid: NodeUid) -> anyhow::Result<String> {
+        let node = self
+            .get_node(node_uid.clone())
+            .await?
+            .result()
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let media_type = match &node {
+            Node::File(f) | Node::Photo(f) => Some(f.base.media_type.as_str()),
+            Node::Folder(_) | Node::Album(_) => None,
+        };
+        let is_file = matches!(node.ty(), crate::node::NodeType::File | crate::node::NodeType::Photo);
+        if crate::node::is_proton_document(media_type) || crate::node::is_proton_sheet(media_type) {
+            return Ok(crate::node::node_web_url("", &node_uid, is_file, media_type));
+        }
+        let context = self
+            .api()
+            .links()
+            .get_context_share(node_uid.volume_id.clone(), node_uid.link_id.clone())
+            .await?;
+        Ok(crate::node::node_web_url(
+            context.context_share_id.raw(),
+            &node_uid,
+            is_file,
+            media_type,
+        ))
+    }
+
+    /// Content session key used by Proton Docs to encrypt and decrypt document updates.
+    pub async fn get_docs_key(&self, node_uid: NodeUid) -> anyhow::Result<crate::pgp::PgpSessionKey> {
+        Ok(FileOperations::get_secrets(self, node_uid).await?.content_key)
+    }
+
+    /// UIDs of nodes the user has shared from My Files.
+    pub async fn enumerate_shared_node_uids(&self) -> anyhow::Result<Vec<NodeUid>> {
+        let my_files = self.get_my_files_folder().await?;
+        crate::share_ops::SharingOperations::enumerate_shared_node_uids(
+            self,
+            my_files.base.uid.volume_id,
+        )
+        .await
+    }
+
+    /// UIDs of nodes shared with the user (files, folders, and Proton Docs).
+    pub async fn enumerate_shared_with_me_node_uids(&self) -> anyhow::Result<Vec<NodeUid>> {
+        crate::share_ops::SharingOperations::enumerate_shared_with_me_node_uids(
+            self,
+            crate::api::share::ShareTargetType::DRIVE,
+        )
+        .await
+    }
+
+    /// Leaves a node that was shared with the current user.
+    pub async fn leave_shared_node(&self, node_uid: NodeUid) -> anyhow::Result<()> {
+        crate::share_ops::SharingOperations::leave_shared_node(self, node_uid).await
+    }
+
+    pub async fn iterate_invitations(
+        &self,
+    ) -> anyhow::Result<Vec<crate::sharing::ProtonInvitationWithNode>> {
+        crate::sharing::SharingOperations::iterate_invitations(
+            self,
+            crate::api::share::ShareTargetType::DRIVE,
+        )
+        .await
+    }
+
+    pub async fn accept_invitation(&self, invitation_uid: &str) -> anyhow::Result<()> {
+        crate::sharing::SharingOperations::accept_invitation(self, invitation_uid).await
+    }
+
+    pub async fn reject_invitation(&self, invitation_uid: &str) -> anyhow::Result<()> {
+        crate::sharing::SharingOperations::reject_invitation(self, invitation_uid).await
+    }
+
+    pub async fn resend_invitation_email(&self, invitation_uid: &str) -> anyhow::Result<()> {
+        crate::sharing::SharingOperations::resend_invitation_email(self, invitation_uid).await
+    }
+
+    pub async fn convert_non_proton_invitation(
+        &self,
+        node_uid: NodeUid,
+        invitation_uid: &str,
+    ) -> anyhow::Result<crate::sharing::ProtonInvitation> {
+        crate::sharing::SharingOperations::convert_non_proton_invitation(
+            self,
+            node_uid,
+            invitation_uid,
+        )
+        .await
+    }
+
+    pub async fn get_sharing_info(
+        &self,
+        node_uid: NodeUid,
+    ) -> anyhow::Result<Option<crate::sharing::ShareResult>> {
+        crate::sharing::SharingOperations::get_sharing_info(self, node_uid).await
+    }
+
+    pub async fn share_node(
+        &self,
+        node_uid: NodeUid,
+        settings: crate::sharing::ShareNodeSettings,
+    ) -> anyhow::Result<crate::sharing::ShareResult> {
+        crate::sharing::SharingOperations::share_node(self, node_uid, settings).await
+    }
+
+    pub async fn unshare_node(
+        &self,
+        node_uid: NodeUid,
+        settings: crate::sharing::UnshareNodeSettings,
+    ) -> anyhow::Result<Option<crate::sharing::ShareResult>> {
+        crate::sharing::SharingOperations::unshare_node(self, node_uid, settings).await
+    }
+
+    pub async fn set_editors_can_share(&self, node_uid: NodeUid, value: bool) -> anyhow::Result<()> {
+        crate::sharing::SharingOperations::set_editors_can_share(self, node_uid, value).await
+    }
+
+    pub async fn create_public_link(
+        &self,
+        node_uid: NodeUid,
+        settings: crate::sharing::ShareUrlSettings,
+    ) -> anyhow::Result<crate::sharing::UrlAccess> {
+        crate::sharing::SharingOperations::create_public_link(self, node_uid, settings).await
+    }
+
+    pub async fn get_public_link_info(
+        &self,
+        url: &str,
+    ) -> anyhow::Result<crate::sharing::PublicLinkInfo> {
+        crate::sharing::SharingOperations::get_public_link_info(self, url).await
+    }
+
+    pub async fn authenticate_public_link(
+        &self,
+        url: &str,
+    ) -> anyhow::Result<crate::sharing::PublicLinkClient> {
+        crate::sharing::SharingOperations::authenticate_public_link(self, url).await
+    }
+
+    pub async fn iterate_bookmarks(&self) -> anyhow::Result<Vec<crate::sharing::Bookmark>> {
+        crate::sharing::SharingOperations::iterate_bookmarks(self).await
+    }
+
+    pub async fn create_bookmark(&self, url: &str) -> anyhow::Result<()> {
+        crate::sharing::SharingOperations::create_bookmark(self, url).await
+    }
+
+    pub async fn remove_bookmark(&self, bookmark_or_url: &str) -> anyhow::Result<()> {
+        crate::sharing::SharingOperations::remove_bookmark(self, bookmark_or_url).await
+    }
+
+    pub async fn subscribe_to_tree_events(
+        &self,
+        volume_id: VolumeId,
+        callback: std::sync::Arc<dyn Fn(crate::events::DriveEvent) + Send + Sync>,
+    ) -> anyhow::Result<crate::events::EventSubscription> {
+        crate::events::subscribe_to_tree_events(self.clone(), volume_id, callback).await
+    }
+
+    pub async fn subscribe_to_drive_events(
+        &self,
+        callback: std::sync::Arc<dyn Fn(crate::events::DriveEvent) + Send + Sync>,
+    ) -> anyhow::Result<crate::events::EventSubscription> {
+        crate::events::subscribe_to_drive_events(self.clone(), callback).await
     }
 
     async fn get_file_uploader_from_draft_provider(

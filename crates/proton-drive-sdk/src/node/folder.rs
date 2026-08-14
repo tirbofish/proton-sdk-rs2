@@ -250,8 +250,12 @@ impl FolderOperations {
         }
 
         let metadata_result: NodeMetadataResult =
-            DtoToMetadataConverter::get_fresh_node_metadata(client, folder_uid.clone(), None)
-                .await?;
+            Box::pin(DtoToMetadataConverter::get_fresh_node_metadata(
+                client,
+                folder_uid.clone(),
+                None,
+            ))
+            .await?;
 
         metadata_result
             .try_get_folder_secrets_else_error()

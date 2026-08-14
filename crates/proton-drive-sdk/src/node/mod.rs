@@ -176,9 +176,17 @@ pub struct NodeUid {
     pub link_id: LinkId,
 }
 
+pub const PROTON_DOC_MEDIA_TYPE: &str = "application/vnd.proton.doc";
+pub const PROTON_SHEET_MEDIA_TYPE: &str = "application/vnd.proton.sheet";
+
 impl NodeUid {
     pub fn new(volume_id: VolumeId, link_id: LinkId) -> Self {
         Self { volume_id, link_id }
+    }
+
+    /// Builds a node UID from raw volume and link/node IDs (`volumeId~linkId`).
+    pub fn from_parts(volume_id: impl Into<String>, link_id: impl Into<String>) -> Self {
+        Self::new(VolumeId::new(volume_id.into()), LinkId::new(link_id.into()))
     }
 
     pub fn try_parse(s: &str) -> Option<Self> {
@@ -214,6 +222,76 @@ impl TryFrom<String> for NodeUid {
     type Error = String;
     fn try_from(s: String) -> Result<Self, Self::Error> {
         NodeUid::parse(&s)
+    }
+}
+
+pub fn is_proton_document(media_type: Option<&str>) -> bool {
+    media_type == Some(PROTON_DOC_MEDIA_TYPE)
+}
+
+pub fn is_proton_sheet(media_type: Option<&str>) -> bool {
+    media_type == Some(PROTON_SHEET_MEDIA_TYPE)
+}
+
+/// Proton Drive / Docs web URL for a node, matching the JS SDK `getNodeUrl`.
+pub fn node_web_url(
+    share_id: &str,
+    node_uid: &NodeUid,
+    is_file: bool,
+    media_type: Option<&str>,
+) -> String {
+    if is_proton_document(media_type) || is_proton_sheet(media_type) {
+        let kind = if is_proton_document(media_type) {
+            "doc"
+        } else {
+            "sheet"
+        };
+        return format!(
+            "https://docs.proton.me/doc?type={}&mode=open&volumeId={}&linkId={}",
+            kind,
+            node_uid.volume_id.raw(),
+            node_uid.link_id.raw()
+        );
+    }
+    let kind = if is_file { "file" } else { "folder" };
+    format!(
+        "https://drive.proton.me/{}/{}/{}",
+        share_id,
+        kind,
+        node_uid.link_id.raw()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_parts_round_trips() {
+        let uid = NodeUid::from_parts("vol", "link");
+        assert_eq!(uid.raw(), "vol~link");
+        assert_eq!(NodeUid::parse("vol~link").unwrap(), uid);
+    }
+
+    #[test]
+    fn node_web_url_docs_and_drive() {
+        let uid = NodeUid::from_parts("vol", "link");
+        assert_eq!(
+            node_web_url("share", &uid, true, Some(PROTON_DOC_MEDIA_TYPE)),
+            "https://docs.proton.me/doc?type=doc&mode=open&volumeId=vol&linkId=link"
+        );
+        assert_eq!(
+            node_web_url("share", &uid, true, Some(PROTON_SHEET_MEDIA_TYPE)),
+            "https://docs.proton.me/doc?type=sheet&mode=open&volumeId=vol&linkId=link"
+        );
+        assert_eq!(
+            node_web_url("share", &uid, true, Some("text/plain")),
+            "https://drive.proton.me/share/file/link"
+        );
+        assert_eq!(
+            node_web_url("share", &uid, false, None),
+            "https://drive.proton.me/share/folder/link"
+        );
     }
 }
 
@@ -771,13 +849,20 @@ impl DtoToMetadataConverter {
             anyhow::bail!("Node not found: {}", uid);
         }
 
+        let link_details = response.links[0].clone();
+        let parent_key = if let Some(share) = known_share_and_key {
+            Some(share.key)
+        } else {
+            Self::resolve_parent_key(client, uid.volume_id.clone(), &link_details).await?
+        };
+
         let metadata = Self::convert_dto_to_node_metadata(
             client.account().clone(),
             client.cache().entities().as_ref(),
             client.cache().secrets().as_ref(),
             uid.volume_id.clone(),
-            response.links[0].clone(),
-            known_share_and_key.map(|s| s.key).as_ref(),
+            link_details,
+            parent_key.as_ref(),
         )
         .await?;
 
@@ -820,6 +905,32 @@ impl DtoToMetadataConverter {
         Ok(metadata)
     }
 
+    async fn resolve_parent_key(
+        client: &ProtonDriveClient,
+        volume_id: VolumeId,
+        link_details: &crate::api::links::LinkDetailsDto,
+    ) -> anyhow::Result<Option<PgpPrivateKey>> {
+        if let Some(parent_id) = &link_details.link.parent_id {
+            let parent_uid = NodeUid::new(volume_id, parent_id.clone());
+            let secrets = Box::pin(crate::node::folder::FolderOperations::get_secrets(
+                client, parent_uid,
+            ))
+            .await?;
+            return Ok(Some(secrets.base.key));
+        }
+
+        let share_id = match &link_details.sharing {
+            Some(sharing) => Some(sharing.share_id.clone()),
+            None => client.cache().entities().try_get_my_files_share_id().await?,
+        };
+        if let Some(share_id) = share_id {
+            let share_and_key = crate::share_ops::ShareOperations::get_share(client, share_id).await?;
+            return Ok(Some(share_and_key.key));
+        }
+
+        Ok(None)
+    }
+
     pub async fn convert_dto_to_node_metadata(
         account_client: std::sync::Arc<dyn crate::account::AccountClient>,
         _entity_cache: &dyn crate::cache::entity::DriveEntityCache,
@@ -850,21 +961,12 @@ impl DtoToMetadataConverter {
                     } else {
                         tracing::debug!(
                             parent_link_id = %parent_id.raw(),
-                            "Parent folder key NOT found in cache, trying user keys"
+                            "Parent folder key NOT found in cache"
                         );
-                        let user_keys = account_client.get_user_keys().await?;
-                        if !user_keys.is_empty() {
-                            tracing::debug!(
-                                count = user_keys.len(),
-                                "Found user keys to try as fallback"
-                            );
-                            Ok(user_keys.into_iter().map(PgpPrivateKey).collect())
-                        } else {
-                            Err(format!(
-                                "Parent folder key for {:?} not found in cache and no user keys available",
-                                parent_id
-                            ))
-                        }
+                        Err(format!(
+                            "Parent folder key for {:?} not found in cache",
+                            parent_id
+                        ))
                     }
                 } else {
                     // Root folder - need share key
@@ -1009,6 +1111,7 @@ impl DtoToMetadataConverter {
                     .or(photo_dto_base)
                     .ok_or_else(|| anyhow::anyhow!("File DTO missing"))?;
 
+                let parent_err = parent_key_result.as_ref().err().cloned();
                 let decryption = crate::node::crypto::NodeCrypto::decrypt_file(
                     account_client,
                     &link_dto,
@@ -1019,6 +1122,10 @@ impl DtoToMetadataConverter {
 
                 let uid = NodeUid::new(_volume_id.clone(), link_dto.id.clone());
                 let parent_uid = link_dto.parent_id.map(|id| NodeUid::new(_volume_id, id));
+
+                let name_err = decryption.link.name.as_ref().err().cloned();
+                let content_err = decryption.content_key.as_ref().err().cloned();
+                let node_err = decryption.link.node_key.as_ref().err().cloned();
 
                 if let (Ok(name), Ok(_content_key), Ok(node_key)) = (
                     decryption.link.name,
@@ -1146,7 +1253,13 @@ impl DtoToMetadataConverter {
                         name_hash_digest: link_dto.name_hash_digest,
                     }))
                 } else {
-                    Err(anyhow::anyhow!("Decryption failed for file"))
+                    Err(anyhow::anyhow!(
+                        "Decryption failed for file parent_key={:?} name={:?} content={:?} node={:?}",
+                        parent_err,
+                        name_err,
+                        content_err,
+                        node_err
+                    ))
                 }
             }
         }

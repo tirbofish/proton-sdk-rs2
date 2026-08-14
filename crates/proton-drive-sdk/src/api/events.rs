@@ -4,7 +4,7 @@ use crate::volume::VolumeId;
 use async_trait::async_trait;
 use proton_sdk_rs2::auth::TokenCredential;
 use reqwest_middleware::ClientWithMiddleware;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 #[async_trait]
 pub trait EventsApiClient: Send + Sync {
@@ -145,8 +145,11 @@ pub struct VolumeEventsResponse {
     pub base: ApiResponse,
     #[serde(rename = "EventID")]
     pub event_id: String,
+    #[serde(default, deserialize_with = "de_boolish")]
     pub more: bool,
+    #[serde(default, deserialize_with = "de_boolish")]
     pub refresh: bool,
+    #[serde(default)]
     pub events: Vec<VolumeEventDto>,
 }
 
@@ -205,6 +208,16 @@ pub struct VolumeEventLinkDto {
     pub link_id: LinkId,
     #[serde(rename = "ParentLinkID")]
     pub parent_link_id: Option<LinkId>,
+    #[serde(default, deserialize_with = "de_boolish")]
     pub is_shared: bool,
+    #[serde(default, deserialize_with = "de_boolish")]
     pub is_trashed: bool,
+}
+
+fn de_boolish<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Bool(b) => b,
+        serde_json::Value::Number(n) => n.as_i64().unwrap_or(0) != 0,
+        _ => false,
+    })
 }

@@ -173,14 +173,23 @@ pub fn init(icon_path: &std::path::Path) -> impl FnOnce() -> Option<TrayIcon> {
     ))]
     {
         std::thread::spawn(move || {
-            gtk::init().unwrap();
+            if let Err(e) = gtk::init() {
+                tracing::warn!(error = %e, "gtk init failed, tray disabled");
+                return;
+            }
             let menu = build_menu();
-            let tray = TrayIconBuilder::new()
+            let tray = match TrayIconBuilder::new()
                 .with_menu(Box::new(menu))
                 .with_tooltip(TrayState::Restoring.tooltip())
                 .with_icon(icon)
                 .build()
-                .unwrap();
+            {
+                Ok(tray) => tray,
+                Err(e) => {
+                    tracing::warn!(error = %e, "tray icon failed, continuing without tray");
+                    return;
+                }
+            };
             gtk::glib::timeout_add_seconds_local(1, move || {
                 let state = TrayState::from_u8(LAST_STATE.load(Ordering::Relaxed));
                 let _ = tray.set_tooltip(Some(state.tooltip()));

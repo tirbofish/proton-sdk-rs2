@@ -65,6 +65,10 @@ pub mod timestamp_opt {
     }
 }
 
+pub fn deserialize_null_default<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+}
+
 pub fn deserialize_signature<'de, D: Deserializer<'de>>(
     d: D,
 ) -> Result<Option<Signature>, D::Error> {
@@ -233,7 +237,7 @@ pub mod epoch_seconds {
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<DateTime<Utc>, D::Error> {
-        let ts = i64::deserialize(d)?;
+        let ts = Option::<i64>::deserialize(d)?.unwrap_or(0);
         Utc.timestamp_opt(ts, 0)
             .single()
             .ok_or_else(|| serde::de::Error::custom("invalid epoch timestamp"))

@@ -1,7 +1,12 @@
 use std::{fmt::Display, sync::Arc, time::Duration};
 
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Nonce};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use proton_srp::{RPGPVerifier, SRPAuth, SrpHashVersion};
+use rand::Rng;
 use reqwest::StatusCode;
+use zeroize::{Zeroize, Zeroizing};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
 
 use crate::auth::DefaultAuthenticationApiClient;
@@ -9,6 +14,7 @@ use crate::cache::InMemoryCacheRepository;
 use crate::keys::{DefaultKeysApiClient, KeysApiClient};
 use crate::secret::SessionSecretCache;
 use crate::ser::StoredCredentials;
+use crate::users::{DefaultUsersApiClient, UsersApiClient};
 use crate::utils::AppVersionConfiguration;
 use crate::{
     PasswordMode, SessionId, UserId,
@@ -316,7 +322,88 @@ impl ProtonAPISession {
         Ok(session)
     }
 
-    /// Restores a session from stored token material using default client options.
+    /// Sign in through the Proton account website (session fork).
+    ///
+    /// This is the flow used by the official Drive CLI: the user completes login
+    /// (and any CAPTCHA) in a browser, then this method polls until the session
+    /// is ready. `on_sign_in` receives the URL to open and the user code to show.
+    pub async fn begin_via_web(
+        app_version: AppVersionConfiguration,
+        options: ProtonClientOptions,
+        mut on_sign_in: impl FnMut(&str, &str),
+    ) -> anyhow::Result<ProtonAPISession> {
+        const AUTH_CLIENT_ID: &str = "external-drive";
+        const ACCOUNT_URL: &str = "https://account.proton.me";
+        const FORK_INITIAL_DELAY: Duration = Duration::from_secs(5);
+        const FORK_POLL_INTERVAL: Duration = Duration::from_secs(5);
+        const FORK_MAX_WAIT: Duration = Duration::from_secs(10 * 60);
+
+        let configuration = ProtonClientConfiguration::new(app_version, options)?;
+        let auth_api_client = Self::create_authentication_api_client(&configuration)?;
+        let fork = auth_api_client.init_session_fork().await?;
+
+        let mut encryption_key = Zeroizing::new([0u8; 32]);
+        rand::rng().fill_bytes(encryption_key.as_mut());
+        let mut sign_in_url = generate_sign_in_url(AUTH_CLIENT_ID, &fork.user_code, &encryption_key, ACCOUNT_URL);
+        on_sign_in(&sign_in_url, &fork.user_code);
+        sign_in_url.zeroize();
+
+        tokio::time::sleep(FORK_INITIAL_DELAY).await;
+        let started = std::time::Instant::now();
+        let status = loop {
+            if started.elapsed() > FORK_MAX_WAIT {
+                anyhow::bail!("browser sign-in timed out");
+            }
+            match auth_api_client.poll_session_fork(&fork.selector).await? {
+                Some(status) => break status,
+                None => tokio::time::sleep(FORK_POLL_INTERVAL).await,
+            }
+        };
+
+        let key_password = Zeroizing::new(decrypt_fork_key_password(&encryption_key, &status.payload)?);
+        encryption_key.zeroize();
+        let password_mode = status.password_mode.unwrap_or(PasswordMode::Single);
+        let token_credential = TokenCredential::new(
+            auth_api_client,
+            status.session_id.clone(),
+            status.access_token,
+            status.refresh_token,
+        );
+        let mut session = ProtonAPISession::new(
+            status.session_id,
+            status.user_id.raw().clone(),
+            status.user_id.clone(),
+            token_credential,
+            status.scopes,
+            false,
+            password_mode,
+            configuration,
+        );
+
+        // Fork sessions are not "locked", so /keys/salts returns 403. The mailbox
+        // password is already in the fork payload; attach it to each user key.
+        let user = DefaultUsersApiClient::new_with_token_credential(
+            session.http_client.clone(),
+            session.token_credential.clone(),
+        )
+        .get_user()
+        .await?
+        .user
+        .ok_or_else(|| anyhow::anyhow!("missing user after browser sign-in"))?;
+        if !user.name.is_empty() {
+            session.username = user.name;
+        }
+        if !user.id.is_empty() {
+            session.user_id = UserId::new(user.id);
+        }
+        for key in &user.keys {
+            session
+                .session_secret_cache
+                .set_account_key_passphrase(&key.id, key_password.as_bytes())
+                .await?;
+        }
+        Ok(session)
+    }
     /// Prefer [`Self::from_stored_credentials`] when reviving a persisted session.
     pub fn resume(
         session_id: SessionId,
@@ -629,5 +716,88 @@ impl ProtonAPISession {
             self.authentication_api = Some(api.clone());
             Ok(api)
         }
+    }
+}
+
+fn generate_sign_in_url(
+    auth_client_id: &str,
+    user_code: &str,
+    encryption_key: &[u8; 32],
+    account_url: &str,
+) -> String {
+    let payload = format!(
+        "0:{}:{}:{auth_client_id}",
+        user_code,
+        STANDARD.encode(encryption_key)
+    );
+    format!("{account_url}/desktop/login?app=drive&pv=3#payload={}", encode_uri_component(&payload))
+}
+
+fn encode_uri_component(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn decrypt_fork_key_password(encryption_key: &[u8; 32], encoded_payload: &str) -> anyhow::Result<String> {
+    let blob = STANDARD.decode(encoded_payload.as_bytes())?;
+    const NONCE_LEN: usize = 12;
+    const TAG_LEN: usize = 16;
+    if blob.len() < NONCE_LEN + TAG_LEN {
+        anyhow::bail!("invalid fork payload blob length");
+    }
+    let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
+    let cipher = Aes256Gcm::new_from_slice(encryption_key)?;
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let plaintext = cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad: b"fork",
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("failed to decrypt fork payload"))?;
+    let parsed: serde_json::Value = serde_json::from_slice(&plaintext)?;
+    parsed
+        .get("keyPassword")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("fork payload missing keyPassword"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aes_gcm::aead::Aead;
+
+    #[test]
+    fn fork_payload_roundtrip() {
+        let key = [7u8; 32];
+        let nonce_bytes = [3u8; 12];
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let body = br#"{"keyPassword":"mailbox-secret"}"#;
+        let ct = cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: body,
+                    aad: b"fork",
+                },
+            )
+            .unwrap();
+        let mut blob = nonce_bytes.to_vec();
+        blob.extend_from_slice(&ct);
+        let encoded = STANDARD.encode(blob);
+        let password = decrypt_fork_key_password(&key, &encoded).unwrap();
+        assert_eq!(password, "mailbox-secret");
     }
 }

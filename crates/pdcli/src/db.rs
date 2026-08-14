@@ -1,5 +1,5 @@
 use rusqlite::{Connection, params};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
@@ -58,8 +58,21 @@ fn now_unix() -> i64 {
 
 impl FuseDb {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        Self::open_with_key(path, &crate::credentials::cache_master_key()?)
+    }
+
+    pub fn open_with_key(path: &Path, key: &[u8]) -> anyhow::Result<Self> {
+        anyhow::ensure!(key.len() == 32, "fuse db key must be 32 bytes");
+        if looks_like_plaintext_sqlite(path) {
+            migrate_plaintext_to_sqlcipher(path, key)?;
+        }
         let conn = Connection::open(path)?;
+        apply_sqlcipher_key(&conn, key)?;
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        crate::credentials::restrict_permissions(path, 0o600);
         let db = Self { conn };
         db.init_schema()?;
         Ok(db)
@@ -360,6 +373,30 @@ impl FuseDb {
         Ok(())
     }
 
+    pub fn dirty_files(&self) -> Vec<InodeRow> {
+        (|| -> rusqlite::Result<Vec<InodeRow>> {
+            let mut stmt = self.conn.prepare_cached(
+                "SELECT ino, parent_ino, name, node_uid, volume_id, link_id, is_dir, size,
+                        media_type, revision_uid, mtime, ctime, cached_path, dirty,
+                        children_populated
+                 FROM inodes WHERE dirty = 1 AND is_dir = 0",
+            )?;
+            let rows = stmt.query_map([], Self::map_row)?;
+            rows.collect()
+        })()
+        .unwrap_or_default()
+    }
+
+    pub fn has_pending_journal(&self, ino: u64) -> bool {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM journal WHERE ino = ? AND status = 'pending' LIMIT 1",
+                params![ino as i64],
+                |_| Ok(()),
+            )
+            .is_ok()
+    }
+
     pub fn set_children_populated(&self, ino: u64) -> anyhow::Result<()> {
         self.conn.execute(
             "UPDATE inodes SET children_populated = 1 WHERE ino = ?",
@@ -496,7 +533,12 @@ impl FuseDb {
         (|| -> rusqlite::Result<Vec<JournalEntry>> {
             let mut stmt = self.conn.prepare_cached(
                 "SELECT id, created_at, event_type, ino, payload, status, error, retry_count
-                 FROM journal WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?",
+                 FROM journal
+                 WHERE status = 'pending'
+                   AND retry_count = (
+                       SELECT MIN(retry_count) FROM journal WHERE status = 'pending'
+                   )
+                 ORDER BY created_at ASC LIMIT ?",
             )?;
             let rows = stmt.query_map(params![limit], |row| {
                 Ok(JournalEntry {
@@ -620,5 +662,139 @@ impl FuseDb {
             dirty: row.get::<_, i64>(13)? != 0,
             children_populated: row.get::<_, i64>(14)? != 0,
         })
+    }
+}
+
+fn sqlcipher_key_literal(key: &[u8]) -> String {
+    format!(
+        "x'{}'",
+        key.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    )
+}
+
+fn apply_sqlcipher_key(conn: &Connection, key: &[u8]) -> anyhow::Result<()> {
+    conn.execute_batch(&format!("PRAGMA key = \"{}\";", sqlcipher_key_literal(key)))?;
+    Ok(())
+}
+
+fn looks_like_plaintext_sqlite(path: &Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut hdr = [0u8; 16];
+    std::io::Read::read_exact(&mut file, &mut hdr).is_ok() && hdr.starts_with(b"SQLite format 3")
+}
+
+fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+fn sql_escape_path(path: &Path) -> anyhow::Result<String> {
+    let s = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("fuse db path is not valid UTF-8"))?;
+    Ok(s.replace('\'', "''"))
+}
+
+fn migrate_plaintext_to_sqlcipher(path: &Path, key: &[u8]) -> anyhow::Result<()> {
+    let tmp = sqlite_sidecar(path, ".tmp-enc");
+    let _ = std::fs::remove_file(&tmp);
+    {
+        let conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        conn.execute_batch(&format!(
+            "ATTACH DATABASE '{}' AS encrypted KEY \"{}\";",
+            sql_escape_path(&tmp)?,
+            sqlcipher_key_literal(key)
+        ))?;
+        conn.query_row("SELECT sqlcipher_export('encrypted')", [], |_| Ok(()))?;
+        conn.execute_batch("DETACH DATABASE encrypted;")?;
+    }
+    std::fs::rename(&tmp, path)?;
+    let _ = std::fs::remove_file(sqlite_sidecar(path, "-wal"));
+    let _ = std::fs::remove_file(sqlite_sidecar(path, "-shm"));
+    tracing::info!(path = %path.display(), "migrated fuse.db to SQLCipher");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "pdcli-fuse-enc-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn cleanup(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(sqlite_sidecar(path, "-wal"));
+        let _ = std::fs::remove_file(sqlite_sidecar(path, "-shm"));
+    }
+
+    #[test]
+    fn fuse_db_encrypted_at_rest() {
+        let path = temp_db();
+        let key = [7u8; 32];
+        {
+            let db = FuseDb::open_with_key(&path, &key).unwrap();
+            db.enqueue_journal("create_file", 1, r#"{"name":"secret.txt"}"#)
+                .unwrap();
+        }
+        let hdr = std::fs::read(&path).unwrap();
+        assert!(
+            !hdr.starts_with(b"SQLite format 3"),
+            "fuse.db still looks like plaintext SQLite"
+        );
+        let db = FuseDb::open_with_key(&path, &key).unwrap();
+        let entries = db.load_pending_journal(10);
+        assert_eq!(entries[0].payload, r#"{"name":"secret.txt"}"#);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn migrates_plaintext_fuse_db() {
+        let path = temp_db();
+        let key = [9u8; 32];
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE journal (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    ino INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    error TEXT,
+                    retry_count INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO journal (created_at, event_type, ino, payload, status)
+                 VALUES (1, 'create_file', 2, '{\"name\":\"old.txt\"}', 'pending')",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(looks_like_plaintext_sqlite(&path));
+        let db = FuseDb::open_with_key(&path, &key).unwrap();
+        let entries = db.load_pending_journal(10);
+        assert_eq!(entries[0].payload, r#"{"name":"old.txt"}"#);
+        drop(db);
+        let hdr = std::fs::read(&path).unwrap();
+        assert!(!hdr.starts_with(b"SQLite format 3"));
+        cleanup(&path);
     }
 }

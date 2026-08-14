@@ -11,7 +11,6 @@ use crate::node::download::DownloadState;
 use crate::node::draft::RevisionDraft;
 use crate::node::file::FileContentDigests;
 use crate::pgp::PgpArmoredMessage;
-use crate::pgp::PgpArmoredSignature;
 use crate::protobuf::SignatureVerificationError;
 use crate::protobuf::ThumbnailHeader;
 use crate::revision::RevisionId;
@@ -21,9 +20,7 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
 use proton_rpgp::AsPublicKeyRef;
-use proton_rpgp::DataEncoding;
 use proton_rpgp::Encryptor;
-use proton_rpgp::Signer;
 use proton_rpgp::pgp::ser::Serialize as _;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
@@ -182,6 +179,7 @@ impl RevisionOperations {
         last_modification_time: Option<DateTime<Utc>>,
         additional_metadata: Option<Vec<AdditionalMetadataProperty>>,
         media_info: Option<crate::api::attr::MediaExtendedAttributes>,
+        expected_sha1: Option<Vec<u8>>,
     ) -> anyhow::Result<RevisionWriter> {
         let file_permit = client.block_uploader().queue.start_file().await?;
 
@@ -202,6 +200,7 @@ impl RevisionOperations {
             last_modification_time,
             additional_metadata,
             media_info,
+            expected_sha1,
         })
     }
 
@@ -290,6 +289,7 @@ pub struct RevisionWriter {
     last_modification_time: Option<DateTime<Utc>>,
     additional_metadata: Option<Vec<AdditionalMetadataProperty>>,
     media_info: Option<crate::api::attr::MediaExtendedAttributes>,
+    expected_sha1: Option<Vec<u8>>,
 }
 
 impl RevisionWriter {
@@ -306,6 +306,7 @@ impl RevisionWriter {
         &mut self,
         mut content_stream: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         on_progress: Arc<dyn Fn(i64, i64) + Send + Sync>,
+        mut pause_rx: Option<tokio::sync::watch::Receiver<crate::node::download::ControllerState>>,
     ) -> anyhow::Result<()> {
         use crate::block::upload::EncryptedBlock;
         use tokio::sync::mpsc;
@@ -327,6 +328,7 @@ impl RevisionWriter {
         let client = self.client.clone();
         let draft = self.draft.clone();
         let target_block_size = self.target_block_size;
+        let mut producer_pause = pause_rx.clone();
 
         // Producer task: reads blocks, encrypts them, sends to channel
         // Returns (block_count, sha1_hash)
@@ -336,7 +338,7 @@ impl RevisionWriter {
             let mut sha1_hasher = sha1::Sha1::default();
 
             loop {
-                // Read a full block (or whatever remains)
+                crate::node::download::wait_while_paused(&mut producer_pause).await;
                 let mut n = 0;
                 while n < target_block_size {
                     let read_bytes = content_stream.read(&mut buffer[n..]).await?;
@@ -394,6 +396,7 @@ impl RevisionWriter {
         loop {
             // Try to receive more encrypted blocks while we have upload capacity
             while !producer_done && upload_futures.len() < Self::MAX_CONCURRENT_UPLOADS {
+                crate::node::download::wait_while_paused(&mut pause_rx).await;
                 match rx.try_recv() {
                     Ok((encrypted_block, block_size)) => {
                         let block_number = encrypted_block.block_number;
@@ -637,21 +640,51 @@ impl RevisionWriter {
             block_sizes = ?self.block_sizes,
             "Committing revision"
         );
-        let signer = Signer::default().with_signing_key(&self.draft.signing_key.0);
-
         let mut manifest = Vec::with_capacity(self.thumbnail_digests.len() + self.digests.len());
         manifest.extend_from_slice(&self.thumbnail_digests);
         manifest.extend_from_slice(&self.digests);
-
-        let manifest_signature = PgpArmoredSignature(String::from_utf8(
-            signer.sign_detached(&manifest, DataEncoding::Armored)?,
-        )?);
+        let manifest_signature = self.draft.signing_key.sign_detached_armored(&manifest)?;
 
         // Use precomputed SHA1 from pipelined write, or fall back to hasher
         let sha1_digest = if let Some(hash) = self.precomputed_sha1 {
             hash.to_vec()
         } else {
             self.sha1_hasher.clone().finalize().to_vec()
+        };
+
+        if self.total_written != self.expected_size {
+            self.client
+                .telemetry()
+                .record_metric(
+                    "blockVerificationError".into(),
+                    Some(b"content size mismatch".to_vec()),
+                )
+                .await;
+            return Err(crate::error::ContentSizeMismatchIntegrityException {
+                uploaded: self.total_written,
+                expected: self.expected_size,
+            }
+            .into());
+        }
+
+        let checksum_verified = if let Some(expected) = &self.expected_sha1 {
+            if expected != &sha1_digest {
+                self.client
+                    .telemetry()
+                    .record_metric(
+                        "blockVerificationError".into(),
+                        Some(b"checksum mismatch".to_vec()),
+                    )
+                    .await;
+                return Err(crate::error::ChecksumMismatchIntegrityException {
+                    actual: sha1_digest,
+                    expected: expected.clone(),
+                }
+                .into());
+            }
+            true
+        } else {
+            false
         };
         let mut additional_metadata = std::collections::HashMap::new();
         if let Some(meta) = &self.additional_metadata {
@@ -687,6 +720,7 @@ impl RevisionWriter {
         let request = crate::api::revision::RevisionUpdateRequest {
             manifest_signature,
             signature_email_address: self.draft.membership_address.email_address.clone(),
+            checksum_verified,
             extended_attributes: Some(encrypted_xattr),
             photos_attributes: None,
         };

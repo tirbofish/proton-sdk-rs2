@@ -293,10 +293,7 @@ impl NodeCrypto {
             .decrypt_session_key(content_key_packet)
         {
             Ok(sk) => Ok(DecryptionOutput {
-                data: PgpSessionKey {
-                    algorithm: u8::from(sk.algorithm().unwrap_or(SymmetricKeyAlgorithm::AES128)),
-                    key: sk.as_ref().to_vec(),
-                },
+                data: crate::pgp::PgpSessionKey::from_rpgp(&sk),
                 session_key: Some(sk),
                 authorship_verification_failure: None,
             }),

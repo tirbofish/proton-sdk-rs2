@@ -1,4 +1,5 @@
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use poll_promise::Promise;
 use proton_sdk_rs2::{
@@ -7,98 +8,67 @@ use proton_sdk_rs2::{
 
 use crate::credentials;
 
-enum LoginResult {
-    Ready(ProtonAPISession),
-    Needs2FA(ProtonAPISession, String),
-}
-
 enum LoginAction {
     Ready(ProtonAPISession),
-    Needs2FA(ProtonAPISession, String),
     Error(String),
 }
 
-pub struct AuthScreen {
-    username: String,
-    password: String,
-    error: Option<String>,
-    login_task: Option<Promise<anyhow::Result<LoginResult>>>,
-    phase: AuthPhase,
+#[derive(Clone)]
+struct BrowserSignIn {
+    url: String,
+    user_code: String,
 }
 
-enum AuthPhase {
-    Credentials,
-    TwoFactor {
-        session: Option<ProtonAPISession>,
-        password: String,
-        totp_code: String,
-        totp_task: Option<Promise<anyhow::Result<ProtonAPISession>>>,
-        error: Option<String>,
-    },
+pub struct AuthScreen {
+    error: Option<String>,
+    login_task: Option<Promise<anyhow::Result<ProtonAPISession>>>,
+    browser_sign_in: Arc<Mutex<Option<BrowserSignIn>>>,
 }
 
 impl AuthScreen {
     pub fn new() -> Self {
         Self {
-            username: String::new(),
-            password: String::new(),
             error: None,
             login_task: None,
-            phase: AuthPhase::Credentials,
+            browser_sign_in: Arc::new(Mutex::new(None)),
         }
     }
 
     fn begin_login(&mut self) {
         self.error = None;
-
-        let (entity_cache, secret_cache) =
-            credentials::open_session_caches().expect("failed to open session caches");
-
-        let username = self.username.clone();
-        let password = self.password.clone();
-
-        tracing::info!(username = %username, "starting authentication");
+        *self.browser_sign_in.lock().unwrap() = None;
+        let browser_sign_in = self.browser_sign_in.clone();
 
         self.login_task = Some(Promise::spawn_async(async move {
-            let session = ProtonAPISession::begin(
-                username,
-                &password,
+            let (entity_cache, secret_cache) = credentials::open_session_caches()?;
+
+            tracing::info!("starting browser authentication");
+            ProtonAPISession::begin_via_web(
                 AppVersionConfiguration::new("pdcli", 0, 1, 0),
                 ProtonClientOptions {
                     entity_cache_repository: Some(entity_cache),
                     secret_cache_repository: Some(secret_cache),
                     ..Default::default()
                 },
+                move |url, user_code| {
+                    *browser_sign_in.lock().unwrap() = Some(BrowserSignIn {
+                        url: url.to_owned(),
+                        user_code: user_code.to_owned(),
+                    });
+                    open_browser(url);
+                },
             )
-            .await?;
-
-            if session.is_waiting_for_second_factor_code {
-                tracing::info!("2FA required");
-                Ok(LoginResult::Needs2FA(session, password))
-            } else {
-                tracing::info!(user = %session.username, "authenticated");
-                Ok(LoginResult::Ready(session))
-            }
+            .await
         }));
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<ProtonAPISession> {
-        match &mut self.phase {
-            AuthPhase::Credentials => self.credentials_ui(ui),
-            AuthPhase::TwoFactor { .. } => self.two_factor_ui(ui),
-        }
-    }
-
-    fn credentials_ui(&mut self, ui: &mut egui::Ui) -> Option<ProtonAPISession> {
         let login_action = self
             .login_task
             .as_ref()
             .and_then(|task| task.ready())
             .map(|result| match result {
-                Ok(LoginResult::Ready(session)) => LoginAction::Ready(session.clone()),
-                Ok(LoginResult::Needs2FA(session, password)) => {
-                    LoginAction::Needs2FA(session.clone(), password.clone())
-                }
+                Ok(session) => LoginAction::Ready(session.clone()),
                 Err(error) => LoginAction::Error(error.to_string()),
             });
 
@@ -111,16 +81,6 @@ impl AuthScreen {
                     credentials::save_session_tokens_on_refresh(&session);
                     return Some(session);
                 }
-                LoginAction::Needs2FA(session, password) => {
-                    self.phase = AuthPhase::TwoFactor {
-                        session: Some(session),
-                        password,
-                        totp_code: String::new(),
-                        totp_task: None,
-                        error: None,
-                    };
-                    return None;
-                }
                 LoginAction::Error(error) => {
                     tracing::error!(error = %error, "login failed");
                     self.error = Some(error);
@@ -131,20 +91,9 @@ impl AuthScreen {
         ui.vertical_centered(|ui| {
             ui.add_space(40.0);
             ui.heading("Sign in to Proton Drive");
-            ui.add_space(20.0);
-
-            ui.add_sized(
-                [300.0, 28.0],
-                egui::TextEdit::singleline(&mut self.username).hint_text("Username"),
-            );
             ui.add_space(8.0);
-            ui.add_sized(
-                [300.0, 28.0],
-                egui::TextEdit::singleline(&mut self.password)
-                    .hint_text("Password")
-                    .password(true),
-            );
-            ui.add_space(12.0);
+            ui.label("Sign in securely in your browser to continue.");
+            ui.add_space(20.0);
 
             let is_loading = self
                 .login_task
@@ -153,17 +102,22 @@ impl AuthScreen {
 
             if is_loading {
                 ui.spinner();
-                ui.label("Authenticating…");
+                ui.label("Waiting for browser sign-in…");
+
+                let details = self.browser_sign_in.lock().unwrap().clone();
+                if let Some(details) = details {
+                    ui.add_space(12.0);
+                    ui.label("Confirm that this code appears in your browser:");
+                    ui.monospace(&details.user_code);
+                    ui.add_space(8.0);
+                    ui.hyperlink_to("Open sign-in page", details.url);
+                }
                 ui.ctx().request_repaint();
             } else {
-                let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let sign_in = ui
-                    .add_sized([300.0, 32.0], egui::Button::new("Sign in"))
+                    .add_sized([300.0, 32.0], egui::Button::new("Sign in with browser"))
                     .clicked();
-                if (sign_in || enter_pressed)
-                    && !self.username.is_empty()
-                    && !self.password.is_empty()
-                {
+                if sign_in {
                     self.begin_login();
                 }
             }
@@ -173,110 +127,6 @@ impl AuthScreen {
                 ui.colored_label(egui::Color32::RED, err);
             }
         });
-
-        None
-    }
-
-    fn two_factor_ui(&mut self, ui: &mut egui::Ui) -> Option<ProtonAPISession> {
-        let AuthPhase::TwoFactor {
-            session: _,
-            password: _,
-            ref mut totp_code,
-            ref mut totp_task,
-            ref mut error,
-        } = self.phase
-        else {
-            return None;
-        };
-
-        let totp_action =
-            totp_task
-                .as_ref()
-                .and_then(|task| task.ready())
-                .map(|result| match result {
-                    Ok(completed_session) => LoginAction::Ready(completed_session.clone()),
-                    Err(error) => LoginAction::Error(error.to_string()),
-                });
-
-        if let Some(action) = totp_action {
-            *totp_task = None;
-
-            match action {
-                LoginAction::Ready(completed_session) => {
-                    tracing::info!(user = %completed_session.username, "2FA verified");
-                    persist(&completed_session);
-                    credentials::save_session_tokens_on_refresh(&completed_session);
-                    return Some(completed_session);
-                }
-                LoginAction::Error(message) => {
-                    tracing::error!(error = %message, "2FA verification failed");
-                    *error = Some(message);
-                }
-                LoginAction::Needs2FA(_, _) => {
-                    unreachable!("2FA task cannot request another 2FA transition");
-                }
-            }
-        }
-
-        let mut should_submit = false;
-
-        ui.vertical_centered(|ui| {
-            ui.add_space(40.0);
-            ui.heading("Two-factor authentication");
-            ui.add_space(8.0);
-            ui.label("Enter the 6-digit code from your authenticator app.");
-            ui.add_space(20.0);
-
-            ui.add_sized(
-                [200.0, 28.0],
-                egui::TextEdit::singleline(totp_code).hint_text("TOTP code"),
-            );
-            ui.add_space(12.0);
-
-            if totp_task.is_some() {
-                ui.spinner();
-                ui.label("Verifying…");
-                ui.ctx().request_repaint();
-            } else {
-                let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let verify_clicked = ui
-                    .add_sized([200.0, 32.0], egui::Button::new("Verify"))
-                    .clicked();
-                if (verify_clicked || enter_pressed) && !totp_code.is_empty() {
-                    should_submit = true;
-                }
-            }
-
-            if let Some(err) = error {
-                ui.add_space(8.0);
-                ui.colored_label(egui::Color32::RED, err.as_str());
-            }
-        });
-
-        if should_submit {
-            let AuthPhase::TwoFactor {
-                ref mut session,
-                ref password,
-                ref totp_code,
-                ref mut totp_task,
-                ref mut error,
-            } = self.phase
-            else {
-                return None;
-            };
-
-            if let Some(mut sess) = session.clone() {
-                *error = None;
-                let code = totp_code.clone();
-                let pw = password.clone();
-
-                *totp_task = Some(Promise::spawn_async(async move {
-                    sess.apply_second_factor_code(code).await?;
-                    sess.apply_data_password(&pw).await?;
-                    Ok(sess)
-                }));
-            }
-        }
 
         None
     }

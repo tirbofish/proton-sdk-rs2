@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -114,6 +115,10 @@ impl Default for ThumbnailConfig {
                 "tracker-extract".into(),
                 "tracker-miner-f".into(),
                 "tracker".into(),
+                "gnome-desktop-".into(),
+                "glycin".into(),
+                "gst-thumbnailer".into(),
+                "ffmpegthumbnailer".into(),
             ],
         }
     }
@@ -178,49 +183,106 @@ impl ThumbnailConfig {
     /// Check if a process (by pid) should be blocked from triggering downloads.
     /// Returns `true` if the process is a known thumbnailer/indexer.
     pub fn is_blocked_process(&self, pid: u32) -> bool {
-        // Read process name from /proc/pid/comm
-        let comm = std::fs::read_to_string(format!("/proc/{}/comm", pid))
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
-
-        // Read exe path from /proc/pid/exe (symlink)
-        let exe = std::fs::read_link(format!("/proc/{}/exe", pid))
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        // Check exe path first (more reliable)
-        if !exe.is_empty() {
-            let exe_lower = exe.to_lowercase();
-            for pattern in &self.allowed_exes {
-                if exe_lower.contains(&pattern.to_lowercase()) {
-                    return false;
-                }
+        // Thumbnailers are commonly launched through bwrap or another helper, so
+        // the PID reported by FUSE is not necessarily Nautilus/the thumbnailer
+        // itself. Inspect a short ancestor chain as well as the immediate process.
+        let mut current = pid;
+        let mut visited = HashSet::new();
+        for _ in 0..16 {
+            if current <= 1 || !visited.insert(current) {
+                break;
             }
-            for pattern in &self.blocked_exes {
-                if exe_lower.contains(&pattern.to_lowercase()) {
-                    tracing::debug!(pid, exe = %exe, "blocking thumbnailer (exe match)");
-                    return true;
+
+            let comm = std::fs::read_to_string(format!("/proc/{current}/comm"))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            let exe = std::fs::read_link(format!("/proc/{current}/exe"))
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            if let Some(blocked) = self.classify(&exe, &comm) {
+                if blocked {
+                    tracing::debug!(pid, matched_pid = current, exe = %exe, comm = %comm,
+                        "blocking thumbnailer process tree");
                 }
+                return blocked;
             }
+
+            current = parent_pid(current).unwrap_or(0);
         }
 
-        // Check process name
-        if !comm.is_empty() {
-            let comm_lower = comm.to_lowercase();
-            for pattern in &self.allowed_names {
-                if comm_lower.starts_with(&pattern.to_lowercase()) {
-                    return false;
-                }
-            }
-            for pattern in &self.blocked_names {
-                if comm_lower.starts_with(&pattern.to_lowercase()) {
-                    tracing::debug!(pid, comm = %comm, "blocking thumbnailer (name match)");
-                    return true;
-                }
-            }
-        }
-
-        // Unknown process — allow by default
+        // Unknown process tree — allow by default.
         false
+    }
+
+    /// `Some(false)` means explicitly allowed, `Some(true)` explicitly blocked.
+    fn classify(&self, exe: &str, comm: &str) -> Option<bool> {
+        let exe = exe.to_lowercase();
+        if self
+            .allowed_exes
+            .iter()
+            .any(|pattern| exe.contains(&pattern.to_lowercase()))
+        {
+            return Some(false);
+        }
+        if self
+            .blocked_exes
+            .iter()
+            .any(|pattern| exe.contains(&pattern.to_lowercase()))
+        {
+            return Some(true);
+        }
+
+        let comm = comm.to_lowercase();
+        if self
+            .allowed_names
+            .iter()
+            .any(|pattern| comm.starts_with(&pattern.to_lowercase()))
+        {
+            return Some(false);
+        }
+        if self
+            .blocked_names
+            .iter()
+            .any(|pattern| comm.starts_with(&pattern.to_lowercase()))
+        {
+            return Some(true);
+        }
+        None
+    }
+}
+
+fn parent_pid(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ThumbnailConfig;
+
+    #[test]
+    fn classifies_nautilus_and_thumbnail_helpers_as_blocked() {
+        let config = ThumbnailConfig::default();
+
+        assert_eq!(config.classify("/usr/bin/nautilus", "nautilus"), Some(true));
+        assert_eq!(
+            config.classify("/usr/libexec/gnome-desktop-thumbnailer", "gnome-desktop-"),
+            Some(true)
+        );
+        assert_eq!(config.classify("/usr/bin/glycin", "glycin"), Some(true));
+    }
+
+    #[test]
+    fn allowed_viewers_take_precedence_and_unknowns_are_unclassified() {
+        let config = ThumbnailConfig::default();
+
+        assert_eq!(config.classify("/usr/bin/loupe", "loupe"), Some(false));
+        assert_eq!(config.classify("/usr/bin/cat", "cat"), None);
     }
 }

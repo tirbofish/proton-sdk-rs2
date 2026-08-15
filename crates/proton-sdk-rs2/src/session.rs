@@ -3,7 +3,6 @@ use std::{fmt::Display, sync::Arc, time::Duration};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use proton_srp::{RPGPVerifier, SRPAuth, SrpHashVersion};
 use rand::Rng;
 use reqwest::StatusCode;
 use zeroize::{Zeroize, Zeroizing};
@@ -235,91 +234,6 @@ impl ProtonAPISession {
             self.is_waiting_for_second_factor_code,
             self.password_mode,
         ))
-    }
-
-    /// Initialises a new session.
-    ///
-    /// It is recommended to store the results of this session.
-    pub async fn begin(
-        username: impl Into<String>,
-        password: &str,
-        app_version: AppVersionConfiguration,
-        options: ProtonClientOptions,
-    ) -> anyhow::Result<ProtonAPISession> {
-        let username: String = username.into();
-        let configuration = ProtonClientConfiguration::new(app_version, options)?;
-        let auth_api_client = Self::create_authentication_api_client(&configuration)?;
-        let session_init_resp = auth_api_client.initiate_session(username.clone()).await?;
-
-        log::debug!(
-            "SRP session {} initialised",
-            session_init_resp.srp_session_id
-        );
-
-        let srp_version = u8::try_from(session_init_resp.version)
-            .ok()
-            .and_then(|version| SrpHashVersion::try_from(version).ok())
-            .ok_or_else(|| {
-                anyhow::anyhow!("Unsupported SRP version {}", session_init_resp.version)
-            })?;
-
-        log::debug!("SRP version {} negotiated", session_init_resp.version);
-
-        let client = SRPAuth::new(
-            &RPGPVerifier::default(),
-            Some(&username),
-            password,
-            srp_version,
-            &session_init_resp.salt,
-            &session_init_resp.modulus,
-            &session_init_resp.server_ephemeral,
-        )?;
-
-        let proof = client.generate_proofs()?;
-        let client_proof: proton_crypto::srp::ClientProof = proof.into();
-
-        let auth_resp = auth_api_client
-            .authenticate(session_init_resp, client_proof, username.clone())
-            .await?;
-
-        let access_token = auth_resp.access_token.clone().ok_or_else(|| {
-            anyhow::anyhow!("AuthenticationResponse.AccessToken is not yet modeled")
-        })?;
-        let refresh_token = auth_resp.refresh_token.clone().ok_or_else(|| {
-            anyhow::anyhow!("AuthenticationResponse.RefreshToken is not yet modeled")
-        })?;
-
-        let token_credential = TokenCredential::new(
-            auth_api_client,
-            auth_resp.session_id.clone(),
-            access_token,
-            refresh_token,
-        );
-
-        let password_mode = auth_resp.password_mode.unwrap_or(PasswordMode::Single);
-        let mut session = ProtonAPISession::new(
-            auth_resp.session_id,
-            username,
-            auth_resp.user_id,
-            token_credential,
-            auth_resp.scopes,
-            auth_resp
-                .second_factor_parameters
-                .as_ref()
-                .map(|p| p.is_enabled)
-                .unwrap_or(false),
-            password_mode,
-            configuration,
-        );
-        //  && matches!(session.password_mode, PasswordMode::Single)
-
-        if !session.is_waiting_for_second_factor_code {
-            if let Err(error) = session.apply_data_password(password).await {
-                log::warn!("Failed to apply data password: {error}");
-            }
-        }
-
-        Ok(session)
     }
 
     /// Sign in through the Proton account website (session fork).

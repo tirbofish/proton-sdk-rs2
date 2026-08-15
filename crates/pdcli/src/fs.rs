@@ -27,6 +27,9 @@ use crate::transfer::{TransferDirection, TransferTracker};
 const TTL: Duration = Duration::from_secs(0);
 const ROOT_INO: u64 = 1;
 const BLOCK_SIZE: u32 = 4096;
+// File opens may wait for a remote download. Keep metadata and directory
+// requests flowing while one of those opens is in progress.
+const FUSE_REQUEST_THREADS: usize = 8;
 
 /// Global mountpoint path so signal handlers / panic hooks can unmount.
 static MOUNT_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -2273,6 +2276,7 @@ pub async fn spawn_fuse_session(
 
     let mut config = Config::default();
     config.mount_options = vec![MountOption::FSName("proton-drive".into())];
+    config.n_threads = Some(FUSE_REQUEST_THREADS);
     let bg = fuser::spawn_mount2(fs, &mountpoint, &config).map_err(|e| {
         anyhow::anyhow!(
             "FUSE mount failed at {}: {e}. On WSL install fuse3 (`sudo apt install fuse3`) and mount on the Linux filesystem, not /mnt/c.",

@@ -2,16 +2,14 @@
 //! other applications within the suite).
 //!
 //! # Example
-//! ```
+//! ```no_run
 //! use proton_sdk_rs2::{session::ProtonAPISession, AppVersionConfiguration, client::ProtonClientOptions};
 //!
 //! async fn start_session() {
-//!     // create a new api session
-//!     let session = ProtonAPISession::begin(
-//!         "eric.nobert@acme.me",
-//!         "password123",
+//!     let session = ProtonAPISession::begin_via_web(
 //!         AppVersionConfiguration::new("example-proton-sdk-rs2-app", 0, 1, 0),
 //!         ProtonClientOptions::default(),
+//!         |url, user_code| println!("Open {url} and confirm code {user_code}"),
 //!     ).await.unwrap();
 //! }
 //! ```

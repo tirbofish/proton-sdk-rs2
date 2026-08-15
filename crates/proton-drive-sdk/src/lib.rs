@@ -2,7 +2,7 @@
 //! Windows, macOS and many other platforms (untested) ).
 //!
 //! # Example
-//! ```
+//! ```no_run
 //! use proton_drive_sdk::client::ProtonDriveClient;
 //! use proton_sdk_rs2::AppVersionConfiguration;
 //! use proton_sdk_rs2::client::ProtonClientOptions;
@@ -11,12 +11,11 @@
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     // creates an api session
-//!     let session = ProtonAPISession::begin(
-//!         "eric.nobert@acme.me",
-//!         "password123",
+//!     // Create an API session through Proton's browser sign-in flow.
+//!     let session = ProtonAPISession::begin_via_web(
 //!         AppVersionConfiguration::new("example-proton-drive-app", 0, 1, 0),
 //!         ProtonClientOptions::default(),
+//!         |url, user_code| println!("Open {url} and confirm code {user_code}"),
 //!     ).await.unwrap();
 //!
 //!     // create a proton drive client that will let you talk to ProtonDrive

@@ -5,10 +5,10 @@
 use anyhow::Context;
 use futures::StreamExt;
 use futures::stream::BoxStream;
+use parking_lot::Mutex;
 use proton_sdk_rs2::cache::CacheRepository;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
-use std::sync::Mutex;
 
 /// A [`CacheRepository`] backed by a SQLite database.
 ///
@@ -72,7 +72,7 @@ impl SqliteCacheRepository {
 #[async_trait::async_trait]
 impl CacheRepository for SqliteCacheRepository {
     async fn set(&self, key: &str, value: String, tags: Vec<String>) -> anyhow::Result<()> {
-        let conn = self.connection.lock().unwrap();
+        let conn = self.connection.lock();
         let max = self.max_cache_size;
 
         if let Some(max_size) = max {
@@ -129,14 +129,14 @@ impl CacheRepository for SqliteCacheRepository {
     }
 
     async fn remove(&self, key: &str) -> anyhow::Result<()> {
-        let conn = self.connection.lock().unwrap();
+        let conn = self.connection.lock();
         conn.execute("DELETE FROM Entries WHERE Key = ?1", params![key])
             .context("Failed to remove cache entry")?;
         Ok(())
     }
 
     async fn remove_by_tag(&self, tag: &str) -> anyhow::Result<()> {
-        let conn = self.connection.lock().unwrap();
+        let conn = self.connection.lock();
         conn.execute(
             "DELETE FROM Entries WHERE Key IN (SELECT Key FROM Tags WHERE Tag = ?1)",
             params![tag],
@@ -146,14 +146,14 @@ impl CacheRepository for SqliteCacheRepository {
     }
 
     async fn clear(&self) -> anyhow::Result<()> {
-        let conn = self.connection.lock().unwrap();
+        let conn = self.connection.lock();
         conn.execute("DELETE FROM Entries", [])
             .context("Failed to clear cache")?;
         Ok(())
     }
 
     async fn try_get(&self, key: &str) -> anyhow::Result<Option<String>> {
-        let conn = self.connection.lock().unwrap();
+        let conn = self.connection.lock();
 
         let result: Option<String> = conn
             .query_row(
@@ -180,7 +180,7 @@ impl CacheRepository for SqliteCacheRepository {
     }
 
     fn get_by_tags(&self, tags: Vec<String>) -> BoxStream<'_, anyhow::Result<(String, String)>> {
-        let conn = self.connection.lock().unwrap();
+        let conn = self.connection.lock();
 
         if tags.is_empty() {
             return futures::stream::empty().boxed();
@@ -255,4 +255,116 @@ fn initialize_schema(conn: &Connection) -> anyhow::Result<()> {
          );",
     )
     .context("Failed to initialize SQLite schema")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn values_by_tag(cache: &SqliteCacheRepository, tag: &str) -> Vec<(String, String)> {
+        let mut values: Vec<_> = cache
+            .get_by_tags(vec![tag.into()])
+            .map(|result| result.unwrap())
+            .collect()
+            .await;
+        values.sort();
+        values
+    }
+
+    #[tokio::test]
+    async fn stores_and_retrieves_entities() {
+        let cache = SqliteCacheRepository::open_in_memory(None).unwrap();
+        cache.set("key", "value".into(), vec![]).await.unwrap();
+        assert_eq!(
+            cache.try_get("key").await.unwrap().as_deref(),
+            Some("value")
+        );
+        assert_eq!(cache.try_get("missing").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn replacing_an_entity_replaces_its_tags() {
+        let cache = SqliteCacheRepository::open_in_memory(None).unwrap();
+        cache
+            .set("key", "one".into(), vec!["old".into(), "kept".into()])
+            .await
+            .unwrap();
+        cache
+            .set("key", "two".into(), vec!["kept".into(), "new".into()])
+            .await
+            .unwrap();
+        assert!(values_by_tag(&cache, "old").await.is_empty());
+        assert_eq!(
+            values_by_tag(&cache, "kept").await,
+            vec![("key".into(), "two".into())]
+        );
+        assert_eq!(
+            values_by_tag(&cache, "new").await,
+            vec![("key".into(), "two".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn iterates_entities_by_tag() {
+        let cache = SqliteCacheRepository::open_in_memory(None).unwrap();
+        cache
+            .set("key1", "one".into(), vec!["tag".into()])
+            .await
+            .unwrap();
+        cache
+            .set("key2", "two".into(), vec!["tag".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            values_by_tag(&cache, "tag").await,
+            vec![("key1".into(), "one".into()), ("key2".into(), "two".into())]
+        );
+        assert!(values_by_tag(&cache, "missing").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn removes_entity_and_its_tag_results() {
+        let cache = SqliteCacheRepository::open_in_memory(None).unwrap();
+        cache
+            .set("key", "value".into(), vec!["tag".into()])
+            .await
+            .unwrap();
+        cache.remove("key").await.unwrap();
+        assert_eq!(cache.try_get("key").await.unwrap(), None);
+        assert!(values_by_tag(&cache, "tag").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn removes_all_entities_by_tag() {
+        let cache = SqliteCacheRepository::open_in_memory(None).unwrap();
+        cache
+            .set("key1", "one".into(), vec!["tag".into()])
+            .await
+            .unwrap();
+        cache
+            .set("key2", "two".into(), vec!["tag".into()])
+            .await
+            .unwrap();
+        cache.set("key3", "three".into(), vec![]).await.unwrap();
+        cache.remove_by_tag("tag").await.unwrap();
+        assert_eq!(cache.try_get("key1").await.unwrap(), None);
+        assert_eq!(cache.try_get("key2").await.unwrap(), None);
+        assert_eq!(
+            cache.try_get("key3").await.unwrap().as_deref(),
+            Some("three")
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_removes_every_entity() {
+        let cache = SqliteCacheRepository::open_in_memory(None).unwrap();
+        cache.set("key", "value".into(), vec![]).await.unwrap();
+        cache.clear().await.unwrap();
+        assert_eq!(cache.try_get("key").await.unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_zero_sized_cache() {
+        assert!(SqliteCacheRepository::open_in_memory(Some(0)).is_err());
+    }
 }

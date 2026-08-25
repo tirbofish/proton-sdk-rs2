@@ -125,3 +125,151 @@ impl CacheRepository for InMemoryCacheRepository {
         stream::iter(results).boxed()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    async fn populated_cache() -> InMemoryCacheRepository {
+        let cache = InMemoryCacheRepository::new();
+        cache
+            .set(
+                "key1",
+                "value1".into(),
+                vec!["tag1:hello".into(), "tag2:world".into()],
+            )
+            .await
+            .unwrap();
+        cache
+            .set("key2", "value2".into(), vec!["tag2:world".into()])
+            .await
+            .unwrap();
+        cache.set("key3", "value3".into(), vec![]).await.unwrap();
+        cache
+    }
+
+    async fn values_by_tag(cache: &InMemoryCacheRepository, tag: &str) -> Vec<(String, String)> {
+        let mut values: Vec<_> = cache
+            .get_by_tags(vec![tag.into()])
+            .map(|result| result.unwrap())
+            .collect()
+            .await;
+        values.sort();
+        values
+    }
+
+    #[tokio::test]
+    async fn stores_and_retrieves_an_entity() {
+        let cache = populated_cache().await;
+        cache
+            .set("newkey", "newvalue".into(), vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.try_get("newkey").await.unwrap().as_deref(),
+            Some("newvalue")
+        );
+    }
+
+    #[tokio::test]
+    async fn replacing_an_entity_replaces_its_tags() {
+        let cache = populated_cache().await;
+        cache
+            .set(
+                "newkey",
+                "value1".into(),
+                vec!["tag1".into(), "tag2".into()],
+            )
+            .await
+            .unwrap();
+        cache
+            .set(
+                "newkey",
+                "value2".into(),
+                vec!["tag2".into(), "tag3".into()],
+            )
+            .await
+            .unwrap();
+
+        assert!(values_by_tag(&cache, "tag1").await.is_empty());
+        assert_eq!(
+            values_by_tag(&cache, "tag2").await,
+            vec![("newkey".into(), "value2".into())]
+        );
+        assert_eq!(
+            values_by_tag(&cache, "tag3").await,
+            vec![("newkey".into(), "value2".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_entity_returns_none() {
+        assert_eq!(
+            InMemoryCacheRepository::new()
+                .try_get("missing")
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn iterates_entities_by_tag() {
+        let cache = populated_cache().await;
+        assert_eq!(
+            values_by_tag(&cache, "tag2:world").await,
+            vec![
+                ("key1".into(), "value1".into()),
+                ("key2".into(), "value2".into())
+            ]
+        );
+        assert_eq!(
+            values_by_tag(&cache, "tag1:hello").await,
+            vec![("key1".into(), "value1".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn nonexistent_tag_is_empty() {
+        assert!(
+            values_by_tag(&populated_cache().await, "nonexistent")
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn removes_entity_and_its_tags() {
+        let cache = populated_cache().await;
+        cache.remove("key1").await.unwrap();
+        assert_eq!(cache.try_get("key1").await.unwrap(), None);
+        assert!(values_by_tag(&cache, "tag1:hello").await.is_empty());
+        assert_eq!(
+            values_by_tag(&cache, "tag2:world").await,
+            vec![("key2".into(), "value2".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn removes_every_entity_with_a_tag() {
+        let cache = populated_cache().await;
+        cache.remove_by_tag("tag2:world").await.unwrap();
+        assert_eq!(cache.try_get("key1").await.unwrap(), None);
+        assert_eq!(cache.try_get("key2").await.unwrap(), None);
+        assert_eq!(
+            cache.try_get("key3").await.unwrap().as_deref(),
+            Some("value3")
+        );
+    }
+
+    #[tokio::test]
+    async fn clears_entities_and_tag_indexes() {
+        let cache = populated_cache().await;
+        cache.clear().await.unwrap();
+        for key in ["key1", "key2", "key3"] {
+            assert_eq!(cache.try_get(key).await.unwrap(), None);
+        }
+        assert!(values_by_tag(&cache, "tag2:world").await.is_empty());
+    }
+}

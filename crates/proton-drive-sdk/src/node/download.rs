@@ -160,8 +160,10 @@ impl BlockDownloader {
         content_key: &PgpSessionKey,
         output: &mut Vec<u8>,
     ) -> anyhow::Result<Vec<u8>> {
+        let _permit = self.queue.start_block().await?;
         let max_retries = 4u32;
         let mut last_err: Option<anyhow::Error> = None;
+        let mut was_throttled = false;
 
         for attempt in 0..=max_retries {
             if attempt > 0 {
@@ -174,6 +176,7 @@ impl BlockDownloader {
                             retry_after
                         );
                         self.client.sdk_events().requests_throttled();
+                        was_throttled = true;
                         tokio::time::sleep(retry_after).await;
                     } else {
                         tokio::time::sleep(delay).await;
@@ -192,7 +195,12 @@ impl BlockDownloader {
                 .execute_download(bare_url, token, content_key, output)
                 .await
             {
-                Ok(digest) => return Ok(digest),
+                Ok(digest) => {
+                    if was_throttled {
+                        self.client.sdk_events().requests_unthrottled();
+                    }
+                    return Ok(digest);
+                }
                 Err(e) => {
                     // Don't retry decryption errors
                     if e.downcast_ref::<FileContentsDecryptionException>()
@@ -272,6 +280,7 @@ pub struct DownloadController {
     state_tx: watch::Sender<ControllerState>,
     pub completion: tokio::task::JoinHandle<anyhow::Result<()>>,
     is_download_complete_with_verification_issue: std::sync::atomic::AtomicBool,
+    sdk_events: Arc<crate::events::SdkEvents>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,11 +304,13 @@ impl DownloadController {
     pub fn new(
         state_tx: watch::Sender<ControllerState>,
         completion: tokio::task::JoinHandle<anyhow::Result<()>>,
+        sdk_events: Arc<crate::events::SdkEvents>,
     ) -> Self {
         Self {
             state_tx,
             completion,
             is_download_complete_with_verification_issue: std::sync::atomic::AtomicBool::new(false),
+            sdk_events,
         }
     }
 
@@ -308,10 +319,12 @@ impl DownloadController {
     }
 
     pub fn pause(&self) {
+        self.sdk_events.transfers_paused();
         let _ = self.state_tx.send(ControllerState::Paused);
     }
 
     pub fn resume(&self) {
+        self.sdk_events.transfers_resumed();
         let _ = self.state_tx.send(ControllerState::Running);
     }
 
@@ -532,6 +545,7 @@ impl RevisionReader {
         token: &str,
         content_key: &PgpSessionKey,
     ) -> anyhow::Result<(i32, Vec<u8>, Vec<u8>)> {
+        let _permit = client.block_downloader().queue.start_block().await?;
         let response = client
             .api()
             .storage()
@@ -550,10 +564,7 @@ impl RevisionReader {
                 error!("Failed to decrypt block {}: {:?}", block_index, e);
                 client
                     .telemetry()
-                    .record_metric(
-                        "decryptionError".into(),
-                        Some(e.to_string().into_bytes()),
-                    )
+                    .record_metric("decryptionError".into(), Some(e.to_string().into_bytes()))
                     .await;
                 return Err(FileContentsDecryptionException::WithCause(e).into());
             }

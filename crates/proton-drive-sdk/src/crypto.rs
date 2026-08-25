@@ -196,3 +196,59 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for AsyncHashingWriteStream<W> {
         std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn expected_hash(data: &[u8]) -> Vec<u8> {
+        Sha256::digest(data).to_vec()
+    }
+
+    #[test]
+    fn hashing_reader_hashes_only_consumed_bytes() {
+        let mut reader = HashingReadStream::new(&b"abcdef"[..]);
+        let mut bytes = [0; 3];
+        reader.read_exact(&mut bytes).unwrap();
+        assert_eq!(reader.finalize(), expected_hash(b"abc"));
+    }
+
+    #[test]
+    fn hashing_writer_hashes_only_written_bytes() {
+        let mut writer = HashingWriteStream::new(Vec::new());
+        writer.write_all(b"abc").unwrap();
+        writer.write_all(b"def").unwrap();
+        assert_eq!(writer.finalize(), expected_hash(b"abcdef"));
+    }
+
+    #[tokio::test]
+    async fn async_hashing_reader_hashes_every_read() {
+        let mut reader = AsyncHashingReadStream::new(&b"abcdef"[..]);
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).await.unwrap();
+        assert_eq!(output, b"abcdef");
+        assert_eq!(reader.finalize(), expected_hash(b"abcdef"));
+    }
+
+    #[tokio::test]
+    async fn async_hashing_writer_hashes_every_write() {
+        let mut writer = AsyncHashingWriteStream::new(Vec::new());
+        writer.write_all(b"abc").await.unwrap();
+        writer.write_all(b"def").await.unwrap();
+        writer.flush().await.unwrap();
+        assert_eq!(writer.finalize(), expected_hash(b"abcdef"));
+    }
+
+    #[test]
+    fn empty_streams_produce_the_sha256_empty_digest() {
+        assert_eq!(
+            HashingReadStream::new(&b""[..]).finalize(),
+            expected_hash(b"")
+        );
+        assert_eq!(
+            HashingWriteStream::new(Vec::<u8>::new()).finalize(),
+            expected_hash(b"")
+        );
+    }
+}

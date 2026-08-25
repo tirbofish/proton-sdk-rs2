@@ -103,4 +103,39 @@ mod tests {
         assert!(first >= Duration::from_millis(500));
         assert!(second >= Duration::from_millis(1000));
     }
+
+    #[test]
+    fn missing_or_invalid_retry_after_is_ignored() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(parse_retry_after(&headers), None);
+        headers.insert(reqwest::header::RETRY_AFTER, "later".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn content_size_mismatch_includes_both_sizes() {
+        assert_eq!(
+            ContentSizeMismatchIntegrityException {
+                uploaded: 41,
+                expected: 42,
+            }
+            .to_string(),
+            "content size mismatch: uploaded 41 bytes, expected 42 bytes"
+        );
+    }
+
+    #[test]
+    fn validation_error_preserves_the_message() {
+        assert_eq!(
+            ProtonDriveError::Validation("Invalid URL".into()).to_string(),
+            "Invalid URL"
+        );
+    }
+
+    #[test]
+    fn retry_backoff_is_bounded_at_the_thirty_two_second_step() {
+        let delay = retry_backoff_delay(u32::MAX);
+        assert!(delay >= Duration::from_secs(32));
+        assert!(delay < Duration::from_millis(32_250));
+    }
 }

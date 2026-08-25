@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 pub struct FileContentDigestsDto {
     #[serde(rename = "SHA1")]
     #[serde(default, with = "crate::utils::serde::forgiving_hex_bytes_opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sha1: Option<Vec<u8>>,
 }
 

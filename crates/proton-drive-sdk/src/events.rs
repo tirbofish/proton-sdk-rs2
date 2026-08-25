@@ -2,6 +2,7 @@ use crate::api::events::{VolumeEventType, VolumeEventsResponse};
 use crate::client::ProtonDriveClient;
 use crate::node::NodeUid;
 use crate::volume::VolumeId;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -40,7 +41,8 @@ pub struct DriveEvent {
 
 #[derive(Default)]
 pub struct SdkEvents {
-    listeners: Mutex<Vec<(SdkEvent, Arc<dyn Fn() + Send + Sync>)>>,
+    listeners: Mutex<Vec<(u64, SdkEvent, Arc<dyn Fn() + Send + Sync>)>>,
+    next_listener_id: AtomicU64,
 }
 
 impl SdkEvents {
@@ -49,18 +51,24 @@ impl SdkEvents {
     }
 
     pub fn add_listener(
-        &self,
+        self: &Arc<Self>,
         event: SdkEvent,
         callback: Arc<dyn Fn() + Send + Sync>,
     ) -> impl Fn() + Send + Sync + 'static {
+        let id = self.next_listener_id.fetch_add(1, Ordering::Relaxed);
         self.listeners
             .lock()
             .expect("sdk event listeners")
-            .push((event, callback.clone()));
-        let listeners = self as *const SdkEvents;
+            .push((id, event, callback));
+        let events = Arc::downgrade(self);
         move || {
-            // unsubscribe is best-effort; listeners stay until process end
-            let _ = listeners;
+            if let Some(events) = events.upgrade() {
+                events
+                    .listeners
+                    .lock()
+                    .expect("sdk event listeners")
+                    .retain(|(listener_id, _, _)| *listener_id != id);
+            }
         }
     }
 
@@ -82,11 +90,173 @@ impl SdkEvents {
 
     fn emit(&self, event: SdkEvent) {
         let listeners = self.listeners.lock().expect("sdk event listeners");
-        for (kind, cb) in listeners.iter() {
+        for (_, kind, cb) in listeners.iter() {
             if *kind == event {
                 cb();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn unsubscribe_removes_listener() {
+        let events = Arc::new(SdkEvents::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let unsubscribe = events.add_listener(
+            SdkEvent::TransfersPaused,
+            Arc::new(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+        events.transfers_paused();
+        unsubscribe();
+        events.transfers_paused();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn emits_only_to_matching_listeners() {
+        let events = Arc::new(SdkEvents::new());
+        let throttled = Arc::new(AtomicUsize::new(0));
+        let unthrottled = Arc::new(AtomicUsize::new(0));
+
+        let throttled_counter = throttled.clone();
+        let _keep_throttled = events.add_listener(
+            SdkEvent::RequestsThrottled,
+            Arc::new(move || {
+                throttled_counter.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+        let unthrottled_counter = unthrottled.clone();
+        let _keep_unthrottled = events.add_listener(
+            SdkEvent::RequestsUnthrottled,
+            Arc::new(move || {
+                unthrottled_counter.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+
+        events.requests_throttled();
+        assert_eq!(throttled.load(Ordering::Relaxed), 1);
+        assert_eq!(unthrottled.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn emits_to_every_matching_listener() {
+        let events = Arc::new(SdkEvents::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..2 {
+            let counter = calls.clone();
+            let _ = events.add_listener(
+                SdkEvent::TransfersResumed,
+                Arc::new(move || {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }),
+            );
+        }
+
+        events.transfers_resumed();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn dispatches_create_update_and_delete_events() {
+        use crate::api::events::{VolumeEventDto, VolumeEventLinkDto};
+        use crate::api::{ApiResponse, ResponseCode};
+        use crate::links::LinkId;
+        use parking_lot::Mutex;
+
+        let response = VolumeEventsResponse {
+            base: ApiResponse {
+                code: ResponseCode::SUCCESS,
+                error_message: None,
+            },
+            event_id: "latest".into(),
+            more: false,
+            refresh: false,
+            events: [1, 2, 3, 0]
+                .into_iter()
+                .enumerate()
+                .map(|(index, event_type)| VolumeEventDto {
+                    event_id: index.to_string(),
+                    event_type,
+                    link: VolumeEventLinkDto {
+                        link_id: LinkId::new(format!("link-{index}")),
+                        parent_link_id: Some(LinkId::new("parent".into())),
+                        is_shared: true,
+                        is_trashed: event_type == 0,
+                    },
+                })
+                .collect(),
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let callback: Arc<dyn Fn(DriveEvent) + Send + Sync> =
+            Arc::new(move |event| captured.lock().push(event));
+
+        dispatch_volume_events(&VolumeId::new("volume".into()), &response, &callback);
+
+        let events = events.lock();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type)
+                .collect::<Vec<_>>(),
+            vec![
+                DriveEventType::NodeCreated,
+                DriveEventType::NodeUpdated,
+                DriveEventType::NodeUpdated,
+                DriveEventType::NodeDeleted,
+            ]
+        );
+        assert_eq!(events[0].node_uid.as_ref().unwrap().raw(), "volume~link-0");
+        assert_eq!(
+            events[0].parent_node_uid.as_ref().unwrap().raw(),
+            "volume~parent"
+        );
+        assert!(events[0].is_shared);
+        assert!(events[3].is_trashed);
+    }
+
+    #[test]
+    fn ignores_unknown_volume_event_types() {
+        use crate::api::events::{VolumeEventDto, VolumeEventLinkDto};
+        use crate::api::{ApiResponse, ResponseCode};
+        use crate::links::LinkId;
+
+        let response = VolumeEventsResponse {
+            base: ApiResponse {
+                code: ResponseCode::SUCCESS,
+                error_message: None,
+            },
+            event_id: "latest".into(),
+            more: false,
+            refresh: false,
+            events: vec![VolumeEventDto {
+                event_id: "event".into(),
+                event_type: 99,
+                link: VolumeEventLinkDto {
+                    link_id: LinkId::new("link".into()),
+                    parent_link_id: None,
+                    is_shared: false,
+                    is_trashed: false,
+                },
+            }],
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let callback: Arc<dyn Fn(DriveEvent) + Send + Sync> = Arc::new(move |_| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+
+        dispatch_volume_events(&VolumeId::new("volume".into()), &response, &callback);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 }
 
@@ -119,7 +289,10 @@ pub async fn subscribe_to_tree_events(
             if *stop_rx.borrow() {
                 break;
             }
-            match client.poll_volume_events(volume_id.clone(), &event_id).await {
+            match client
+                .poll_volume_events(volume_id.clone(), &event_id)
+                .await
+            {
                 Ok(response) => {
                     dispatch_volume_events(&volume_id, &response, &callback);
                     event_id = response.event_id;
@@ -218,13 +391,12 @@ fn dispatch_volume_events(
         callback(DriveEvent {
             event_type,
             event_id: event.event_id.clone(),
-            node_uid: Some(NodeUid::new(
-                volume_id.clone(),
-                event.link.link_id.clone(),
-            )),
-            parent_node_uid: event.link.parent_link_id.clone().map(|id| {
-                NodeUid::new(volume_id.clone(), id)
-            }),
+            node_uid: Some(NodeUid::new(volume_id.clone(), event.link.link_id.clone())),
+            parent_node_uid: event
+                .link
+                .parent_link_id
+                .clone()
+                .map(|id| NodeUid::new(volume_id.clone(), id)),
             is_trashed: event.link.is_trashed,
             is_shared: event.link.is_shared,
             tree_event_scope_id: volume_id.raw().to_string(),

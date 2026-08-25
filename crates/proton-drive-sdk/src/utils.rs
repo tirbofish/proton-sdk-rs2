@@ -16,10 +16,11 @@ impl AlternateFileNameGenerator {
         let mut candidates = Vec::with_capacity(64);
 
         for index in 1..=64 {
-            let candidate = if extension.is_empty() {
-                format!("{} ({})", stem, index)
-            } else {
-                format!("{} ({}).{}", stem, index, extension)
+            let candidate = match (stem.is_empty(), extension.is_empty()) {
+                (true, true) => format!("({index})"),
+                (_, true) => format!("{stem} ({index})"),
+                (true, false) => format!("({index}).{extension}"),
+                (false, false) => format!("{stem} ({index}).{extension}"),
             };
             candidates.push(candidate);
         }
@@ -163,3 +164,49 @@ impl<N, DN> PotentialObject<N, DN> {
 }
 
 impl PotentialObject<NodeMetadata, DegradedNodeMetadata> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alternate_names_match_typescript_filename_contract() {
+        let cases = [
+            ("document.pdf", "document (1).pdf"),
+            ("folder", "folder (1)"),
+            ("my.file.name.txt", "my.file.name (1).txt"),
+            ("dot.", "dot. (1)"),
+            (".gitignore", ".gitignore (1)"),
+            ("", "(1)"),
+        ];
+
+        for (name, expected) in cases {
+            let names = AlternateFileNameGenerator::get_names(name);
+            assert_eq!(names.len(), 64);
+            assert_eq!(names[0], expected);
+        }
+    }
+
+    #[test]
+    fn alternate_names_increment_without_reordering() {
+        let names = AlternateFileNameGenerator::get_names("document.pdf");
+        assert_eq!(names[1], "document (2).pdf");
+        assert_eq!(names[63], "document (64).pdf");
+    }
+
+    #[test]
+    fn split_name_and_extension_matches_typescript_edges() {
+        assert_eq!(split_name_and_extension(""), ("", ""));
+        assert_eq!(
+            split_name_and_extension("document.pdf"),
+            ("document", "pdf")
+        );
+        assert_eq!(split_name_and_extension("folder"), ("folder", ""));
+        assert_eq!(
+            split_name_and_extension("my.file.name.txt"),
+            ("my.file.name", "txt")
+        );
+        assert_eq!(split_name_and_extension("dot."), ("dot.", ""));
+        assert_eq!(split_name_and_extension(".gitignore"), (".gitignore", ""));
+    }
+}

@@ -102,3 +102,41 @@ impl BlockVerifierFactory for DefaultBlockVerifierFactory {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn verifier(code: &[u8]) -> BlockVerifier {
+        BlockVerifier::new(
+            PgpSessionKey {
+                algorithm: 9,
+                key: vec![0; 32],
+            },
+            code.to_vec(),
+        )
+    }
+
+    #[test]
+    fn verification_prefix_length_matches_code_length() {
+        assert_eq!(verifier(&[1; 32]).data_packet_prefix_max_length(), 32);
+    }
+
+    #[test]
+    fn verification_token_xors_code_and_packet_prefix() {
+        assert_eq!(
+            verifier(&[1, 2, 3]).verify_block(&[3, 2, 1], &[]).unwrap(),
+            vec![2, 0, 2]
+        );
+    }
+
+    #[test]
+    fn verification_token_pads_short_and_truncates_long_prefixes() {
+        let verifier = verifier(&[1, 1, 1]);
+        assert_eq!(verifier.verify_block(&[1], &[]).unwrap(), vec![0, 1, 1]);
+        assert_eq!(
+            verifier.verify_block(&[1, 1, 1, 1], &[]).unwrap(),
+            vec![0, 0, 0]
+        );
+    }
+}

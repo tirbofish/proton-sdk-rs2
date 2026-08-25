@@ -49,8 +49,8 @@ impl BlockUploader {
         let signature = signer.sign_detached(plain_data, proton_rpgp::DataEncoding::Auto)?;
 
         // 2. Encrypt the signature using the file key (unsigned, matching official SDK)
-        let signature_encryptor = proton_rpgp::Encryptor::default()
-            .with_encryption_key(draft.file_key.0.as_public_key());
+        let signature_encryptor =
+            proton_rpgp::Encryptor::default().with_encryption_key(draft.file_key.0.as_public_key());
         let signature_result = signature_encryptor.encrypt(&signature)?;
         let encrypted_signature = PgpArmoredMessage(String::from_utf8(signature_result.armor()?)?);
 
@@ -97,6 +97,7 @@ impl BlockUploader {
         draft: &RevisionDraft,
         encrypted_block: EncryptedBlock,
     ) -> anyhow::Result<BlockUploadResult> {
+        let _permit = self.queue.start_block().await?;
         tracing::debug!(
             block_number = encrypted_block.block_number,
             encrypted_size = encrypted_block.encrypted_data.len(),
@@ -154,6 +155,7 @@ impl BlockUploader {
         plain_data: &[u8],
         on_block_progress: Option<&Box<dyn Fn(i64) + Send + Sync>>,
     ) -> anyhow::Result<BlockUploadResult> {
+        let _permit = self.queue.start_block().await?;
         tracing::debug!(block_number, size = plain_data.len(), "Uploading block");
         let plain_data_len = plain_data.len();
 
@@ -162,8 +164,8 @@ impl BlockUploader {
         let signature = signer.sign_detached(plain_data, proton_rpgp::DataEncoding::Auto)?;
 
         // 2. Encrypt the signature using the file key (unsigned, matching official SDK)
-        let signature_encryptor = proton_rpgp::Encryptor::default()
-            .with_encryption_key(draft.file_key.0.as_public_key());
+        let signature_encryptor =
+            proton_rpgp::Encryptor::default().with_encryption_key(draft.file_key.0.as_public_key());
         let signature_result = signature_encryptor.encrypt(&signature)?;
         let encrypted_signature =
             crate::pgp::PgpArmoredMessage(String::from_utf8(signature_result.armor()?)?);

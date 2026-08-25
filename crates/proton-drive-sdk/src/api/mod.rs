@@ -258,3 +258,44 @@ impl<T> AggregateApiResponse<T> {
         self.base.is_success()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_code_1000_is_success() {
+        assert!(ResponseCode::SUCCESS.is_success());
+        assert!(!ResponseCode(0).is_success());
+        assert!(!ResponseCode(1001).is_success());
+    }
+
+    #[test]
+    fn successful_api_response_converts_to_ok() {
+        let response = ApiResponse {
+            code: ResponseCode::SUCCESS,
+            error_message: None,
+        };
+        assert!(response.is_success());
+        assert!(response.to_result().is_ok());
+    }
+
+    #[test]
+    fn failed_api_response_preserves_code_and_message() {
+        let response = ApiResponse {
+            code: ResponseCode(2500),
+            error_message: Some("Not found".into()),
+        };
+        let error = response.to_result().unwrap_err().to_string();
+        assert!(error.contains("2500"));
+        assert!(error.contains("Not found"));
+    }
+
+    #[test]
+    fn deserializes_typescript_api_error_shape() {
+        let response: ApiResponse =
+            serde_json::from_str(r#"{"Code":2500,"Error":"Not found"}"#).unwrap();
+        assert_eq!(response.code, ResponseCode(2500));
+        assert_eq!(response.error_message.as_deref(), Some("Not found"));
+    }
+}

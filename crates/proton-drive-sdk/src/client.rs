@@ -63,6 +63,7 @@ pub struct ProtonDriveClientOptions {
 #[derive(Clone)]
 pub struct ProtonDriveClient {
     uid: String,
+    api_url: String,
     account: Arc<dyn AccountClient>,
     api: Arc<dyn DriveApiClients>,
     cache: Arc<dyn DriveClientCache>,
@@ -207,7 +208,7 @@ impl ProtonDriveClient {
         drive_api_clients_factory: Arc<dyn DriveApiClientsFactory>,
         uid: String,
         token_credential: Option<TokenCredential>,
-        _api_url: String,
+        api_url: String,
     ) -> anyhow::Result<Self> {
         let api = drive_api_clients_factory.create(
             default_api_http_client.clone(),
@@ -217,7 +218,7 @@ impl ProtonDriveClient {
             token_credential.clone(),
         );
 
-        Ok(Self::from_components(
+        Ok(Self::from_components_with_api_url(
             account_client,
             api,
             cache,
@@ -230,6 +231,7 @@ impl ProtonDriveClient {
             telemetry,
             uid,
             None,
+            api_url,
         ))
     }
 
@@ -294,6 +296,31 @@ impl ProtonDriveClient {
         uid: String,
         block_transfer_degree_of_parallelism: Option<usize>,
     ) -> Self {
+        Self::from_components_with_api_url(
+            account_client,
+            api,
+            cache,
+            block_verifier_factory,
+            feature_flag_provider,
+            telemetry,
+            uid,
+            block_transfer_degree_of_parallelism,
+            "https://drive-api.proton.me/".into(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_components_with_api_url(
+        account_client: Arc<dyn AccountClient>,
+        api: Arc<dyn DriveApiClients>,
+        cache: Arc<dyn DriveClientCache>,
+        block_verifier_factory: Arc<dyn BlockVerifierFactory>,
+        feature_flag_provider: Arc<dyn FeatureFlagProvider>,
+        telemetry: Arc<dyn Telemetry>,
+        uid: String,
+        block_transfer_degree_of_parallelism: Option<usize>,
+        api_url: String,
+    ) -> Self {
         let max_degree_of_block_transfer_parallelism =
             block_transfer_degree_of_parallelism.unwrap_or_else(default_block_transfer_parallelism);
 
@@ -312,6 +339,7 @@ impl ProtonDriveClient {
 
         Self {
             uid,
+            api_url,
             account: account_client,
             api,
             cache,
@@ -334,6 +362,10 @@ impl ProtonDriveClient {
     /// Returns the unique identifier assigned to this client instance.
     pub fn uid(&self) -> &str {
         &self.uid
+    }
+
+    pub(crate) fn api_url(&self) -> &str {
+        &self.api_url
     }
 
     /// Returns the target encrypted block size (in bytes) used when uploading file data.
@@ -1060,9 +1092,14 @@ impl ProtonDriveClient {
             Node::File(f) | Node::Photo(f) => Some(f.base.media_type.as_str()),
             Node::Folder(_) | Node::Album(_) => None,
         };
-        let is_file = matches!(node.ty(), crate::node::NodeType::File | crate::node::NodeType::Photo);
+        let is_file = matches!(
+            node.ty(),
+            crate::node::NodeType::File | crate::node::NodeType::Photo
+        );
         if crate::node::is_proton_document(media_type) || crate::node::is_proton_sheet(media_type) {
-            return Ok(crate::node::node_web_url("", &node_uid, is_file, media_type));
+            return Ok(crate::node::node_web_url(
+                "", &node_uid, is_file, media_type,
+            ));
         }
         let context = self
             .api()
@@ -1078,8 +1115,13 @@ impl ProtonDriveClient {
     }
 
     /// Content session key used by Proton Docs to encrypt and decrypt document updates.
-    pub async fn get_docs_key(&self, node_uid: NodeUid) -> anyhow::Result<crate::pgp::PgpSessionKey> {
-        Ok(FileOperations::get_secrets(self, node_uid).await?.content_key)
+    pub async fn get_docs_key(
+        &self,
+        node_uid: NodeUid,
+    ) -> anyhow::Result<crate::pgp::PgpSessionKey> {
+        Ok(FileOperations::get_secrets(self, node_uid)
+            .await?
+            .content_key)
     }
 
     /// UIDs of nodes the user has shared from My Files.
@@ -1164,7 +1206,11 @@ impl ProtonDriveClient {
         crate::sharing::SharingOperations::unshare_node(self, node_uid, settings).await
     }
 
-    pub async fn set_editors_can_share(&self, node_uid: NodeUid, value: bool) -> anyhow::Result<()> {
+    pub async fn set_editors_can_share(
+        &self,
+        node_uid: NodeUid,
+        value: bool,
+    ) -> anyhow::Result<()> {
         crate::sharing::SharingOperations::set_editors_can_share(self, node_uid, value).await
     }
 

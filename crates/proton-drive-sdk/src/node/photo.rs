@@ -61,3 +61,37 @@ pub enum PhotoTag {
     Panorama = 8,
     Raw = 9,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn photo_tags_use_typescript_api_values() {
+        let cases = [
+            (PhotoTag::Favorite, 0),
+            (PhotoTag::Screenshot, 1),
+            (PhotoTag::Video, 2),
+            (PhotoTag::LivePhoto, 3),
+            (PhotoTag::MotionPhoto, 4),
+            (PhotoTag::Selfie, 5),
+            (PhotoTag::Portrait, 6),
+            (PhotoTag::Burst, 7),
+            (PhotoTag::Panorama, 8),
+            (PhotoTag::Raw, 9),
+        ];
+        for (tag, value) in cases {
+            assert_eq!(serde_json::to_value(tag).unwrap(), value);
+            assert_eq!(
+                serde_json::from_value::<PhotoTag>(value.into()).unwrap(),
+                tag
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_photo_tags_are_rejected() {
+        assert!(serde_json::from_value::<PhotoTag>(10.into()).is_err());
+        assert!(serde_json::from_value::<PhotoTag>((-1).into()).is_err());
+    }
+}

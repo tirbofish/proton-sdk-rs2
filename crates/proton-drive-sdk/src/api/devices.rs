@@ -265,3 +265,70 @@ impl TryFrom<DeviceListEntry> for RawDeviceInfo {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(create_time: i64, last_sync_time: Option<i64>, name: Option<&str>) -> DeviceListEntry {
+        DeviceListEntry {
+            device: DeviceDto {
+                device_id: "device".into(),
+                volume_id: VolumeId::new("volume".into()),
+                r#type: DeviceType::Linux,
+                create_time,
+                last_sync_time,
+            },
+            share: DeviceShareDto {
+                share_id: ShareId::new("share".into()),
+                link_id: LinkId::new("root".into()),
+                name: name.map(str::to_owned),
+            },
+        }
+    }
+
+    #[test]
+    fn converts_device_api_entry() {
+        let device = RawDeviceInfo::try_from(entry(1_700_000_000, None, None)).unwrap();
+        assert_eq!(device.device_id, "device");
+        assert_eq!(device.volume_id.raw(), "volume");
+        assert_eq!(device.share_id.raw(), "share");
+        assert_eq!(device.root_link_id.raw(), "root");
+        assert_eq!(device.device_type, DeviceType::Linux);
+        assert_eq!(device.create_time.timestamp(), 1_700_000_000);
+    }
+
+    #[test]
+    fn converts_optional_last_sync_time() {
+        let device =
+            RawDeviceInfo::try_from(entry(1_700_000_000, Some(1_700_000_100), None)).unwrap();
+        assert_eq!(
+            device.last_sync_time.map(|time| time.timestamp()),
+            Some(1_700_000_100)
+        );
+    }
+
+    #[test]
+    fn detects_only_nonempty_deprecated_names() {
+        assert!(
+            !RawDeviceInfo::try_from(entry(1, None, None))
+                .unwrap()
+                .has_deprecated_name
+        );
+        assert!(
+            !RawDeviceInfo::try_from(entry(1, None, Some("")))
+                .unwrap()
+                .has_deprecated_name
+        );
+        assert!(
+            RawDeviceInfo::try_from(entry(1, None, Some("Computer")))
+                .unwrap()
+                .has_deprecated_name
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_create_time() {
+        assert!(RawDeviceInfo::try_from(entry(i64::MAX, None, None)).is_err());
+    }
+}

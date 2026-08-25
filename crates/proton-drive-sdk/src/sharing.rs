@@ -13,9 +13,7 @@ use crate::pgp::{PgpPrivateKey, PgpSessionKey};
 use crate::share::ShareId;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
-use proton_rpgp::{
-    AsPublicKeyRef, DataEncoding, Encryptor, PublicKey, SignatureContext, Signer,
-};
+use proton_rpgp::{AsPublicKeyRef, DataEncoding, Encryptor, PublicKey, SignatureContext, Signer};
 use proton_srp::{SRPAuth, SRPVerifierB64, SrpHashVersion};
 use rand::RngExt;
 
@@ -147,6 +145,7 @@ pub struct PublicLinkSession {
 
 pub struct PublicLinkClient {
     session: PublicLinkSession,
+    drive: ProtonDriveClient,
 }
 
 impl PublicLinkClient {
@@ -161,6 +160,45 @@ impl PublicLinkClient {
     pub fn share_key(&self) -> &PgpPrivateKey {
         &self.session.share_key
     }
+
+    pub async fn get_root_node(
+        &self,
+    ) -> anyhow::Result<crate::utils::PotentialObject<crate::node::Node, crate::node::DegradedNode>>
+    {
+        self.drive.get_node(self.session.root_uid.clone()).await
+    }
+
+    pub async fn get_node(
+        &self,
+        node_uid: NodeUid,
+    ) -> anyhow::Result<crate::utils::PotentialObject<crate::node::Node, crate::node::DegradedNode>>
+    {
+        self.drive.get_node(node_uid).await
+    }
+
+    pub async fn enumerate_folder_children(
+        &self,
+        folder_uid: NodeUid,
+    ) -> anyhow::Result<
+        impl futures::Stream<
+            Item = anyhow::Result<
+                crate::utils::PotentialObject<crate::node::Node, crate::node::DegradedNode>,
+            >,
+        > + 'static,
+    > {
+        self.drive.enumerate_folder_children(folder_uid).await
+    }
+
+    pub async fn get_file_downloader(
+        &self,
+        revision_uid: crate::node::revision::RevisionUid,
+    ) -> anyhow::Result<crate::node::file::download::FileDownloader> {
+        self.drive.get_file_downloader(revision_uid).await
+    }
+
+    pub fn drive(&self) -> &ProtonDriveClient {
+        &self.drive
+    }
 }
 
 pub fn invitation_uid(share_id: &ShareId, invitation_id: &str) -> String {
@@ -173,7 +211,8 @@ pub fn split_sharing_uid(uid: &str) -> anyhow::Result<(&str, &str)> {
 }
 
 pub fn parse_public_link_url(url: &str) -> anyhow::Result<(String, String)> {
-    let parsed = reqwest::Url::parse(url).map_err(|_| ProtonDriveError::Validation("Invalid URL".into()))?;
+    let parsed =
+        reqwest::Url::parse(url).map_err(|_| ProtonDriveError::Validation("Invalid URL".into()))?;
     let token = parsed
         .path_segments()
         .and_then(|mut s| s.next_back())
@@ -233,18 +272,16 @@ impl SharingOperations {
                     client.account().get_default_address().await?.address_id,
                 ))
                 .await?;
-            let pgp_keys: Vec<PgpPrivateKey> = address_keys.into_iter().map(PgpPrivateKey).collect();
+            let pgp_keys: Vec<PgpPrivateKey> =
+                address_keys.into_iter().map(PgpPrivateKey).collect();
             let claim = crate::node::authorship::AuthorshipClaim {
                 keys: vec![],
                 author: crate::author::Author::ANONYMOUS,
                 key_retrieval_error_message: None,
             };
-            if let Ok((passphrase, _, _)) = NodeCrypto::decrypt_message(
-                &details.share.passphrase,
-                None,
-                &pgp_keys,
-                &claim,
-            ) {
+            if let Ok((passphrase, _, _)) =
+                NodeCrypto::decrypt_message(&details.share.passphrase, None, &pgp_keys, &claim)
+            {
                 if let Ok(share_key) =
                     NodeCrypto::unlock_key_with_passphrase(&details.share.share_key, &passphrase)
                 {
@@ -289,8 +326,8 @@ impl SharingOperations {
                 break;
             }
         }
-        let session_key =
-            session_key.ok_or_else(|| anyhow::anyhow!("could not decrypt invitation key packet"))?;
+        let session_key = session_key
+            .ok_or_else(|| anyhow::anyhow!("could not decrypt invitation key packet"))?;
         let signing_key = keys
             .into_iter()
             .next()
@@ -700,16 +737,110 @@ impl SharingOperations {
             &response.share.share_passphrase,
             hashed.as_bytes(),
         )?;
-        Ok(PublicLinkClient {
-            session: PublicLinkSession {
-                token,
-                session_uid: response.session_uid,
-                access_token: response.access_token,
-                root_uid: NodeUid::new(response.share.volume_id, response.share.link_id),
-                share_key,
-                public_role: response.share.public_permissions.to_role(),
-            },
-        })
+        let session = PublicLinkSession {
+            token,
+            session_uid: response.session_uid,
+            access_token: response.access_token,
+            root_uid: NodeUid::new(response.share.volume_id, response.share.link_id),
+            share_key,
+            public_role: response.share.public_permissions.to_role(),
+        };
+        Self::create_public_link_client(client, session).await
+    }
+
+    async fn create_public_link_client(
+        parent: &ProtonDriveClient,
+        session: PublicLinkSession,
+    ) -> anyhow::Result<PublicLinkClient> {
+        use crate::api::{DefaultDriveApiClients, DriveApiClients};
+        use crate::block::verify::{BlockVerifierFactory, DefaultBlockVerifierFactory};
+        use crate::cache::client::{DefaultDriveClientCache, DriveClientCache};
+        use crate::cache::entity::{DefaultDriveEntityCache, DriveEntityCache};
+        use crate::cache::secret::{DefaultDriveSecretCache, DriveSecretCache};
+        use crate::share::Share;
+        use proton_sdk_rs2::cache::InMemoryCacheRepository;
+        use std::sync::Arc;
+
+        let middleware = || crate::http::PublicLinkSessionMiddleware {
+            session_uid: session.session_uid.clone(),
+            access_token: session.access_token.clone(),
+        };
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(
+                crate::client::ProtonDriveDefaults::STORAGE_API_TIMEOUT_SECONDS as u64,
+            ))
+            .build()?;
+        let api_http = reqwest_middleware::ClientBuilder::new(http.clone())
+            .with(middleware())
+            .build();
+        let storage_http = reqwest_middleware::ClientBuilder::new(http)
+            .with(middleware())
+            .build();
+        let base_url = reqwest::Url::parse(parent.api_url())?
+            .join(crate::client::ProtonDriveDefaults::DRIVE_BASE_ROUTE)?;
+        let api: Arc<dyn DriveApiClients> = Arc::new(DefaultDriveApiClients::new(
+            api_http.clone(),
+            storage_http,
+            base_url.clone(),
+            base_url.clone(),
+        ));
+
+        let details = api
+            .links()
+            .get_details(
+                session.root_uid.volume_id.clone(),
+                vec![session.root_uid.link_id.clone()],
+            )
+            .await?;
+        let root = details
+            .links
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("public-link root node was not returned"))?;
+        let share_id = root
+            .sharing
+            .as_ref()
+            .map(|sharing| sharing.share_id.clone())
+            .or_else(|| {
+                root.membership
+                    .as_ref()
+                    .map(|membership| membership.share_id.clone())
+            })
+            .ok_or_else(|| anyhow::anyhow!("public-link root has no share context"))?;
+
+        let entity_cache: Arc<dyn DriveEntityCache> = Arc::new(DefaultDriveEntityCache::new(
+            Arc::new(InMemoryCacheRepository::new()),
+        ));
+        let secret_cache: Arc<dyn DriveSecretCache> = Arc::new(DefaultDriveSecretCache::new(
+            Arc::new(InMemoryCacheRepository::new()),
+        ));
+        let address = parent.account().get_default_address().await?;
+        entity_cache
+            .set_share(Share {
+                id: share_id.clone(),
+                root_folder_id: session.root_uid.clone(),
+                membership_address_id: AddressId::new(address.address_id),
+                share_type: crate::api::share::ShareType::Standard,
+            })
+            .await?;
+        secret_cache
+            .set_share_key(share_id, session.share_key.clone())
+            .await?;
+        let cache: Arc<dyn DriveClientCache> =
+            Arc::new(DefaultDriveClientCache::new(entity_cache, secret_cache));
+        let verifier: Arc<dyn BlockVerifierFactory> =
+            Arc::new(DefaultBlockVerifierFactory::new(api_http, base_url, None));
+        let drive = ProtonDriveClient::from_components_with_api_url(
+            parent.account().clone(),
+            api,
+            cache,
+            verifier,
+            parent.feature_flag_provider().clone(),
+            parent.telemetry().clone(),
+            format!("{}-public-link", parent.uid()),
+            None,
+            parent.api_url().to_string(),
+        );
+        Ok(PublicLinkClient { session, drive })
     }
 
     pub async fn iterate_bookmarks(client: &ProtonDriveClient) -> anyhow::Result<Vec<Bookmark>> {
@@ -782,8 +913,7 @@ impl SharingOperations {
             .account()
             .get_address_primary_private_key(&AddressId::new(address.address_id.clone()))
             .await?;
-        let encryptor =
-            Encryptor::default().with_encryption_key(signing_key.as_public_key());
+        let encryptor = Encryptor::default().with_encryption_key(signing_key.as_public_key());
         let encrypted = encryptor.encrypt(password.as_bytes())?;
         let armored = String::from_utf8(encrypted.armor()?)?;
         let address_key_id = address
@@ -807,7 +937,10 @@ impl SharingOperations {
             .await
     }
 
-    pub async fn remove_bookmark(client: &ProtonDriveClient, bookmark_or_url: &str) -> anyhow::Result<()> {
+    pub async fn remove_bookmark(
+        client: &ProtonDriveClient,
+        bookmark_or_url: &str,
+    ) -> anyhow::Result<()> {
         let token = if let Ok((token, _)) = parse_public_link_url(bookmark_or_url) {
             token
         } else {
@@ -857,17 +990,15 @@ impl SharingOperations {
         let sk = session_key.to_rpgp_sk()?;
         let encryptor = Encryptor::default()
             .with_session_key(sk)
-            .with_encryption_keys([
-                secrets.key.0.as_public_key(),
-                address_key.0.as_public_key(),
-            ])
+            .with_encryption_keys([secrets.key.0.as_public_key(), address_key.0.as_public_key()])
             .with_signing_key(&address_key.0);
         let encrypted_passphrase = encryptor.encrypt(passphrase.as_bytes())?;
         let passphrase_signature = Signer::default()
             .with_signing_key(&address_key.0)
             .sign_detached(passphrase.as_bytes(), DataEncoding::Armored)?;
         let armored_key = share_key.to_armored_private_key(Some(passphrase.as_bytes()))?;
-        let passphrase_key_packet = share_key.encrypt_session_key(&secrets.passphrase_session_key)?;
+        let passphrase_key_packet =
+            share_key.encrypt_session_key(&secrets.passphrase_session_key)?;
         let name_key_packet = share_key.encrypt_session_key(&secrets.name_session_key)?;
         let created = client
             .api()
@@ -987,7 +1118,10 @@ impl SharingOperations {
                         key_packet_signature,
                         external_invitation_id: external_invitation_id.map(str::to_string),
                     },
-                    email_details: EmailDetailsBody { message, item_name: node_name },
+                    email_details: EmailDetailsBody {
+                        message,
+                        item_name: node_name,
+                    },
                 },
             )
             .await?;
@@ -1008,7 +1142,11 @@ impl SharingOperations {
         message: Option<String>,
         node_name: Option<String>,
     ) -> anyhow::Result<NonProtonInvitation> {
-        let payload = format!("{}|{}", email, STANDARD.encode(&ctx.passphrase_session_key.key));
+        let payload = format!(
+            "{}|{}",
+            email,
+            STANDARD.encode(&ctx.passphrase_session_key.key)
+        );
         let context = SignatureContext::new(SIGNING_EXTERNAL.to_string(), true);
         let signature = Signer::default()
             .with_signing_key(&ctx.address_key.0)
@@ -1026,7 +1164,10 @@ impl SharingOperations {
                         permissions: ShareMemberPermissions::from_role(role).bits(),
                         signature: STANDARD.encode(signature),
                     },
-                    email_details: EmailDetailsBody { message, item_name: node_name },
+                    email_details: EmailDetailsBody {
+                        message,
+                        item_name: node_name,
+                    },
                 },
             )
             .await?;
@@ -1068,8 +1209,7 @@ impl SharingOperations {
         let key_packet = Encryptor::default()
             .with_passphrase(salted.as_bytes())
             .encrypt_session_key(&ctx.passphrase_session_key.to_rpgp_sk()?)?;
-        let encryptor =
-            Encryptor::default().with_encryption_key(ctx.address_key.0.as_public_key());
+        let encryptor = Encryptor::default().with_encryption_key(ctx.address_key.0.as_public_key());
         let armored_password = String::from_utf8(encryptor.encrypt(password.as_bytes())?.armor()?)?;
         client
             .api()
@@ -1098,7 +1238,11 @@ impl SharingOperations {
         client: &ProtonDriveClient,
         share_id: ShareId,
     ) -> anyhow::Result<Option<UrlAccess>> {
-        let urls = client.api().shares().get_share_urls(share_id.clone()).await?;
+        let urls = client
+            .api()
+            .shares()
+            .get_share_urls(share_id.clone())
+            .await?;
         let Some(url) = urls.share_urls.into_iter().next() else {
             return Ok(None);
         };
@@ -1207,18 +1351,113 @@ mod tests {
         assert_eq!((share, inv), ("share", "inv"));
     }
 
-    #[test]
-    fn public_link_url_parse() {
-        let (token, password) =
-            parse_public_link_url("https://drive.proton.me/urls/abcTOKEN#s3cret").unwrap();
-        assert_eq!(token, "abcTOKEN");
-        assert_eq!(password, "s3cret");
+    macro_rules! valid_public_link_url {
+        ($name:ident, $url:literal, $token:literal, $password:literal) => {
+            #[test]
+            fn $name() {
+                assert_eq!(
+                    parse_public_link_url($url).unwrap(),
+                    ($token.to_string(), $password.to_string())
+                );
+            }
+        };
     }
+
+    macro_rules! invalid_public_link_url {
+        ($name:ident, $url:literal) => {
+            #[test]
+            fn $name() {
+                let error = parse_public_link_url($url).unwrap_err();
+                assert!(error.to_string().contains("Invalid URL"));
+            }
+        };
+    }
+
+    valid_public_link_url!(
+        public_link_url_parse,
+        "https://drive.proton.me/urls/abc123#def456",
+        "abc123",
+        "def456"
+    );
+    valid_public_link_url!(
+        public_link_url_allows_other_domains,
+        "https://example.com/urls/mytoken#mypassword",
+        "mytoken",
+        "mypassword"
+    );
+    valid_public_link_url!(
+        public_link_url_ignores_query_parameters,
+        "https://drive.proton.me/urls/token123?param=value#password456",
+        "token123",
+        "password456"
+    );
+    invalid_public_link_url!(
+        public_link_url_rejects_missing_path,
+        "https://drive.proton.me/#password123"
+    );
+    invalid_public_link_url!(
+        public_link_url_rejects_empty_token,
+        "https://drive.proton.me/urls/#password123"
+    );
+    invalid_public_link_url!(
+        public_link_url_rejects_missing_fragment,
+        "https://drive.proton.me/urls/token123"
+    );
+    invalid_public_link_url!(
+        public_link_url_rejects_empty_fragment,
+        "https://drive.proton.me/urls/token123#"
+    );
+    invalid_public_link_url!(public_link_url_rejects_empty_input, "");
+    invalid_public_link_url!(public_link_url_rejects_invalid_input, "not-a-url");
 
     #[test]
     fn member_role_permissions() {
-        assert_eq!(ShareMemberPermissions::from_role(MemberRole::Viewer).bits(), 4);
-        assert_eq!(ShareMemberPermissions::from_role(MemberRole::Editor).bits(), 6);
-        assert_eq!(ShareMemberPermissions::from_role(MemberRole::Admin).bits(), 22);
+        assert_eq!(
+            ShareMemberPermissions::from_role(MemberRole::Viewer).bits(),
+            4
+        );
+        assert_eq!(
+            ShareMemberPermissions::from_role(MemberRole::Editor).bits(),
+            6
+        );
+        assert_eq!(
+            ShareMemberPermissions::from_role(MemberRole::Admin).bits(),
+            22
+        );
+    }
+
+    #[test]
+    fn malformed_sharing_uids_are_rejected() {
+        assert!(split_sharing_uid("").is_err());
+        assert!(split_sharing_uid("share-only").is_err());
+    }
+
+    #[test]
+    fn generated_and_custom_passwords_split_only_for_flag_three() {
+        let password = format!("{}custom", "g".repeat(PUBLIC_LINK_PASSWORD_LEN));
+        assert_eq!(
+            split_generated_and_custom(&password, 3),
+            ("g".repeat(PUBLIC_LINK_PASSWORD_LEN), Some("custom".into()))
+        );
+        assert_eq!(split_generated_and_custom(&password, 1), (password, None));
+    }
+
+    #[test]
+    fn short_public_link_password_is_not_split() {
+        assert_eq!(
+            split_generated_and_custom("short", 3),
+            ("short".into(), None)
+        );
+    }
+
+    #[test]
+    fn generated_public_link_password_uses_the_expected_alphabet() {
+        let password = random_password(256);
+        assert_eq!(password.len(), 256);
+        assert!(
+            password
+                .bytes()
+                .all(|byte| GENERATED_PASSWORD_CHARSET.contains(&byte))
+        );
     }
 }

@@ -35,6 +35,7 @@ impl FileDownloader {
         let (state_tx, state_rx) = tokio::sync::watch::channel(ControllerState::Running);
 
         let completion = tokio::spawn(async move {
+            let _file_permit = client.block_downloader().queue.start_file().await?;
             let release_block_listing = Box::new(|_| {});
             tracing::debug!("Creating download state for revision_uid={}", revision_uid);
             let download_state = RevisionOperations::create_download_state(
@@ -91,7 +92,7 @@ impl FileDownloader {
             Ok(())
         });
 
-        DownloadController::new(state_tx, completion)
+        DownloadController::new(state_tx, completion, self.client.sdk_events().clone())
     }
 
     /// Claimed plaintext sizes of each block, required for seeking. Fails on older files that omit them.
@@ -102,7 +103,8 @@ impl FileDownloader {
         use crate::node::crypto::NodeCrypto;
         use crate::node::file::FileOperations;
 
-        let secrets = FileOperations::get_secrets(&self.client, self.revision_uid.node_uid.clone()).await?;
+        let secrets =
+            FileOperations::get_secrets(&self.client, self.revision_uid.node_uid.clone()).await?;
         let resp = self
             .client
             .api()
@@ -125,8 +127,9 @@ impl FileDownloader {
             author: Author::ANONYMOUS,
             key_retrieval_error_message: None,
         };
-        let (bytes, _, _) = NodeCrypto::decrypt_message(&xattr_msg, None, [&secrets.base.key], &claim)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let (bytes, _, _) =
+            NodeCrypto::decrypt_message(&xattr_msg, None, [&secrets.base.key], &claim)
+                .map_err(|e| anyhow::anyhow!(e))?;
         let xattr: ExtendedAttributes = serde_json::from_slice(&bytes)?;
         xattr
             .common
@@ -169,15 +172,76 @@ impl FileDownloader {
             if block_start >= end {
                 break;
             }
-            let data = reader
-                .download_block_at((i as i32) + 1)
-                .await?;
+            let data = reader.download_block_at((i as i32) + 1).await?;
             let slice_start = offset.saturating_sub(block_start) as usize;
             let slice_end = (end.min(block_end) - block_start) as usize;
             output.write_all(&data[slice_start..slice_end.min(data.len())])?;
             written += (slice_end - slice_start) as u64;
         }
         Ok(written)
+    }
+
+    /// Creates a cursor for on-demand range reads, suitable for media playback.
+    pub async fn get_seekable_stream(&self) -> anyhow::Result<SeekableFileStream<'_>> {
+        let length =
+            self.claimed_block_sizes()
+                .await?
+                .into_iter()
+                .try_fold(0u64, |total, size| {
+                    u64::try_from(size)
+                        .ok()
+                        .and_then(|size| total.checked_add(size))
+                        .ok_or_else(|| anyhow::anyhow!("invalid claimed block sizes"))
+                })?;
+        Ok(SeekableFileStream {
+            downloader: self,
+            position: 0,
+            length,
+        })
+    }
+}
+
+pub struct SeekableFileStream<'a> {
+    downloader: &'a FileDownloader,
+    position: u64,
+    length: u64,
+}
+
+impl SeekableFileStream<'_> {
+    pub fn position(&self) -> u64 {
+        self.position
+    }
+
+    pub fn len(&self) -> u64 {
+        self.length
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    pub fn seek(&mut self, position: u64) -> anyhow::Result<()> {
+        if position > self.length {
+            anyhow::bail!(
+                "seek position {position} exceeds file length {}",
+                self.length
+            );
+        }
+        self.position = position;
+        Ok(())
+    }
+
+    pub async fn read(&mut self, num_bytes: usize) -> anyhow::Result<Vec<u8>> {
+        if num_bytes == 0 {
+            anyhow::bail!("read length must be greater than zero");
+        }
+        let mut bytes = Vec::with_capacity(num_bytes.min((self.length - self.position) as usize));
+        let written = self
+            .downloader
+            .download_range(self.position, num_bytes as u64, &mut bytes)
+            .await?;
+        self.position += written;
+        Ok(bytes)
     }
 }
 

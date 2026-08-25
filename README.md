@@ -87,10 +87,10 @@ this project uses the MIT license because all the other proton-based repositorie
 - [x] Upload from file path
 - [x] Thumbnails enumeration
 - [x] Thumbnail fetch
-- [ ] Upload pause/resume controller
-- [ ] Download pause/resume controller
-- [ ] Seekable stream for video playback
-- [ ] Expected SHA1 verification on upload
+- [x] Upload pause/resume controller
+- [x] Download pause/resume controller
+- [x] Seekable stream for video playback
+- [x] Expected SHA1 verification on upload
 
 ### Revisions
 - [x] Iterate revisions
@@ -109,36 +109,36 @@ this project uses the MIT license because all the other proton-based repositorie
 - [x] Poll volume events
 - [x] Get core latest event ID
 - [x] Poll core events
-- [ ] Subscribe to tree events
-- [ ] Subscribe to drive events
-- [ ] SDK events (TransfersPaused, TransfersResumed, RequestsThrottled)
+- [x] Subscribe to tree events
+- [x] Subscribe to drive events
+- [x] SDK events (TransfersPaused, TransfersResumed, RequestsThrottled)
 
 ### Sharing & Collaboration
-- [ ] Share node (with users/public link)
-- [ ] Unshare node
-- [ ] Get sharing info (members, invitations, public link)
-- [ ] Iterate nodes shared by me
-- [ ] Iterate nodes shared with me
-- [ ] Leave shared node
-- [ ] Editors can share setting
+- [x] Share node (with users/public link)
+- [x] Unshare node
+- [x] Get sharing info (members, invitations, public link)
+- [x] Iterate nodes shared by me
+- [x] Iterate nodes shared with me
+- [x] Leave shared node
+- [x] Editors can share setting
 
 ### Invitations
-- [ ] Iterate pending invitations
-- [ ] Accept invitation
-- [ ] Reject invitation
-- [ ] Resend invitation email
-- [ ] Convert non-Proton invitation
+- [x] Iterate pending invitations
+- [x] Accept invitation
+- [x] Reject invitation
+- [x] Resend invitation email
+- [x] Convert non-Proton invitation
 
 ### Public Links
-- [ ] Create public link (with password/expiration)
-- [ ] Get public link info
-- [ ] Authenticate public link
-- [ ] Public link client for accessing shared content
+- [x] Create public link (with password/expiration)
+- [x] Get public link info
+- [x] Authenticate public link
+- [x] Public link client for accessing shared content
 
 ### Bookmarks
-- [ ] Iterate bookmarks
-- [ ] Create bookmark
-- [ ] Remove bookmark
+- [x] Iterate bookmarks
+- [x] Create bookmark
+- [x] Remove bookmark
 
 ### Photos
 - [x] Photos client initialization
@@ -146,32 +146,32 @@ this project uses the MIT license because all the other proton-based repositorie
 - [x] Photos file uploader
 - [x] Photos file downloader
 - [x] Enumerate timeline (basic)
-- [ ] Timeline with pagination
-- [ ] Create album
-- [ ] Delete album
-- [ ] Rename album
-- [ ] Set album cover
-- [ ] Add photos to album
-- [ ] Remove photos from album
-- [ ] Iterate album contents
-- [ ] Favorite/unfavorite photo
-- [ ] Photo tags (Favorites, Screenshots, Videos, LivePhotos, etc.)
-- [ ] Duplicate detection
+- [x] Timeline with pagination
+- [x] Create album
+- [x] Delete album
+- [x] Rename album
+- [x] Set album cover
+- [x] Add photos to album
+- [x] Remove photos from album
+- [x] Iterate album contents
+- [x] Favorite/unfavorite photo
+- [x] Photo tags (Favorites, Screenshots, Videos, LivePhotos, etc.)
+- [x] Duplicate detection
 
 ### Utilities
-- [ ] Generate node UID from share/link IDs
-- [ ] Get node web URL
-- [ ] Get Docs key (for Proton Docs integration)
+- [x] Generate node UID from share/link IDs
+- [x] Get node web URL
+- [x] Get Docs key (for Proton Docs integration)
 
 ### Resilience & Error Handling
-- [ ] Automatic retry with backoff
-- [ ] Transfer queue management
-- [ ] TooManyRequests handling
-- [ ] Integrity exception types (ChecksumMismatch, ContentSizeMismatch, etc.)
+- [x] Automatic retry with backoff
+- [x] Transfer queue management
+- [x] TooManyRequests handling
+- [x] Integrity exception types (ChecksumMismatch, ContentSizeMismatch, etc.)
 
 ### Telemetry
 - [x] Telemetry trait/interface
-- [ ] Upload/Download error events
-- [ ] Block verification error events
-- [ ] Decryption error events
+- [x] Upload/Download error events
+- [x] Block verification error events
+- [x] Decryption error events
 </details>

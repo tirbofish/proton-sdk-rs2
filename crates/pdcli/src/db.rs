@@ -269,12 +269,7 @@ impl FuseDb {
                     )?;
                 }
             }
-            self.conn.execute(
-                "UPDATE inodes
-                 SET parent_ino = ?
-                 WHERE parent_ino = 1 AND ino NOT IN (1, ?)",
-                params![row.ino as i64, row.ino as i64],
-            )?;
+            self.reparent_legacy_root_children(row.ino)?;
             return Ok(row.ino);
         }
 
@@ -311,18 +306,44 @@ impl FuseDb {
             }
         }
 
+        self.reparent_legacy_root_children(my_files_ino)?;
+        Ok(my_files_ino)
+    }
+
+    fn reparent_legacy_root_children(&self, my_files_ino: u64) -> anyhow::Result<()> {
         self.conn.execute(
             "UPDATE inodes
              SET parent_ino = ?
-             WHERE parent_ino = 1 AND ino NOT IN (1, ?)",
+             WHERE parent_ino = 1
+               AND ino NOT IN (1, ?)
+               AND name NOT IN ('MyFiles', 'Computers')",
             params![my_files_ino as i64, my_files_ino as i64],
         )?;
+        Ok(())
+    }
 
-        Ok(my_files_ino)
+    pub fn ensure_computers_root(&self) -> anyhow::Result<u64> {
+        self.insert_root(None, None, None)?;
+        if let Some(row) = self.lookup_child(1, "Computers") {
+            return Ok(row.ino);
+        }
+        let now = now_unix();
+        self.conn.execute(
+            "INSERT INTO inodes
+                (parent_ino, name, node_uid, volume_id, link_id, is_dir, size,
+                 media_type, mtime, ctime, dirty, children_populated)
+             VALUES (1, 'Computers', NULL, NULL, NULL, 1, 0, '', ?, ?, 0, 0)",
+            params![now, now],
+        )?;
+        Ok(self.conn.last_insert_rowid() as u64)
     }
 
     pub fn my_files_inode(&self) -> Option<InodeRow> {
         self.lookup_child(1, "MyFiles")
+    }
+
+    pub fn computers_inode(&self) -> Option<InodeRow> {
+        self.lookup_child(1, "Computers")
     }
 
     pub fn inode_path(&self, ino: u64) -> Option<Vec<InodeRow>> {
@@ -795,6 +816,20 @@ mod tests {
         drop(db);
         let hdr = std::fs::read(&path).unwrap();
         assert!(!hdr.starts_with(b"SQLite format 3"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn my_files_migration_leaves_computers_at_root() {
+        let path = temp_db();
+        let key = [3u8; 32];
+        let db = FuseDb::open_with_key(&path, &key).unwrap();
+        let computers = db.ensure_computers_root().unwrap();
+        let my_files = db.ensure_my_files_root().unwrap();
+        db.ensure_my_files_root().unwrap();
+        assert_eq!(db.lookup_child(1, "Computers").unwrap().ino, computers);
+        assert_eq!(db.lookup_child(1, "MyFiles").unwrap().ino, my_files);
+        assert_eq!(db.get_inode(computers).unwrap().parent_ino, 1);
         cleanup(&path);
     }
 }

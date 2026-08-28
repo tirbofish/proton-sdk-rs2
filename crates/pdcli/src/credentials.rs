@@ -123,10 +123,8 @@ pub fn remove() {
     }
 }
 
-pub fn open_session_caches() -> anyhow::Result<(
-    Arc<dyn CacheRepository>,
-    Arc<dyn CacheRepository>,
-)> {
+pub fn open_session_caches() -> anyhow::Result<(Arc<dyn CacheRepository>, Arc<dyn CacheRepository>)>
+{
     let dir = cred_dir();
     let cache_db_path = dir.join("cache.db");
     let secret_db_path = dir.join("secret.db");
@@ -158,10 +156,7 @@ fn scrub_plaintext_passphrases(cache_db: &Path) {
         "DELETE FROM Entries WHERE Key LIKE 'account:passphrase:%'",
         [],
     );
-    let _ = conn.execute(
-        "DELETE FROM Tags WHERE Key LIKE 'account:passphrase:%'",
-        [],
-    );
+    let _ = conn.execute("DELETE FROM Tags WHERE Key LIKE 'account:passphrase:%'", []);
 }
 
 pub(crate) fn cache_master_key() -> anyhow::Result<Vec<u8>> {

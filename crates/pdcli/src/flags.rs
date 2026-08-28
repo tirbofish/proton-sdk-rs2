@@ -57,9 +57,42 @@ pub enum Command {
     Sync,
     /// Open the Proton Drive folder
     Open,
+    /// List computers, register this machine, or manage folder sync jobs
+    Computers {
+        #[command(subcommand)]
+        command: Option<ComputersCommand>,
+    },
     /// Run the background daemon
     #[command(hide = true)]
     Daemon,
+}
+
+#[derive(Subcommand)]
+pub enum ComputersCommand {
+    /// Register this machine, or bind it to an existing computer
+    Register {
+        /// Display name (defaults to hostname)
+        #[arg(long)]
+        name: Option<String>,
+        /// Bind to an existing computer id
+        #[arg(long)]
+        bind: Option<String>,
+    },
+    /// Back up a local folder to this computer and keep it in sync
+    Sync {
+        path: std::path::PathBuf,
+        /// Remote folder name (defaults to the local directory name)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Restore a computer folder to a local path and keep syncing it there
+    Restore {
+        computer: String,
+        folder: String,
+        path: std::path::PathBuf,
+    },
+    /// Stop a sync job without deleting local or cloud files
+    Unsync { job: String },
 }
 
 #[derive(Clone, Default)]

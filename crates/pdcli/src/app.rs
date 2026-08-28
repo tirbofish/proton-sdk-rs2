@@ -4,7 +4,7 @@ use proton_sdk_rs2::{
 };
 
 use crate::{
-    auth, credentials, daemon, flags, pdignore,
+    auth, computers, credentials, daemon, flags, pdignore,
     transfer::{TransferDirection, TransferTracker, format_bytes},
 };
 
@@ -36,6 +36,7 @@ pub struct ProtonDrive {
     daemon_error: Option<String>,
     pdignore_text: String,
     pdignore_status: Option<String>,
+    computers: computers::ComputersUi,
 }
 
 impl ProtonDrive {
@@ -89,6 +90,7 @@ impl ProtonDrive {
             daemon_error: None,
             pdignore_text: pdignore::load_global_text(),
             pdignore_status: None,
+            computers: computers::ComputersUi::default(),
         }
     }
 }
@@ -354,8 +356,12 @@ impl ProtonDrive {
                 }
             }
             MenuPage::Computers => {
-                ui.heading("Computers");
-                ui.label("No computers linked yet.");
+                let session = if let AppState::Authenticated(session) = &self.state {
+                    session.clone()
+                } else {
+                    return;
+                };
+                self.computers.ui(ui, session);
             }
             MenuPage::Mount => {
                 ui.heading("Mount");
@@ -369,8 +375,8 @@ impl ProtonDrive {
                     });
                     ui.add_space(8.0);
                     let mount_path = dirs::home_dir()
-                        .map(|h| h.join("ProtonDrive").join("MyFiles").display().to_string())
-                        .unwrap_or_else(|| "~/ProtonDrive/MyFiles".into());
+                        .map(|h| h.join("ProtonDrive").display().to_string())
+                        .unwrap_or_else(|| "~/ProtonDrive".into());
                     ui.label(format!("Mount point: {}", mount_path));
                 } else {
                     ui.horizontal(|ui| {

@@ -363,10 +363,9 @@ fn status_response() -> &'static str {
     }
 }
 
-async fn restore_session(force_offline: bool) -> anyhow::Result<ProtonAPISession> {
-    let cred = credentials::load().ok_or_else(|| {
-        anyhow::anyhow!("no stored credentials; run `pdcli login` to sign in")
-    })?;
+pub(crate) async fn restore_session(force_offline: bool) -> anyhow::Result<ProtonAPISession> {
+    let cred = credentials::load()
+        .ok_or_else(|| anyhow::anyhow!("no stored credentials; run `pdcli login` to sign in"))?;
 
     let (entity_cache, secret_cache) = credentials::open_session_caches()?;
 

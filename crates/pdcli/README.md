@@ -16,6 +16,11 @@ pdcli pause        # pause background sync
 pdcli resume       # resume background sync
 pdcli sync         # retry sync now
 pdcli open         # open the Drive folder
+pdcli computers    # list computers and sync jobs
+pdcli computers register [--name NAME] [--bind DEVICE_ID]
+pdcli computers sync ~/Documents [--name Documents]
+pdcli computers restore <computer> <folder> ~/Documents
+pdcli computers unsync Documents
 pdcli --help
 ```
 

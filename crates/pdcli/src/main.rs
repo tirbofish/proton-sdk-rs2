@@ -7,6 +7,7 @@ use crate::flags::{Cli, Command, is_wsl};
 
 mod app;
 mod auth;
+mod computers;
 mod credentials;
 mod daemon;
 mod db;
@@ -56,6 +57,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Open) => {
             daemon::open_folder();
             Ok(())
+        }
+        Some(Command::Computers { command }) => {
+            computers::run_cli(flags.force_offline, command).await
         }
         Some(Command::Daemon) => run_daemon(flags.force_offline, !flags.no_tray).await,
         None if cli.daemon => run_daemon(flags.force_offline, !flags.no_tray).await,

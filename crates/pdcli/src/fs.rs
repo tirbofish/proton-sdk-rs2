@@ -68,6 +68,10 @@ pub fn retry_sync_now() {
     wake_journal();
 }
 
+pub(crate) fn sync_notify() -> &'static tokio::sync::Notify {
+    &JOURNAL_NOTIFY
+}
+
 fn wake_journal() {
     SYNC_NOW.store(true, Ordering::Relaxed);
     JOURNAL_NOTIFY.notify_one();
@@ -184,6 +188,16 @@ impl ProtonDriveFs {
         if let Some(ino) = my_files_ino {
             self.start_populate(ino);
         }
+        let computers_ino = {
+            let db = self.db.lock().unwrap();
+            db.ensure_computers_root().ok()
+        };
+        if let Some(ino) = computers_ino {
+            self.start_populate(ino);
+        }
+
+        self.rt
+            .spawn(crate::computers::sync_loop(self.drive.clone()));
     }
 
     // ── Helpers ──────────────────────────────────────────────────────
@@ -243,6 +257,25 @@ impl ProtonDriveFs {
         }
     }
 
+    fn ensure_computers_root(&self) -> Option<u64> {
+        let db = self.db.lock().unwrap();
+        match db.ensure_computers_root() {
+            Ok(ino) => Some(ino),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to ensure Computers root");
+                None
+            }
+        }
+    }
+
+    fn computers_ino(&self) -> Option<u64> {
+        self.db.lock().unwrap().computers_inode().map(|row| row.ino)
+    }
+
+    fn is_protected_parent(&self, parent_ino: u64) -> bool {
+        parent_ino == ROOT_INO || self.computers_ino() == Some(parent_ino)
+    }
+
     /// Populate the children of a directory if not yet done.
     ///
     /// Cached names are returned immediately. A network refresh runs in the
@@ -250,9 +283,21 @@ impl ProtonDriveFs {
     /// listed (empty cache).
     fn ensure_children_populated(&self, parent_ino: u64) {
         if parent_ino == ROOT_INO {
-            if self.ensure_my_files_root().is_some() {
+            if self.ensure_my_files_root().is_some() && self.ensure_computers_root().is_some() {
                 let db = self.db.lock().unwrap();
                 let _ = db.set_children_populated(ROOT_INO);
+            }
+            return;
+        }
+
+        if self.computers_ino() == Some(parent_ino) {
+            let has_cached = {
+                let db = self.db.lock().unwrap();
+                !db.list_children(parent_ino).is_empty()
+            };
+            self.start_populate(parent_ino);
+            if !has_cached {
+                self.wait_until_populated(parent_ino);
             }
             return;
         }
@@ -645,8 +690,19 @@ async fn populate_folder_children(
         return Ok(());
     }
 
+    let (my_files_ino, computers_ino) = {
+        let db = db.lock().unwrap();
+        (
+            db.my_files_inode().map(|row| row.ino),
+            db.computers_inode().map(|row| row.ino),
+        )
+    };
+    if Some(parent_ino) == computers_ino {
+        return populate_computers(db, drive, parent_ino).await;
+    }
+
     let mut node_uid_str = parent.node_uid.clone();
-    if node_uid_str.is_none() && is_online() {
+    if node_uid_str.is_none() && is_online() && Some(parent_ino) == my_files_ino {
         let folder = drive.get_my_files_folder().await?;
         let uid_raw = folder.base.uid.raw();
         let vol = folder.base.uid.volume_id.raw().to_string();
@@ -705,6 +761,60 @@ async fn populate_folder_children(
     Ok(())
 }
 
+async fn populate_computers(
+    db: Arc<Mutex<FuseDb>>,
+    drive: ProtonDriveClient,
+    computers_ino: u64,
+) -> anyhow::Result<()> {
+    if !is_online() {
+        let db = db.lock().unwrap();
+        if !db.list_children(computers_ino).is_empty() {
+            db.set_children_populated(computers_ino)?;
+        }
+        return Ok(());
+    }
+
+    let devices = drive.list_devices().await?;
+    let db = db.lock().unwrap();
+    let mut remote_uids = HashSet::new();
+    let mut taken = HashSet::new();
+    for device in devices {
+        let uid_raw = device.root_uid.raw();
+        remote_uids.insert(uid_raw.clone());
+        let name = crate::computers::fuse_device_name(&device.name, &device.device_id, &taken);
+        taken.insert(name.clone());
+        if let Some(existing) = db.find_by_node_uid(&uid_raw) {
+            if existing.name != name || existing.parent_ino != computers_ino {
+                let _ = db.rename_inode(existing.ino, computers_ino, &name);
+            }
+            continue;
+        }
+        let _ = db.insert_inode(
+            computers_ino,
+            &name,
+            Some(&uid_raw),
+            Some(device.root_uid.volume_id.raw()),
+            Some(device.root_uid.link_id.raw()),
+            true,
+            0,
+            "",
+            None,
+            device.create_time.timestamp(),
+        );
+    }
+    for local in db.list_children(computers_ino) {
+        match local.node_uid {
+            Some(ref uid)
+                if remote_uids.contains(uid)
+                    || local.dirty
+                    || db.has_pending_journal(local.ino) => {}
+            _ => remove_inode_tree(&db, &local),
+        }
+    }
+    db.set_children_populated(computers_ino)?;
+    Ok(())
+}
+
 fn remove_inode_tree(db: &FuseDb, row: &InodeRow) {
     for child in db.list_children(row.ino) {
         remove_inode_tree(db, &child);
@@ -739,6 +849,8 @@ impl Filesystem for ProtonDriveFs {
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         }
         db.ensure_my_files_root()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        db.ensure_computers_root()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         Ok(())
     }
@@ -1148,7 +1260,7 @@ impl Filesystem for ProtonDriveFs {
             }
         };
 
-        if parent_ino == ROOT_INO {
+        if self.is_protected_parent(parent_ino) {
             reply.error(Errno::EACCES);
             return;
         }
@@ -1264,7 +1376,7 @@ impl Filesystem for ProtonDriveFs {
             }
         };
 
-        if parent_ino == ROOT_INO {
+        if self.is_protected_parent(parent_ino) {
             reply.error(Errno::EACCES);
             return;
         }
@@ -1332,7 +1444,7 @@ impl Filesystem for ProtonDriveFs {
             }
         };
 
-        if parent_ino == ROOT_INO {
+        if self.is_protected_parent(parent_ino) {
             reply.error(Errno::EACCES);
             return;
         }
@@ -1375,7 +1487,7 @@ impl Filesystem for ProtonDriveFs {
             }
         };
 
-        if parent_ino == ROOT_INO {
+        if self.is_protected_parent(parent_ino) {
             reply.error(Errno::EACCES);
             return;
         }
@@ -1440,7 +1552,7 @@ impl Filesystem for ProtonDriveFs {
             }
         };
 
-        if parent_ino == ROOT_INO || newparent_ino == ROOT_INO {
+        if self.is_protected_parent(parent_ino) || self.is_protected_parent(newparent_ino) {
             reply.error(Errno::EACCES);
             return;
         }
@@ -2248,6 +2360,7 @@ pub async fn spawn_fuse_session(
     // Seed root inode.
     db.insert_root(None, None, None)?;
     db.ensure_my_files_root()?;
+    db.ensure_computers_root()?;
     reconcile_cached_file_sizes(&db);
 
     let rt = tokio::runtime::Handle::current();

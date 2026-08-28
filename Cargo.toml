@@ -1,6 +1,6 @@
 
 [workspace]
-package.version = "0.2.0"
+package.version = "0.3.0"
 package.edition = "2024"
 package.license = "MIT"
 package.repository = "https://github.com/tirbofish/proton-sdk-rs2"
@@ -14,7 +14,7 @@ members = ["crates/*"]
 proton-srp = { version = "0.8", features = ["pgpinternal"]}
 proton-crypto = { version = "0.12" }
 proton-rpgp = { version = "0.3" }
-proton-sdk-rs2 = { version = "0.2", path = "crates/proton-sdk-rs2" }
+proton-sdk-rs2 = { version = "0.3", path = "crates/proton-sdk-rs2" }
 
 semver = { version = "1.0", features = ["serde"] }
 anyhow = "1.0"

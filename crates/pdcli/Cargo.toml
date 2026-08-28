@@ -13,8 +13,8 @@ name = "pdcli"
 path = "src/main.rs"
 
 [dependencies]
-proton-drive-sdk = { version = "0.2", path = "../proton-drive-sdk", features = ["cache-encrypted"] }
-proton-sdk-rs2 = { version = "0.2", path = "../proton-sdk-rs2" }
+proton-drive-sdk = { version = "0.3", path = "../proton-drive-sdk", features = ["cache-encrypted"] }
+proton-sdk-rs2 = { version = "0.3", path = "../proton-sdk-rs2" }
 tokio = { version = "1.50", features = ["full"] }
 tokio-util = "0.7"
 tracing = "0.1"

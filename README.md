@@ -45,7 +45,7 @@ proton-drive-sdk and proton-sdk-rs2 are both on crates.io, as well as the proton
 
 **crates.io**
 ```toml
-proton-drive-sdk = { version = "0.1" }
+proton-drive-sdk = { version = "0.3" }
 ```
 
 **cutting edge**

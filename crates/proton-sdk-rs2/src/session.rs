@@ -5,8 +5,8 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rand::Rng;
 use reqwest::StatusCode;
-use zeroize::{Zeroize, Zeroizing};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::auth::DefaultAuthenticationApiClient;
 use crate::cache::InMemoryCacheRepository;
@@ -258,7 +258,12 @@ impl ProtonAPISession {
 
         let mut encryption_key = Zeroizing::new([0u8; 32]);
         rand::rng().fill_bytes(encryption_key.as_mut());
-        let mut sign_in_url = generate_sign_in_url(AUTH_CLIENT_ID, &fork.user_code, &encryption_key, ACCOUNT_URL);
+        let mut sign_in_url = generate_sign_in_url(
+            AUTH_CLIENT_ID,
+            &fork.user_code,
+            &encryption_key,
+            ACCOUNT_URL,
+        );
         on_sign_in(&sign_in_url, &fork.user_code);
         sign_in_url.zeroize();
 
@@ -274,7 +279,8 @@ impl ProtonAPISession {
             }
         };
 
-        let key_password = Zeroizing::new(decrypt_fork_key_password(&encryption_key, &status.payload)?);
+        let key_password =
+            Zeroizing::new(decrypt_fork_key_password(&encryption_key, &status.payload)?);
         encryption_key.zeroize();
         let password_mode = status.password_mode.unwrap_or(PasswordMode::Single);
         let token_credential = TokenCredential::new(
@@ -644,7 +650,10 @@ fn generate_sign_in_url(
         user_code,
         STANDARD.encode(encryption_key)
     );
-    format!("{account_url}/desktop/login?app=drive&pv=3#payload={}", encode_uri_component(&payload))
+    format!(
+        "{account_url}/desktop/login?app=drive&pv=3#payload={}",
+        encode_uri_component(&payload)
+    )
 }
 
 fn encode_uri_component(s: &str) -> String {
@@ -660,7 +669,10 @@ fn encode_uri_component(s: &str) -> String {
     out
 }
 
-fn decrypt_fork_key_password(encryption_key: &[u8; 32], encoded_payload: &str) -> anyhow::Result<String> {
+fn decrypt_fork_key_password(
+    encryption_key: &[u8; 32],
+    encoded_payload: &str,
+) -> anyhow::Result<String> {
     let blob = STANDARD.decode(encoded_payload.as_bytes())?;
     const NONCE_LEN: usize = 12;
     const TAG_LEN: usize = 16;

@@ -2,12 +2,14 @@ use crate::account::AddressId;
 use crate::api::share::{
     CreateBookmarkBody, CreateBookmarkRequest, CreateShareRequest, CreateShareUrlRequest,
     EmailDetailsBody, InviteExternalUserBody, InviteExternalUserRequest, InviteProtonUserBody,
-    InviteProtonUserRequest, PublicLinkAuthRequest, ShareMemberPermissions, ShareTargetType,
+    InviteProtonUserRequest, PublicLinkAuthRequest, ReportShareAbuseRequest,
+    ShareMemberPermissions, ShareTargetType, UpdateShareUrlRequest,
 };
 use crate::client::ProtonDriveClient;
 use crate::crypto::CryptoGenerator;
 use crate::error::ProtonDriveError;
 use crate::node::crypto::NodeCrypto;
+use crate::node::revision::RevisionUid;
 use crate::node::{NodeAndSecrets, NodeSecrets, NodeUid};
 use crate::pgp::{PgpPrivateKey, PgpSessionKey};
 use crate::share::ShareId;
@@ -17,7 +19,7 @@ use proton_rpgp::{AsPublicKeyRef, DataEncoding, Encryptor, PublicKey, SignatureC
 use proton_srp::{SRPAuth, SRPVerifierB64, SrpHashVersion};
 use rand::RngExt;
 
-pub use crate::api::share::MemberRole;
+pub use crate::api::share::{AbuseCategory, MemberRole};
 
 const SIGNING_INVITER: &str = "drive.share-member.inviter";
 const SIGNING_MEMBER: &str = "drive.share-member.member";
@@ -134,6 +136,27 @@ pub struct PublicLinkInfo {
 }
 
 #[derive(Debug, Clone)]
+pub struct ReportDirectShareAbuseSettings {
+    pub node_uid: NodeUid,
+    pub abuse_category: AbuseCategory,
+    pub bona_fide: bool,
+    pub reporter_message: Option<String>,
+    pub reporter_email: Option<String>,
+    pub revision_uid: Option<RevisionUid>,
+    pub invitation_uid: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReportPublicLinkShareAbuseSettings {
+    pub abuse_category: AbuseCategory,
+    pub bona_fide: bool,
+    pub reporter_message: Option<String>,
+    pub reporter_email: Option<String>,
+    pub node_uid: Option<NodeUid>,
+    pub revision_uid: Option<RevisionUid>,
+}
+
+#[derive(Debug, Clone)]
 pub struct PublicLinkSession {
     pub token: String,
     pub session_uid: String,
@@ -146,6 +169,10 @@ pub struct PublicLinkSession {
 pub struct PublicLinkClient {
     session: PublicLinkSession,
     drive: ProtonDriveClient,
+    url: String,
+    url_password: String,
+    share_passphrase: String,
+    share_id: ShareId,
 }
 
 impl PublicLinkClient {
@@ -198,6 +225,44 @@ impl PublicLinkClient {
 
     pub fn drive(&self) -> &ProtonDriveClient {
         &self.drive
+    }
+
+    pub async fn report_abuse(
+        &self,
+        settings: ReportPublicLinkShareAbuseSettings,
+    ) -> anyhow::Result<()> {
+        SharingOperations::validate_report_settings(
+            settings.abuse_category,
+            settings.bona_fide,
+            settings.reporter_message.as_deref(),
+        )?;
+        let mut link_id = settings
+            .node_uid
+            .as_ref()
+            .map(|uid| uid.link_id.raw().to_string());
+        let mut revision_id = None;
+        if let Some(revision_uid) = &settings.revision_uid {
+            link_id =
+                Some(link_id.unwrap_or_else(|| revision_uid.node_uid.link_id.raw().to_string()));
+            revision_id = Some(revision_uid.revision_id.raw().to_string());
+        }
+        self.drive
+            .api()
+            .shares()
+            .report_share_abuse(ReportShareAbuseRequest {
+                share_passphrase: STANDARD.encode(self.share_passphrase.as_bytes()),
+                member_session_key: None,
+                share_id: self.share_id.raw().to_string(),
+                abuse_category: settings.abuse_category,
+                bona_fide: true,
+                reporter_message: settings.reporter_message,
+                reporter_email: settings.reporter_email,
+                share_url: Some(self.url.clone()),
+                share_url_password: Some(self.url_password.clone()),
+                link_id,
+                revision_id,
+            })
+            .await
     }
 }
 
@@ -484,6 +549,9 @@ impl SharingOperations {
                 }
             }
         }
+        if settings.url_access.is_some() {
+            Self::ensure_url_access_owner(client, &node_uid).await?;
+        }
 
         let mut proton_users = Vec::new();
         let mut external_users = Vec::new();
@@ -524,15 +592,42 @@ impl SharingOperations {
             });
 
         for user in proton_users {
-            let already = current
+            if let Some(invitation) = current
                 .proton_invitations
                 .iter()
-                .any(|i| i.invitee_email.eq_ignore_ascii_case(&user.email))
-                || current
-                    .members
-                    .iter()
-                    .any(|m| m.invitee_email.eq_ignore_ascii_case(&user.email));
-            if already {
+                .find(|i| i.invitee_email.eq_ignore_ascii_case(&user.email))
+            {
+                if invitation.role != user.role {
+                    let (_, invitation_id) = split_sharing_uid(&invitation.uid)?;
+                    client
+                        .api()
+                        .shares()
+                        .update_invitation(
+                            ctx.share_id.clone(),
+                            invitation_id,
+                            ShareMemberPermissions::from_role(user.role).bits(),
+                        )
+                        .await?;
+                }
+                continue;
+            }
+            if let Some(member) = current
+                .members
+                .iter()
+                .find(|m| m.invitee_email.eq_ignore_ascii_case(&user.email))
+            {
+                if member.role != user.role {
+                    let (_, member_id) = split_sharing_uid(&member.uid)?;
+                    client
+                        .api()
+                        .shares()
+                        .update_member(
+                            ctx.share_id.clone(),
+                            crate::api::share::ShareMembershipId::new(member_id.to_string()),
+                            ShareMemberPermissions::from_role(user.role).bits(),
+                        )
+                        .await?;
+                }
                 continue;
             }
             Self::invite_proton(
@@ -547,11 +642,42 @@ impl SharingOperations {
             .await?;
         }
         for user in external_users {
-            let already = current
+            if let Some(invitation) = current
                 .non_proton_invitations
                 .iter()
-                .any(|i| i.invitee_email.eq_ignore_ascii_case(&user.email));
-            if already {
+                .find(|i| i.invitee_email.eq_ignore_ascii_case(&user.email))
+            {
+                if invitation.role != user.role {
+                    let (_, invitation_id) = split_sharing_uid(&invitation.uid)?;
+                    client
+                        .api()
+                        .shares()
+                        .update_external_invitation(
+                            ctx.share_id.clone(),
+                            invitation_id,
+                            ShareMemberPermissions::from_role(user.role).bits(),
+                        )
+                        .await?;
+                }
+                continue;
+            }
+            if let Some(member) = current
+                .members
+                .iter()
+                .find(|m| m.invitee_email.eq_ignore_ascii_case(&user.email))
+            {
+                if member.role != user.role {
+                    let (_, member_id) = split_sharing_uid(&member.uid)?;
+                    client
+                        .api()
+                        .shares()
+                        .update_member(
+                            ctx.share_id.clone(),
+                            crate::api::share::ShareMembershipId::new(member_id.to_string()),
+                            ShareMemberPermissions::from_role(user.role).bits(),
+                        )
+                        .await?;
+                }
                 continue;
             }
             Self::invite_external(
@@ -565,7 +691,9 @@ impl SharingOperations {
             .await?;
         }
         if let Some(url_settings) = settings.url_access {
-            if current.url_access.is_none() {
+            if let Some(url_access) = &current.url_access {
+                Self::update_public_link_on_share(client, &ctx, url_access, url_settings).await?;
+            } else {
                 Self::create_public_link_on_share(client, &ctx, url_settings).await?;
             }
         }
@@ -674,6 +802,7 @@ impl SharingOperations {
         node_uid: NodeUid,
         settings: ShareUrlSettings,
     ) -> anyhow::Result<UrlAccess> {
+        Self::ensure_url_access_owner(client, &node_uid).await?;
         let ctx = match Self::load_share_context(client, node_uid.clone()).await {
             Ok(ctx) => ctx,
             Err(_) => Self::create_share(client, node_uid.clone()).await?,
@@ -732,7 +861,7 @@ impl SharingOperations {
         }
         let salt = STANDARD.decode(response.share.share_password_salt.as_bytes())?;
         let hashed = proton_srp::mailbox_password_hash(&password, &salt)?;
-        let share_key = unlock_share_with_password(
+        let (share_key, share_passphrase) = unlock_share_with_password(
             &response.share.share_key,
             &response.share.share_passphrase,
             hashed.as_bytes(),
@@ -745,12 +874,15 @@ impl SharingOperations {
             share_key,
             public_role: response.share.public_permissions.to_role(),
         };
-        Self::create_public_link_client(client, session).await
+        Self::create_public_link_client(client, session, url, &password, share_passphrase).await
     }
 
     async fn create_public_link_client(
         parent: &ProtonDriveClient,
         session: PublicLinkSession,
+        url: &str,
+        url_password: &str,
+        share_passphrase: String,
     ) -> anyhow::Result<PublicLinkClient> {
         use crate::api::{DefaultDriveApiClients, DriveApiClients};
         use crate::block::verify::{BlockVerifierFactory, DefaultBlockVerifierFactory};
@@ -823,7 +955,7 @@ impl SharingOperations {
             })
             .await?;
         secret_cache
-            .set_share_key(share_id, session.share_key.clone())
+            .set_share_key(share_id.clone(), session.share_key.clone())
             .await?;
         let cache: Arc<dyn DriveClientCache> =
             Arc::new(DefaultDriveClientCache::new(entity_cache, secret_cache));
@@ -840,7 +972,14 @@ impl SharingOperations {
             None,
             parent.api_url().to_string(),
         );
-        Ok(PublicLinkClient { session, drive })
+        Ok(PublicLinkClient {
+            session,
+            drive,
+            url: url.to_string(),
+            url_password: url_password.to_string(),
+            share_passphrase,
+            share_id,
+        })
     }
 
     pub async fn iterate_bookmarks(client: &ProtonDriveClient) -> anyhow::Result<Vec<Bookmark>> {
@@ -949,6 +1088,212 @@ impl SharingOperations {
         client.api().shares().delete_bookmark(&token).await
     }
 
+    pub async fn report_abuse(
+        client: &ProtonDriveClient,
+        settings: ReportDirectShareAbuseSettings,
+    ) -> anyhow::Result<()> {
+        Self::validate_report_settings(
+            settings.abuse_category,
+            settings.bona_fide,
+            settings.reporter_message.as_deref(),
+        )?;
+        if let Some(invitation_uid) = settings.invitation_uid.clone() {
+            return Self::report_invitation_abuse(client, settings, &invitation_uid).await;
+        }
+
+        let (share_id, root_uid) = Self::find_share_root(client, settings.node_uid.clone()).await?;
+        let (share_passphrase, member_session_key) =
+            Self::decrypt_share_passphrase_for_report(client, share_id.clone(), root_uid).await?;
+        let mut link_id = Some(settings.node_uid.link_id.raw().to_string());
+        let mut revision_id = None;
+        if let Some(revision_uid) = settings.revision_uid {
+            link_id = Some(revision_uid.node_uid.link_id.raw().to_string());
+            revision_id = Some(revision_uid.revision_id.raw().to_string());
+        }
+        client
+            .api()
+            .shares()
+            .report_share_abuse(ReportShareAbuseRequest {
+                share_passphrase: STANDARD.encode(share_passphrase.as_bytes()),
+                member_session_key,
+                share_id: share_id.raw().to_string(),
+                abuse_category: settings.abuse_category,
+                bona_fide: true,
+                reporter_message: settings.reporter_message,
+                reporter_email: settings.reporter_email,
+                share_url: None,
+                share_url_password: None,
+                link_id,
+                revision_id,
+            })
+            .await
+    }
+
+    async fn report_invitation_abuse(
+        client: &ProtonDriveClient,
+        settings: ReportDirectShareAbuseSettings,
+        invitation_uid: &str,
+    ) -> anyhow::Result<()> {
+        let (share_id, invitation_id) = split_sharing_uid(invitation_uid)?;
+        let details = client.api().shares().get_invitation(invitation_id).await?;
+        let address = client.account().get_default_address().await?;
+        let keys = client
+            .account()
+            .get_address_private_keys(&AddressId::new(address.address_id))
+            .await?;
+        let pgp_keys: Vec<PgpPrivateKey> = keys.into_iter().map(PgpPrivateKey).collect();
+        let claim = crate::node::authorship::AuthorshipClaim {
+            keys: vec![],
+            author: crate::author::Author::ANONYMOUS,
+            key_retrieval_error_message: None,
+        };
+        let (passphrase, _, _) =
+            NodeCrypto::decrypt_message(&details.share.passphrase, None, &pgp_keys, &claim)
+                .map_err(|error| anyhow::anyhow!(error))?;
+        let share_passphrase = String::from_utf8_lossy(&passphrase).into_owned();
+        let key_packet = STANDARD.decode(details.invitation.key_packet.as_bytes())?;
+        let member_session_key = decrypt_member_session_key(&pgp_keys, &key_packet);
+        client
+            .api()
+            .shares()
+            .report_share_abuse(ReportShareAbuseRequest {
+                share_passphrase: STANDARD.encode(share_passphrase.as_bytes()),
+                member_session_key,
+                share_id: share_id.to_string(),
+                abuse_category: settings.abuse_category,
+                bona_fide: true,
+                reporter_message: settings.reporter_message,
+                reporter_email: settings.reporter_email,
+                share_url: None,
+                share_url_password: None,
+                link_id: Some(details.link.link_id.raw().to_string()),
+                revision_id: None,
+            })
+            .await
+    }
+
+    pub fn validate_report_settings(
+        category: AbuseCategory,
+        bona_fide: bool,
+        reporter_message: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if !bona_fide {
+            anyhow::bail!(ProtonDriveError::Validation(
+                "You must confirm the report is submitted in good faith".into()
+            ));
+        }
+        if category.requires_message() && reporter_message.unwrap_or("").trim().is_empty() {
+            anyhow::bail!(ProtonDriveError::Validation(
+                "A message is required when reporting copyright infringement or stolen data".into()
+            ));
+        }
+        Ok(())
+    }
+
+    async fn find_share_root(
+        client: &ProtonDriveClient,
+        node_uid: NodeUid,
+    ) -> anyhow::Result<(ShareId, NodeUid)> {
+        let mut current_uid = node_uid.clone();
+        let mut visited = std::collections::HashSet::new();
+        loop {
+            if !visited.insert(current_uid.clone()) {
+                anyhow::bail!("Folder structure loop detected");
+            }
+            match crate::node::operations::NodeOperations::get_node_metadata(
+                client,
+                current_uid.clone(),
+            )
+            .await
+            {
+                Ok(metadata) => {
+                    if let Ok(result) = metadata.result() {
+                        if let Some(share_id) = result.membership_share_id {
+                            return Ok((share_id, current_uid));
+                        }
+                        if let Some(parent_uid) = result.inner.parent_uid() {
+                            current_uid = parent_uid.clone();
+                            continue;
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+            let response = client
+                .api()
+                .links()
+                .get_context_share(node_uid.volume_id.clone(), node_uid.link_id.clone())
+                .await?;
+            let share = client
+                .api()
+                .shares()
+                .get_share(response.context_share_id.clone())
+                .await?;
+            return Ok((
+                response.context_share_id,
+                NodeUid::new(share.volume_id, share.root_link_id),
+            ));
+        }
+    }
+
+    async fn decrypt_share_passphrase_for_report(
+        client: &ProtonDriveClient,
+        share_id: ShareId,
+        root_uid: NodeUid,
+    ) -> anyhow::Result<(String, Option<String>)> {
+        let secrets = Self::node_secrets(client, root_uid).await?;
+        let response = client.api().shares().get_share(share_id).await?;
+        let claim = crate::node::authorship::AuthorshipClaim {
+            keys: vec![],
+            author: crate::author::Author::ANONYMOUS,
+            key_retrieval_error_message: None,
+        };
+        let decrypted = NodeCrypto::decrypt_message(
+            &response.passphrase,
+            Some(&response.passphrase_signature),
+            [&secrets.key],
+            &claim,
+        );
+        let (passphrase, _, _) = match decrypted {
+            Ok(value) => value,
+            Err(_) => {
+                let address_keys = client
+                    .account()
+                    .get_address_private_keys(&response.address_id)
+                    .await?
+                    .into_iter()
+                    .map(PgpPrivateKey)
+                    .collect::<Vec<_>>();
+                NodeCrypto::decrypt_message(
+                    &response.passphrase,
+                    Some(&response.passphrase_signature),
+                    &address_keys,
+                    &claim,
+                )
+                .map_err(|error| anyhow::anyhow!(error))?
+            }
+        };
+        let share_passphrase = String::from_utf8_lossy(&passphrase).into_owned();
+        let mut member_session_key = None;
+        if let Some(membership) = response.memberships.first() {
+            let mut keys = client
+                .account()
+                .get_address_private_keys(&membership.address_id)
+                .await
+                .unwrap_or_default();
+            if keys.is_empty() {
+                keys = client
+                    .account()
+                    .get_address_private_keys(&response.address_id)
+                    .await
+                    .unwrap_or_default();
+            }
+            let pgp_keys: Vec<PgpPrivateKey> = keys.into_iter().map(PgpPrivateKey).collect();
+            member_session_key = decrypt_member_session_key(&pgp_keys, &membership.key_packet);
+        }
+        Ok((share_passphrase, member_session_key))
+    }
+
     async fn node_share_id(
         client: &ProtonDriveClient,
         node_uid: NodeUid,
@@ -957,6 +1302,19 @@ impl SharingOperations {
             .await?
             .result()?;
         Ok(metadata.membership_share_id)
+    }
+
+    async fn ensure_url_access_owner(
+        client: &ProtonDriveClient,
+        node_uid: &NodeUid,
+    ) -> anyhow::Result<()> {
+        let root = client.get_my_files_folder().await?;
+        if root.base.uid.volume_id != node_uid.volume_id {
+            anyhow::bail!(ProtonDriveError::Validation(
+                "You can create public links for your own files only".into()
+            ));
+        }
+        Ok(())
     }
 
     async fn node_secrets(
@@ -1190,27 +1548,12 @@ impl SharingOperations {
         ctx: &ShareContext,
         settings: ShareUrlSettings,
     ) -> anyhow::Result<()> {
-        if settings.role == MemberRole::Admin {
-            anyhow::bail!("Cannot set admin role for URL access.");
-        }
         let generated = random_password(PUBLIC_LINK_PASSWORD_LEN);
         let password = match &settings.custom_password {
             Some(custom) => format!("{generated}{custom}"),
             None => generated,
         };
-        let includes_custom = settings.custom_password.is_some();
-        let modulus = client.api().shares().get_srp_modulus().await?;
-        let verifier = SRPAuth::generate_verifier_with_pgp(&password, None, &modulus.modulus)?;
-        let verifier_b64: SRPVerifierB64 = verifier.into();
-        let mut salt_bytes = [0u8; 16];
-        rand::rng().fill(&mut salt_bytes);
-        let salt = STANDARD.encode(salt_bytes);
-        let salted = proton_srp::mailbox_password_hash(&password, &salt_bytes)?;
-        let key_packet = Encryptor::default()
-            .with_passphrase(salted.as_bytes())
-            .encrypt_session_key(&ctx.passphrase_session_key.to_rpgp_sk()?)?;
-        let encryptor = Encryptor::default().with_encryption_key(ctx.address_key.0.as_public_key());
-        let armored_password = String::from_utf8(encryptor.encrypt(password.as_bytes())?.armor()?)?;
+        let request = Self::build_public_link_request(client, ctx, &settings, &password).await?;
         client
             .api()
             .shares()
@@ -1218,20 +1561,78 @@ impl SharingOperations {
                 ctx.share_id.clone(),
                 CreateShareUrlRequest {
                     creator_email: ctx.email.clone(),
-                    permissions: ShareMemberPermissions::from_role(settings.role).bits(),
-                    flags: if includes_custom { 3 } else { 2 },
-                    expiration_time: settings.expiration.map(|t| t.timestamp()),
-                    share_password_salt: salt,
-                    share_passphrase_key_packet: STANDARD.encode(key_packet),
-                    password: armored_password,
-                    url_password_salt: verifier_b64.salt,
-                    srp_verifier: verifier_b64.verifier,
-                    srp_modulus_id: modulus.modulus_id,
-                    max_accesses: 0,
+                    permissions: request.permissions,
+                    flags: request.flags,
+                    expiration_time: request.expiration_time,
+                    share_password_salt: request.share_password_salt,
+                    share_passphrase_key_packet: request.share_passphrase_key_packet,
+                    password: request.password,
+                    url_password_salt: request.url_password_salt,
+                    srp_verifier: request.srp_verifier,
+                    srp_modulus_id: request.srp_modulus_id,
+                    max_accesses: request.max_accesses,
                 },
             )
             .await?;
         Ok(())
+    }
+
+    async fn update_public_link_on_share(
+        client: &ProtonDriveClient,
+        ctx: &ShareContext,
+        url_access: &UrlAccess,
+        settings: ShareUrlSettings,
+    ) -> anyhow::Result<()> {
+        let generated = generated_password_for_update(&url_access.url)?;
+        let password = match &settings.custom_password {
+            Some(custom) => format!("{generated}{custom}"),
+            None => generated.to_string(),
+        };
+        let request = Self::build_public_link_request(client, ctx, &settings, &password).await?;
+        let (_, url_id) = split_sharing_uid(&url_access.uid)?;
+        client
+            .api()
+            .shares()
+            .update_share_url(ctx.share_id.clone(), url_id, request)
+            .await
+    }
+
+    async fn build_public_link_request(
+        client: &ProtonDriveClient,
+        ctx: &ShareContext,
+        settings: &ShareUrlSettings,
+        password: &str,
+    ) -> anyhow::Result<UpdateShareUrlRequest> {
+        if settings.role == MemberRole::Admin {
+            anyhow::bail!("Cannot set admin role for URL access.");
+        }
+        let modulus = client.api().shares().get_srp_modulus().await?;
+        let verifier = SRPAuth::generate_verifier_with_pgp(password, None, &modulus.modulus)?;
+        let verifier_b64: SRPVerifierB64 = verifier.into();
+        let mut salt_bytes = [0u8; 16];
+        rand::rng().fill(&mut salt_bytes);
+        let share_password_salt = STANDARD.encode(salt_bytes);
+        let salted = proton_srp::mailbox_password_hash(password, &salt_bytes)?;
+        let key_packet = Encryptor::default()
+            .with_passphrase(salted.as_bytes())
+            .encrypt_session_key(&ctx.passphrase_session_key.to_rpgp_sk()?)?;
+        let encryptor = Encryptor::default().with_encryption_key(ctx.address_key.0.as_public_key());
+        Ok(UpdateShareUrlRequest {
+            permissions: ShareMemberPermissions::from_role(settings.role).bits(),
+            flags: if settings.custom_password.is_some() {
+                3
+            } else {
+                2
+            },
+            expiration_time: settings.expiration.map(|t| t.timestamp()),
+            share_password_salt,
+            share_passphrase_key_packet: STANDARD.encode(key_packet),
+            password: String::from_utf8(encryptor.encrypt(password.as_bytes())?.armor()?)?,
+            url_password_salt: verifier_b64.salt,
+            srp_verifier: verifier_b64.verifier,
+            srp_modulus_id: modulus.modulus_id,
+            max_accesses: 0,
+        })
     }
 
     async fn decrypt_url_access(
@@ -1307,7 +1708,7 @@ fn unlock_share_with_password(
     armored_key: &crate::pgp::PgpArmoredPrivateKey,
     armored_passphrase: &crate::pgp::PgpArmoredMessage,
     password: &[u8],
-) -> anyhow::Result<PgpPrivateKey> {
+) -> anyhow::Result<(PgpPrivateKey, String)> {
     let decryptor = proton_rpgp::Decryptor::default().with_passphrase(password);
     let unarmored = if armored_passphrase.0.contains("-----BEGIN PGP MESSAGE-----") {
         proton_rpgp::armor::unarmor(armored_passphrase.0.as_bytes())?
@@ -1315,9 +1716,21 @@ fn unlock_share_with_password(
         armored_passphrase.0.as_bytes().to_vec()
     };
     let passphrase = decryptor.decrypt(&unarmored, DataEncoding::Auto)?;
-    NodeCrypto::unlock_key_with_passphrase(armored_key, &passphrase.data)
+    let share_key = NodeCrypto::unlock_key_with_passphrase(armored_key, &passphrase.data)
         .or_else(|_| NodeCrypto::unlock_key_with_passphrase(armored_key, password))
-        .map_err(|e| anyhow::anyhow!(e))
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok((
+        share_key,
+        String::from_utf8_lossy(&passphrase.data).into_owned(),
+    ))
+}
+
+fn decrypt_member_session_key(keys: &[PgpPrivateKey], key_packet: &[u8]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        key.decrypt_session_key(key_packet)
+            .ok()
+            .map(|session_key| STANDARD.encode(session_key.key))
+    })
 }
 
 fn random_password(len: usize) -> String {
@@ -1327,6 +1740,16 @@ fn random_password(len: usize) -> String {
             GENERATED_PASSWORD_CHARSET[idx] as char
         })
         .collect()
+}
+
+fn generated_password_for_update(url: &str) -> anyhow::Result<&str> {
+    let generated = url.split_once('#').map(|(_, password)| password);
+    match generated.filter(|password| password.len() == PUBLIC_LINK_PASSWORD_LEN) {
+        Some(password) => Ok(password),
+        None => anyhow::bail!(ProtonDriveError::Validation(
+            "Legacy public link cannot be updated. Please re-create a new public link.".into()
+        )),
+    }
 }
 
 fn split_generated_and_custom(password: &str, flags: u32) -> (String, Option<String>) {
@@ -1459,5 +1882,23 @@ mod tests {
                 .bytes()
                 .all(|byte| GENERATED_PASSWORD_CHARSET.contains(&byte))
         );
+    }
+
+    #[test]
+    fn report_settings_require_bona_fide_and_message_for_copyright() {
+        SharingOperations::validate_report_settings(AbuseCategory::Spam, true, None).unwrap();
+        assert!(
+            SharingOperations::validate_report_settings(AbuseCategory::Spam, false, None).is_err()
+        );
+        assert!(
+            SharingOperations::validate_report_settings(AbuseCategory::Copyright, true, None)
+                .is_err()
+        );
+        SharingOperations::validate_report_settings(
+            AbuseCategory::Copyright,
+            true,
+            Some("taken without permission"),
+        )
+        .unwrap();
     }
 }

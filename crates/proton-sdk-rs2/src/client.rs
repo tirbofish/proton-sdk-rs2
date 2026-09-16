@@ -100,7 +100,9 @@ impl ProtonClientConfiguration {
                 .entity_cache_repository
                 .unwrap_or(Arc::new(InMemoryCacheRepository::new())),
             telemetry: options.telemetry.unwrap_or(Arc::new(NullTelemetry {})),
-            feature_flag_provider: Arc::new(AlwaysDisabledFeatureFlagProvider),
+            feature_flag_provider: options
+                .feature_flag_provider
+                .unwrap_or_else(|| Arc::new(AlwaysDisabledFeatureFlagProvider)),
             refresh_redirect_uri: options
                 .refresh_redirect_uri
                 .unwrap_or(ProtonApiDefaults::refresh_redirect_uri()),
@@ -162,7 +164,10 @@ impl ProtonClientConfiguration {
             .pool_max_idle_per_host(10)
             .pool_idle_timeout(std::time::Duration::from_secs(90));
 
-        if !matches!(self.tls_policy, ProtonClientTlsPolicy::Strict) {
+        // `NoCertificatePinning` keeps normal WebPKI validation; this client
+        // does not install a pinning callback. Only the explicitly unsafe
+        // policy disables certificate validation.
+        if self.tls_policy.disables_certificate_validation() {
             builder = builder.danger_accept_invalid_certs(true);
         }
 
@@ -261,4 +266,52 @@ pub enum ProtonClientTlsPolicy {
     Strict = 0,
     NoCertificatePinning = 1,
     NoCertificateValidation = 2,
+}
+
+impl ProtonClientTlsPolicy {
+    fn disables_certificate_validation(self) -> bool {
+        matches!(self, Self::NoCertificateValidation)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::AppVersionConfiguration;
+
+    struct EnabledFeatureFlagProvider;
+
+    #[async_trait::async_trait]
+    impl FeatureFlagProvider for EnabledFeatureFlagProvider {
+        async fn is_enabled(&self, _flag_name: String) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn configuration_preserves_supplied_feature_flag_provider() {
+        let configuration = ProtonClientConfiguration::new(
+            AppVersionConfiguration::new("test", 1, 0, 0),
+            ProtonClientOptions {
+                feature_flag_provider: Some(Arc::new(EnabledFeatureFlagProvider)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            configuration
+                .feature_flag_provider
+                .is_enabled("test".into())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn only_explicit_no_validation_disables_certificate_checks() {
+        assert!(!ProtonClientTlsPolicy::Strict.disables_certificate_validation());
+        assert!(!ProtonClientTlsPolicy::NoCertificatePinning.disables_certificate_validation());
+        assert!(ProtonClientTlsPolicy::NoCertificateValidation.disables_certificate_validation());
+    }
 }

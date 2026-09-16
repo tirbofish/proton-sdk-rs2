@@ -1,8 +1,8 @@
 use crate::api::share::ShareTargetType;
 use crate::client::ProtonDriveClient;
 use crate::error::ProtonDriveError;
-use crate::node::secrets::ShareAndKey;
 use crate::node::NodeUid;
+use crate::node::secrets::ShareAndKey;
 use crate::pgp::{PgpArmoredMessage, PgpArmoredPrivateKey, PgpArmoredSignature, PgpPrivateKey};
 use crate::share::{Share, ShareId};
 use crate::volume::VolumeId;

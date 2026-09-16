@@ -22,7 +22,7 @@ use crate::node::file::FileOperations;
 use crate::node::file::FileThumbnail;
 use crate::node::file::download::FileDownloader;
 use crate::node::file::upload::FileUploader;
-use crate::node::folder::{FolderNode, FolderOperations};
+use crate::node::folder::{FolderNode, FolderOperations, FolderSizeInfo};
 use crate::node::operations::NodeOperations;
 use crate::node::revision::{
     REVISION_WRITER_DEFAULT_BLOCK_SIZE, RevisionInfo, RevisionState, RevisionUid,
@@ -594,6 +594,14 @@ impl ProtonDriveClient {
         last_modification_time: Option<std::time::SystemTime>,
     ) -> anyhow::Result<FolderNode> {
         FolderOperations::create(self, parent_id, name, last_modification_time).await
+    }
+
+    /// Calculates the size of a folder, including all active and trashed descendants.
+    pub async fn get_folder_size(
+        &self,
+        folder_uid: impl Into<NodeUid>,
+    ) -> anyhow::Result<FolderSizeInfo> {
+        FolderOperations::get_folder_size(self, folder_uid.into()).await
     }
 
     /// Enumerate children of a folder, streaming items as they are fetched and
@@ -1246,6 +1254,13 @@ impl ProtonDriveClient {
 
     pub async fn remove_bookmark(&self, bookmark_or_url: &str) -> anyhow::Result<()> {
         crate::sharing::SharingOperations::remove_bookmark(self, bookmark_or_url).await
+    }
+
+    pub async fn report_abuse(
+        &self,
+        settings: crate::sharing::ReportDirectShareAbuseSettings,
+    ) -> anyhow::Result<()> {
+        crate::sharing::SharingOperations::report_abuse(self, settings).await
     }
 
     pub async fn subscribe_to_tree_events(

@@ -29,6 +29,47 @@ impl AlternateFileNameGenerator {
     }
 }
 
+pub fn split_extension(filename: &str) -> (&str, &str) {
+    split_name_and_extension(filename)
+}
+
+pub fn join_name_and_extension(name: &str, index: usize, extension: &str) -> String {
+    match (name.is_empty(), extension.is_empty()) {
+        (true, true) => format!("({index})"),
+        (true, false) => format!("({index}).{extension}"),
+        (false, true) => format!("{name} ({index})"),
+        (false, false) => format!("{name} ({index}).{extension}"),
+    }
+}
+
+pub fn batch<T: Clone>(items: &[T], batch_size: usize) -> Vec<Vec<T>> {
+    if batch_size == 0 {
+        panic!("Batch size must be greater than 0");
+    }
+    items
+        .chunks(batch_size)
+        .map(|chunk| chunk.to_vec())
+        .collect()
+}
+
+pub async fn wait_for_condition<F>(mut callback: F, aborted: bool) -> anyhow::Result<()>
+where
+    F: FnMut() -> bool,
+{
+    if aborted {
+        anyhow::bail!(crate::error::ProtonDriveError::abort());
+    }
+    loop {
+        if aborted {
+            anyhow::bail!(crate::error::ProtonDriveError::abort());
+        }
+        if callback() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 fn split_name_and_extension(file_name: &str) -> (&str, &str) {
     if let Some((stem, extension)) = file_name.rsplit_once('.') {
         if !stem.is_empty() && !extension.is_empty() {
@@ -208,5 +249,35 @@ mod tests {
         );
         assert_eq!(split_name_and_extension("dot."), ("dot.", ""));
         assert_eq!(split_name_and_extension(".gitignore"), (".gitignore", ""));
+    }
+
+    #[test]
+    fn join_name_and_extension_matches_typescript() {
+        assert_eq!(
+            join_name_and_extension("document", 1, "pdf"),
+            "document (1).pdf"
+        );
+        assert_eq!(join_name_and_extension("", 2, "txt"), "(2).txt");
+        assert_eq!(join_name_and_extension("document", 3, ""), "document (3)");
+        assert_eq!(join_name_and_extension("", 4, ""), "(4)");
+    }
+
+    #[test]
+    fn batch_chunks_like_typescript() {
+        assert_eq!(
+            batch(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 3),
+            vec![vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9], vec![10]]
+        );
+        assert_eq!(batch(&[1, 2, 3, 4, 5], 5), vec![vec![1, 2, 3, 4, 5]]);
+        assert_eq!(batch(&[1, 2, 3], 10), vec![vec![1, 2, 3]]);
+        assert_eq!(batch(&[1, 2, 3], 1), vec![vec![1], vec![2], vec![3]]);
+        let empty: Vec<i32> = Vec::new();
+        assert!(batch(&empty, 3).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "Batch size must be greater than 0")]
+    fn batch_rejects_zero_size() {
+        let _ = batch(&[1, 2, 3], 0);
     }
 }

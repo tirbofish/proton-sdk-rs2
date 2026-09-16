@@ -1,0 +1,24 @@
+pkgname=pdcli
+pkgver=0.3.0
+pkgrel=1
+pkgdesc='Proton Drive command-line client and filesystem daemon'
+arch=('x86_64' 'aarch64')
+url='https://github.com/tirbofish/proton-sdk-rs2'
+license=('MIT')
+depends=('fuse3' 'gtk3' 'libxdo' 'libayatana-appindicator')
+makedepends=('cargo' 'protobuf' 'pkgconf')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/tirbofish/proton-sdk-rs2/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$srcdir/proton-sdk-rs2-$pkgver"
+  cargo build --locked --release -p pdcli
+}
+
+package() {
+  cd "$srcdir/proton-sdk-rs2-$pkgver"
+  install -Dm755 target/release/pdcli "$pkgdir/usr/bin/pdcli"
+  install -Dm644 packaging/systemd/pdcli.service \
+    "$pkgdir/usr/lib/systemd/user/pdcli.service"
+  install -Dm644 LICENSE.md "$pkgdir/usr/share/licenses/$pkgname/LICENSE.md"
+}

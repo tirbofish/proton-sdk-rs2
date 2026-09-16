@@ -4,7 +4,9 @@ use std::sync::Arc;
 use platform_dirs::AppDirs;
 use proton_drive_sdk::cache::encrypted::EncryptedCacheRepository;
 use proton_drive_sdk::cache::sqlite::SqliteCacheRepository;
-use proton_sdk_rs2::{cache::CacheRepository, ser::StoredCredentials, session::ProtonAPISession};
+use proton_drive_sdk::proton_sdk_rs2::{
+    cache::CacheRepository, ser::StoredCredentials, session::ProtonAPISession,
+};
 use rand::Rng;
 
 const APP_NAME: &str = "pdcli";

@@ -208,6 +208,13 @@ impl BlockDownloader {
                     {
                         return Err(e);
                     }
+
+                    if e.downcast_ref::<crate::error::HttpTransferError>()
+                        .is_some_and(|error| !error.is_retryable())
+                    {
+                        return Err(e);
+                    }
+
                     last_err = Some(e);
                 }
             }
@@ -436,9 +443,18 @@ impl RevisionReader {
             let bare_url = block_dto.bare_url.clone();
             let token = block_dto.token.clone();
             let ck = content_key.clone();
+            let revision_uid = self.state.uid.clone();
 
             let handle = tokio::spawn(async move {
-                Self::download_and_decrypt_block(&client, idx, &bare_url, &token, &ck).await
+                Self::download_and_decrypt_block(
+                    &client,
+                    &revision_uid,
+                    idx,
+                    &bare_url,
+                    &token,
+                    &ck,
+                )
+                .await
             });
             download_futures.push(handle);
         }
@@ -465,10 +481,18 @@ impl RevisionReader {
                     let bare_url = block_dto.bare_url.clone();
                     let token = block_dto.token.clone();
                     let ck = content_key.clone();
+                    let revision_uid = self.state.uid.clone();
 
                     let handle = tokio::spawn(async move {
-                        Self::download_and_decrypt_block(&client, next_idx, &bare_url, &token, &ck)
-                            .await
+                        Self::download_and_decrypt_block(
+                            &client,
+                            &revision_uid,
+                            next_idx,
+                            &bare_url,
+                            &token,
+                            &ck,
+                        )
+                        .await
                     });
                     download_futures.push(handle);
                 }
@@ -528,6 +552,7 @@ impl RevisionReader {
         let block_dto = &self.state.revision_dto.blocks[(block_index - 1) as usize];
         let (_, data, _) = Self::download_and_decrypt_block(
             &self.client,
+            &self.state.uid,
             block_index,
             &block_dto.bare_url,
             &block_dto.token,
@@ -540,42 +565,25 @@ impl RevisionReader {
     /// Download and decrypt a single block, returning (block_index, decrypted_data, sha256_digest).
     async fn download_and_decrypt_block(
         client: &ProtonDriveClient,
+        revision_uid: &RevisionUid,
         block_index: i32,
         bare_url: &str,
         token: &str,
         content_key: &PgpSessionKey,
     ) -> anyhow::Result<(i32, Vec<u8>, Vec<u8>)> {
-        let _permit = client.block_downloader().queue.start_block().await?;
-        let response = client
-            .api()
-            .storage()
-            .get_blob_stream(bare_url, token)
+        let mut data = Vec::new();
+        let digest = client
+            .block_downloader()
+            .download(
+                client,
+                revision_uid.clone(),
+                block_index,
+                bare_url.to_owned(),
+                token.to_owned(),
+                content_key.clone(),
+                &mut data,
+            )
             .await?;
-        let blob_bytes = response.bytes().await?;
-
-        // Hash the encrypted bytes for verification
-        let mut hasher = Sha256::new();
-        hasher.update(&blob_bytes);
-        let digest = hasher.finalize().to_vec();
-
-        let data = match content_key.decrypt(&blob_bytes) {
-            Ok(data) => data,
-            Err(e) => {
-                error!("Failed to decrypt block {}: {:?}", block_index, e);
-                client
-                    .telemetry()
-                    .record_metric("decryptionError".into(), Some(e.to_string().into_bytes()))
-                    .await;
-                return Err(FileContentsDecryptionException::WithCause(e).into());
-            }
-        };
-
-        debug!(
-            "Block {} decrypted: {} encrypted -> {} decrypted bytes",
-            block_index,
-            blob_bytes.len(),
-            data.len()
-        );
 
         Ok((block_index, data, digest))
     }

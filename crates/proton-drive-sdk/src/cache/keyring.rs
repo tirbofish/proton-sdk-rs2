@@ -214,6 +214,13 @@ mod tests {
     /// persistence test
     #[tokio::test]
     async fn test_keyring_persistence() {
+        if std::env::var_os("PROTON_DRIVE_RUN_KEYRING_TESTS").is_none() {
+            // The Linux Secret Service backend requires a user session and a
+            // running D-Bus daemon. Keep the default test suite hermetic;
+            // opt in when the host provides a real keyring.
+            return;
+        }
+
         let cache = KeyringSecretCache::new("proton-drive-sdk-test");
         let test_key = "persistent_test_key".to_string();
         let test_value = "persistent_test_value".to_string();

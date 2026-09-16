@@ -921,10 +921,17 @@ impl DtoToMetadataConverter {
 
         let share_id = match &link_details.sharing {
             Some(sharing) => Some(sharing.share_id.clone()),
-            None => client.cache().entities().try_get_my_files_share_id().await?,
+            None => {
+                client
+                    .cache()
+                    .entities()
+                    .try_get_my_files_share_id()
+                    .await?
+            }
         };
         if let Some(share_id) = share_id {
-            let share_and_key = crate::share_ops::ShareOperations::get_share(client, share_id).await?;
+            let share_and_key =
+                crate::share_ops::ShareOperations::get_share(client, share_id).await?;
             return Ok(Some(share_and_key.key));
         }
 

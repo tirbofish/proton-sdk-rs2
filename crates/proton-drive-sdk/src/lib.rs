@@ -32,6 +32,7 @@
 //! ```
 
 pub mod account;
+pub mod additional_metadata;
 pub mod api;
 pub mod author;
 pub mod block;
@@ -39,6 +40,8 @@ pub mod cache;
 pub mod client;
 pub mod crypto;
 pub mod device_ops;
+pub mod diagnostic;
+pub mod easy_switch;
 pub mod error;
 pub mod events;
 pub mod http;

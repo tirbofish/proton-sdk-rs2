@@ -9,8 +9,8 @@ use proton_drive_sdk::device_ops::Device;
 use proton_drive_sdk::futures::StreamExt;
 use proton_drive_sdk::node::revision::RevisionUid;
 use proton_drive_sdk::node::{Node, NodeUid};
+use proton_drive_sdk::proton_sdk_rs2::session::ProtonAPISession;
 use proton_drive_sdk::utils::PotentialObject;
-use proton_sdk_rs2::session::ProtonAPISession;
 use serde::{Deserialize, Serialize};
 
 use crate::{credentials, daemon, flags, fs};
@@ -166,6 +166,30 @@ pub async fn run_cli(
     force_offline: bool,
     command: Option<flags::ComputersCommand>,
 ) -> anyhow::Result<()> {
+    if let Some(flags::ComputersCommand::Sync {
+        path,
+        name,
+        dry_run: true,
+    }) = &command
+    {
+        let local_path = expand_path(&path.to_string_lossy());
+        validate_sync_path(&local_path)?;
+        let local_path = std::fs::canonicalize(&local_path).unwrap_or(local_path);
+        let folder_name = name.clone().unwrap_or_else(|| {
+            local_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Backup")
+                .to_string()
+        });
+        println!(
+            "dry-run: would sync {} -> {} (conflicts become timestamped copies)",
+            local_path.display(),
+            folder_name
+        );
+        return Ok(());
+    }
+
     let session = daemon::restore_session(force_offline).await?;
     let drive = open_drive(&session).await?;
     match command {
@@ -211,8 +235,15 @@ pub async fn run_cli(
             let device = register(&drive, name, bind).await?;
             println!("registered as {} ({})", device.name, device.device_id);
         }
-        Some(flags::ComputersCommand::Sync { path, name }) => {
-            let job = add_sync(&drive, expand_path(&path.to_string_lossy()), name).await?;
+        Some(flags::ComputersCommand::Sync {
+            path,
+            name,
+            dry_run,
+        }) => {
+            let local_path = expand_path(&path.to_string_lossy());
+            validate_sync_path(&local_path)?;
+            anyhow::ensure!(!dry_run, "dry-run was already handled");
+            let job = add_sync(&drive, local_path, name).await?;
             finish_job(&drive, &job).await?;
             println!("syncing {} -> {}", job.local_path, job.name);
         }
@@ -305,12 +336,7 @@ pub async fn add_sync(
     name: Option<String>,
 ) -> anyhow::Result<SyncJob> {
     let local_path = std::fs::canonicalize(&local_path).unwrap_or(local_path);
-    anyhow::ensure!(
-        local_path.is_dir(),
-        "{} is not a directory",
-        local_path.display()
-    );
-    reject_mount_path(&local_path)?;
+    validate_sync_path(&local_path)?;
 
     let device = register(drive, None, None).await?;
     let folder_name = name.unwrap_or_else(|| {
@@ -428,6 +454,11 @@ fn reject_mount_path(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_sync_path(path: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(path.is_dir(), "{} is not a directory", path.display());
+    reject_mount_path(path)
+}
+
 async fn resolve_remote_folder(
     drive: &ProtonDriveClient,
     mut current: NodeUid,
@@ -541,6 +572,10 @@ async fn sync_tree(drive: &ProtonDriveClient, local: &Path, remote: NodeUid) -> 
         let Some(name) = name.to_str() else {
             continue;
         };
+        // Conflict copies are recovery artifacts, not new backup inputs.
+        if is_conflict_name(name) {
+            continue;
+        }
         let file_type = entry.file_type()?;
         if file_type.is_symlink() {
             continue;
@@ -571,8 +606,21 @@ async fn sync_tree(drive: &ProtonDriveClient, local: &Path, remote: NodeUid) -> 
                 Some(child) => {
                     let local_mtime = file_mtime(&path);
                     if local_mtime > child.mtime {
+                        let conflict = copy_conflict_file(&path, "remote")?;
+                        download_file(drive, child, &conflict).await?;
+                        tracing::warn!(
+                            path = %path.display(),
+                            conflict = %conflict.display(),
+                            "local and remote changed; preserved the remote copy"
+                        );
                         upload_revision(drive, child, &path).await?;
                     } else if child.mtime > local_mtime {
+                        let conflict = copy_conflict_file(&path, "local")?;
+                        tracing::warn!(
+                            path = %path.display(),
+                            conflict = %conflict.display(),
+                            "local and remote changed; preserved the local copy"
+                        );
                         download_file(drive, child, &path).await?;
                     }
                 }
@@ -581,7 +629,7 @@ async fn sync_tree(drive: &ProtonDriveClient, local: &Path, remote: NodeUid) -> 
         }
     }
 
-    // ponytail: last-write-wins, no deletes. add a recycle confirm if mirroring is required.
+    // ponytail: no deletes. add a recycle confirm if mirroring is required.
     for child in &remote_children {
         if seen.contains(&child.name) {
             continue;
@@ -595,6 +643,43 @@ async fn sync_tree(drive: &ProtonDriveClient, local: &Path, remote: NodeUid) -> 
         }
     }
     Ok(())
+}
+
+fn is_conflict_name(name: &str) -> bool {
+    name.contains(" (pdcli conflict ")
+}
+
+fn copy_conflict_file(path: &Path, side: &str) -> anyhow::Result<PathBuf> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("{} is not a valid UTF-8 filename", path.display()))?;
+    let (stem, extension) = file_name
+        .rsplit_once('.')
+        .filter(|(stem, extension)| !stem.is_empty() && !extension.is_empty())
+        .map_or((file_name, ""), |parts| parts);
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    for index in 0..1000 {
+        let suffix = if extension.is_empty() {
+            String::new()
+        } else {
+            format!(".{extension}")
+        };
+        let candidate = parent.join(format!(
+            "{stem} (pdcli conflict {side} {stamp}{index}){suffix}"
+        ));
+        if !candidate.exists() {
+            std::fs::copy(path, &candidate)?;
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!("could not create a conflict copy for {}", path.display())
 }
 
 fn file_mtime(path: &Path) -> i64 {
@@ -1233,5 +1318,11 @@ mod tests {
         assert!(state.add_job(job("/tmp/a")).is_err());
         assert!(state.remove_job("Documents"));
         assert!(state.jobs.is_empty());
+    }
+
+    #[test]
+    fn conflict_copies_are_not_resynced() {
+        assert!(is_conflict_name("notes (pdcli conflict local 1230).txt"));
+        assert!(!is_conflict_name("notes.txt"));
     }
 }

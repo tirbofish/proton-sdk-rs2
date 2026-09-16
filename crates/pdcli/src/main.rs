@@ -1,9 +1,11 @@
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use clap::Parser;
+use serde::Serialize;
 
 use crate::app::ProtonDrive;
-use crate::flags::{Cli, Command, is_wsl};
+use crate::flags::{Cli, Command, ServiceCommand, is_wsl};
 
 mod app;
 mod auth;
@@ -14,9 +16,14 @@ mod db;
 mod flags;
 mod fs;
 mod pdignore;
+mod quoted;
+mod service;
+mod share;
+mod takeout;
 mod thumbnail;
 mod transfer;
 mod tray;
+mod version;
 
 #[tokio::main]
 async fn main() {
@@ -44,7 +51,8 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         }
         Some(Command::Login) => cmd_login().await,
         Some(Command::Logout) => cmd_logout(),
-        Some(Command::Status) => cmd_status(),
+        Some(Command::Status { json }) => cmd_status(json),
+        Some(Command::Retry { id, all }) => cmd_retry(id, all),
         Some(Command::Mount) => cmd_mount(flags.force_offline, flags.no_tray).await,
         Some(Command::Stop) => cmd_stop(),
         Some(Command::Pause) => cmd_pause(true),
@@ -58,6 +66,11 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             daemon::open_folder();
             Ok(())
         }
+        Some(Command::Share { command }) => share::run_cli(flags.force_offline, command).await,
+        Some(Command::Takeout { destination }) => {
+            takeout::run_cli(flags.force_offline, destination).await
+        }
+        Some(Command::Service { command }) => cmd_service(command),
         Some(Command::Computers { command }) => {
             computers::run_cli(flags.force_offline, command).await
         }
@@ -72,7 +85,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
 fn run_gui(flags: flags::ClientFlags) -> anyhow::Result<()> {
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
-        "Proton Drive",
+        "pdcli (unofficial)",
         native_options,
         Box::new(move |_| Ok(Box::new(ProtonDrive::new(flags)))),
     )
@@ -141,28 +154,144 @@ fn cmd_pause(pause: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_status() -> anyhow::Result<()> {
-    match credentials::load() {
-        Some(cred) => println!("signed in: {}", cred.username()),
-        None => println!("signed in: no"),
-    }
-
-    match daemon::status() {
-        Some(daemon::DaemonStatus::Online) => println!("daemon: online"),
-        Some(daemon::DaemonStatus::Offline) => println!("daemon: offline"),
-        Some(daemon::DaemonStatus::Paused) => println!("daemon: paused"),
-        None => println!("daemon: not running"),
-    }
-
+fn cmd_status(json: bool) -> anyhow::Result<()> {
+    let credential = credentials::load();
+    let daemon = daemon::status();
     let mount = fs::default_mountpoint()?;
     let mounted = std::fs::read_to_string("/proc/mounts")
         .map(|s| s.contains("proton-drive"))
         .unwrap_or(false);
+
+    let journal = if credential.is_some() {
+        db::FuseDb::open_default()
+            .ok()
+            .map(|db| db.journal_summary(50))
+    } else {
+        None
+    };
+
+    if json {
+        #[derive(Serialize)]
+        struct StatusOutput {
+            signed_in: bool,
+            username: Option<String>,
+            daemon: &'static str,
+            mountpoint: String,
+            mounted: bool,
+            journal: Option<db::JournalSummary>,
+        }
+        let daemon = match daemon {
+            Some(daemon::DaemonStatus::Online) => "online",
+            Some(daemon::DaemonStatus::Offline) => "offline",
+            Some(daemon::DaemonStatus::Paused) => "paused",
+            None => "not running",
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&StatusOutput {
+                signed_in: credential.is_some(),
+                username: credential.map(|cred| cred.username().to_owned()),
+                daemon,
+                mountpoint: mount.display().to_string(),
+                mounted,
+                journal,
+            })?
+        );
+        return Ok(());
+    }
+
+    match credential {
+        Some(cred) => println!("signed in: {}", cred.username()),
+        None => println!("signed in: no"),
+    }
+    println!(
+        "daemon: {}",
+        match daemon {
+            Some(daemon::DaemonStatus::Online) => "online",
+            Some(daemon::DaemonStatus::Offline) => "offline",
+            Some(daemon::DaemonStatus::Paused) => "paused",
+            None => "not running",
+        }
+    );
     println!(
         "mount: {} ({})",
         mount.display(),
         if mounted { "mounted" } else { "not mounted" }
     );
+    if let Some(summary) = journal {
+        println!(
+            "journal: {} pending, {} failed",
+            summary.pending, summary.failed
+        );
+        for entry in summary
+            .entries
+            .iter()
+            .filter(|entry| entry.status == "failed")
+        {
+            println!(
+                "  failed #{} {}{}",
+                entry.id,
+                entry.event_type,
+                entry
+                    .error
+                    .as_deref()
+                    .map(|error| format!(": {error}"))
+                    .unwrap_or_default()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_retry(id: Option<i64>, all: bool) -> anyhow::Result<()> {
+    let db = db::FuseDb::open_default()
+        .context("cannot open the local journal; sign in once before retrying")?;
+    let entry_id = if all {
+        None
+    } else {
+        Some(id.ok_or_else(|| anyhow::anyhow!("provide a failed journal ID or --all"))?)
+    };
+    let count = db.retry_failed(entry_id, all)?;
+    if daemon::is_running() {
+        daemon::request_retry_sync_now().ok();
+    }
+    if all {
+        println!("retrying {count} failed journal entries");
+    } else if let Some(entry_id) = entry_id {
+        println!("retrying failed journal entry {entry_id}");
+    }
+    Ok(())
+}
+
+fn cmd_service(command: ServiceCommand) -> anyhow::Result<()> {
+    match command {
+        ServiceCommand::Install => {
+            let path = service::install()?;
+            service::reload()?;
+            println!("installed {}", path.display());
+        }
+        ServiceCommand::Uninstall => {
+            let _ = service::disable();
+            service::uninstall()?;
+            service::reload()?;
+            println!("service removed");
+        }
+        ServiceCommand::Enable => {
+            stop_daemon();
+            let path = service::install()?;
+            service::enable()?;
+            println!("enabled {}", path.display());
+        }
+        ServiceCommand::Disable => {
+            service::disable()?;
+            println!("service disabled");
+        }
+        ServiceCommand::Reload => {
+            service::reload()?;
+            println!("systemd user units reloaded");
+        }
+        ServiceCommand::Status => println!("{}", service::status()?),
+    }
     Ok(())
 }
 

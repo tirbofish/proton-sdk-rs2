@@ -1,0 +1,11 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@ --buildsystem=none
+
+override_dh_auto_build:
+	cargo build --locked --release -p pdcli
+
+override_dh_auto_install:
+	install -Dm755 target/release/pdcli debian/pdcli/usr/bin/pdcli
+	install -Dm644 packaging/systemd/pdcli.service debian/pdcli/usr/lib/systemd/user/pdcli.service

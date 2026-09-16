@@ -1,177 +1,176 @@
 # proton-sdk-rs2
 
-A port of the [Proton SDK](https://github.com/ProtonDriveApps/sdk) (specifically the drive implementation) from c# to rust. 
+`proton-sdk-rs2` is a community Rust port of the Proton Drive SDK. It is not
+an official Proton product. The `pdcli` binary is a Linux FUSE client and
+desktop utility built on top of the SDK.
 
-This is the second iteration because the first iteration that I attempted to make was severly underperformant and my experience was poor. 
-You can check it out [here](https://github.com/tirbofish/proton-sdk-rs)
+This software can modify remote files and is still evolving. Keep an
+independent backup of important data and review sync/conflict output before
+using it on a primary copy.
 
-> [!WARNING]
-> This port is not an official product of Proton, nor is it made by Proton. It is a community project. 
-> 
-> Despite this project being open-source (and anyone can check the contents), there can be bugs and issues that may cause data loss, so always be aware of this issue. 
-> 
-> Passwords are not saved, but instead tokens are saved to the config. Even so, it is dependent on how the app (not the SDK) uses the tokens. There are helpers available for any developers wanting to store their credentials safely. 
+## Build from source
 
-# usage
+The CLI currently targets Linux. Install the native build dependencies first.
 
-## the normal joe
-anyone wanting to use the client will have to clone this repository and compile with cargo (if no release has been made, or you just want cutting edge)
+Debian/Ubuntu:
 
-### dependencies
-
-building this from source requires a couple dependencies. 
-
-#### Arch
-```bash
-pacman -S gtk3 xdotool libappindicator-gtk3 #or libayatana-appindicator
+```sh
+sudo apt update
+sudo apt install build-essential cargo rustc pkg-config protobuf-compiler \
+  libdbus-1-dev libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libfuse3-dev
 ```
 
-#### Ubuntu
-```bash
-sudo apt install libgtk-3-dev libxdo-dev libappindicator3-dev #or libayatana-appindicator3-dev
+Arch Linux:
+
+```sh
+sudo pacman -S --needed base-devel rust cargo protobuf pkgconf gtk3 libxdo \
+  libayatana-appindicator libfuse3
 ```
 
-### building
+Then build or install the CLI:
 
-```bash
+```sh
 git clone https://github.com/tirbofish/proton-sdk-rs2
 cd proton-sdk-rs2
-cargo run
+cargo build --locked --release -p pdcli
+cargo install --locked --path crates/pdcli
 ```
 
-## sdk
+Package recipes for Debian, RPM-based systems, and Arch are in
+[`packaging/README.md`](packaging/README.md).
 
-proton-drive-sdk and proton-sdk-rs2 are both on crates.io, as well as the proton based cryptography libraries (no changes, just some cosmetic stuff). 
+## pdcli quick start
 
-**crates.io**
+```sh
+pdcli login                 # browser-based sign-in
+pdcli mount                 # mounts ~/ProtonDrive
+ls ~/ProtonDrive/MyFiles
+pdcli status --json
+```
+
+`pdcli mount` also signs in when needed. On WSL, an invocation without a
+subcommand defaults to mounting; use `pdcli gui` for the desktop window.
+
+The main commands are documented by `pdcli --help` and include:
+
+```text
+pdcli status [--json]
+pdcli retry <ID>
+pdcli retry --all
+pdcli pause
+pdcli resume
+pdcli sync
+pdcli open
+pdcli stop
+pdcli logout
+pdcli computers
+pdcli computers register [--name NAME] [--bind DEVICE_ID]
+pdcli computers sync PATH [--name NAME] [--dry-run]
+pdcli computers restore COMPUTER FOLDER PATH
+pdcli computers unsync JOB
+pdcli share link NODE_UID [--role viewer|editor] [--password PASSWORD]
+pdcli share status NODE_UID [--json]
+pdcli share remove NODE_UID
+pdcli share report NODE_UID --category CATEGORY --bona-fide
+pdcli takeout DESTINATION
+```
+
+`pdcli status` reports login, daemon, mount, and failed/pending journal state.
+Use `pdcli retry ID` or `pdcli retry --all` after inspecting a failed entry.
+
+Computer sync validates paths, refuses to sync the Proton Drive mount itself,
+does not delete files, and preserves the overwritten side when local and
+remote versions differ as timestamped `pdcli conflict` copies. Run
+`pdcli computers sync PATH --dry-run` first; it
+does not create a device, folder, or job.
+
+`pdcli takeout DESTINATION` exports **My Files** to a local directory and
+resumes from `.pdcli-takeout-manifest.json`. It currently skips Photos and
+degraded/unsupported nodes and does not export Computers backups.
+
+## Start the daemon at login
+
+For a source install, generate a systemd user unit for the current executable:
+
+```sh
+pdcli service enable
+pdcli service status
+```
+
+`pdcli service enable` installs the generated unit, reloads systemd, and starts
+it. `pdcli service install` only writes the unit. `pdcli service disable` stops
+it, and `pdcli service uninstall` removes the generated unit. Package installs
+provide `/usr/lib/systemd/user/pdcli.service`:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now pdcli.service
+journalctl --user -u pdcli.service -e
+```
+
+User services normally start when the user manager starts at login. For a
+headless machine, `loginctl enable-linger "$USER"` starts the user manager at
+boot, but a lingering service may start before a desktop Secret Service/keyring
+is available. Sign in once first and ensure the account's credentials are
+available to that user; otherwise systemd may restart the daemon until login.
+
+## Credentials, cache, and security
+
+On Linux the default data directory is `$XDG_CONFIG_HOME/pdcli`, or
+`$HOME/.config/pdcli` when `XDG_CONFIG_HOME` is unset. Other platforms follow
+their native application-data directory. The directory contains the FUSE
+database (encrypted `fuse.db`), SDK caches (`cache.db` and encrypted
+`secret.db`), Computer sync state (`computers.json`), and the file cache
+(`fuse_cache`).
+
+Session tokens and the cache master key are stored in the OS keyring under the
+`pdcli` service when available. If no keyring is available, pdcli falls back to
+`cred.ron` and `cache.key` with restrictive permissions (`0600` on Unix).
+Passwords are not persisted by pdcli, but session tokens can authorize the
+account; protect the account keyring and configuration directory. `pdcli logout`
+stops the daemon and removes the stored session credentials; it does not erase
+cached files.
+
+## SDK compatibility
+
+For crates.io consumers:
+
 ```toml
-proton-drive-sdk = { version = "0.3" }
+proton-drive-sdk = "0.3"
 ```
 
-**cutting edge**
+For the repository version:
+
 ```toml
 proton-drive-sdk = { git = "https://github.com/tirbofish/proton-sdk-rs2" }
 ```
 
-> [!NOTE]
-> There is no need for you to include the `proton-sdk-rs2` library as part of your imports, it's already exported by `proton-drive-sdk`
+`proton-drive-sdk` re-exports the lower-level `proton-sdk-rs2` crate, so most
+applications do not need to add a second direct SDK dependency.
 
-# license
+The current upstream compatibility reference is the fetched
+`ProtonDriveApps/sdk` baseline `6cbf2f44` (15 September 2026). This Rust port
+is not a drop-in guarantee for every upstream API change, so pin a crate
+version or commit in applications that need reproducible builds. Upstream's
+next cryptographic migration is expected around late 2026/early 2027; review
+the migration notes and test existing stored credentials before upgrading
+through that boundary.
 
-this project uses the MIT license because all the other proton-based repositories use MIT, and it would only be fair to use MIT myself. 
+## Troubleshooting
 
-<details>
-    <summary>Todo</summary>
+- `fusermount3` or `/dev/fuse` errors: install `fuse3` and confirm the user is
+  allowed to access FUSE; then run `pdcli stop` before retrying.
+- A daemon started by systemd but immediately restarts: inspect
+  `journalctl --user -u pdcli.service -e`, check `pdcli status`, and verify the
+  keyring/credential availability described above.
+- A sync operation is not progressing: run `pdcli status --json`, inspect the
+  failed journal entries, and retry a specific ID before using `--all`.
+- Enable diagnostic logging for one invocation with
+  `RUST_LOG=pdcli=debug pdcli status`.
+- Tests that exercise the native keyring may require a running desktop Secret
+  Service/DBus session; this is an environment requirement, not a second
+  credential store.
 
-### Core Operations
-- [x] Authentication / Session management
-- [x] Get My Files root folder
-- [x] Get node by UID
-- [x] Enumerate nodes
-- [x] Create folder
-- [x] Rename node
-- [x] Move nodes
-- [x] Copy node
-- [x] Trash nodes
-- [x] Restore nodes from trash
-- [x] Delete nodes from trash
-- [x] Empty trash
-- [x] Enumerate trash
-- [x] Get available name (collision handling)
+## License
 
-### File Upload/Download
-- [x] File upload (stream-based)
-- [x] File revision upload
-- [x] File download (stream-based)
-- [x] Download to file path
-- [x] Upload from file path
-- [x] Thumbnails enumeration
-- [x] Thumbnail fetch
-- [x] Upload pause/resume controller
-- [x] Download pause/resume controller
-- [x] Seekable stream for video playback
-- [x] Expected SHA1 verification on upload
-
-### Revisions
-- [x] Iterate revisions
-- [x] Restore revision
-- [x] Delete revision
-
-### Devices (Computers/Backup)
-- [x] List devices
-- [x] Get device
-- [x] Create device
-- [x] Rename device
-- [x] Delete device
-
-### Events
-- [x] Get volume latest event ID
-- [x] Poll volume events
-- [x] Get core latest event ID
-- [x] Poll core events
-- [x] Subscribe to tree events
-- [x] Subscribe to drive events
-- [x] SDK events (TransfersPaused, TransfersResumed, RequestsThrottled)
-
-### Sharing & Collaboration
-- [x] Share node (with users/public link)
-- [x] Unshare node
-- [x] Get sharing info (members, invitations, public link)
-- [x] Iterate nodes shared by me
-- [x] Iterate nodes shared with me
-- [x] Leave shared node
-- [x] Editors can share setting
-
-### Invitations
-- [x] Iterate pending invitations
-- [x] Accept invitation
-- [x] Reject invitation
-- [x] Resend invitation email
-- [x] Convert non-Proton invitation
-
-### Public Links
-- [x] Create public link (with password/expiration)
-- [x] Get public link info
-- [x] Authenticate public link
-- [x] Public link client for accessing shared content
-
-### Bookmarks
-- [x] Iterate bookmarks
-- [x] Create bookmark
-- [x] Remove bookmark
-
-### Photos
-- [x] Photos client initialization
-- [x] Get photos root folder
-- [x] Photos file uploader
-- [x] Photos file downloader
-- [x] Enumerate timeline (basic)
-- [x] Timeline with pagination
-- [x] Create album
-- [x] Delete album
-- [x] Rename album
-- [x] Set album cover
-- [x] Add photos to album
-- [x] Remove photos from album
-- [x] Iterate album contents
-- [x] Favorite/unfavorite photo
-- [x] Photo tags (Favorites, Screenshots, Videos, LivePhotos, etc.)
-- [x] Duplicate detection
-
-### Utilities
-- [x] Generate node UID from share/link IDs
-- [x] Get node web URL
-- [x] Get Docs key (for Proton Docs integration)
-
-### Resilience & Error Handling
-- [x] Automatic retry with backoff
-- [x] Transfer queue management
-- [x] TooManyRequests handling
-- [x] Integrity exception types (ChecksumMismatch, ContentSizeMismatch, etc.)
-
-### Telemetry
-- [x] Telemetry trait/interface
-- [x] Upload/Download error events
-- [x] Block verification error events
-- [x] Decryption error events
-</details>
+MIT. See [`LICENSE.md`](LICENSE.md).

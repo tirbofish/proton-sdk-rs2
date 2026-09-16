@@ -1,11 +1,10 @@
 use poll_promise::Promise;
-use proton_sdk_rs2::{
-    AppVersionConfiguration, client::ProtonClientOptions, session::ProtonAPISession,
-};
+use proton_drive_sdk::proton_sdk_rs2::{client::ProtonClientOptions, session::ProtonAPISession};
 
 use crate::{
     auth, computers, credentials, daemon, flags, pdignore,
     transfer::{TransferDirection, TransferTracker, format_bytes},
+    version::{APP_VERSION, app_version_configuration},
 };
 
 pub(crate) enum AppState {
@@ -51,7 +50,7 @@ impl ProtonDrive {
 
                     let mut session = ProtonAPISession::from_stored_credentials(
                         cred,
-                        AppVersionConfiguration::new("pdcli", 0, 1, 0),
+                        app_version_configuration(),
                         ProtonClientOptions {
                             entity_cache_repository: Some(entity_cache),
                             secret_cache_repository: Some(secret_cache),
@@ -402,8 +401,7 @@ impl ProtonDrive {
             MenuPage::About => {
                 ui.heading("About");
                 ui.label(format!(
-                    "pdcli {} - Proton Drive for Linux",
-                    env!("CARGO_PKG_VERSION")
+                    "pdcli {APP_VERSION} — unofficial Proton Drive for Linux",
                 ));
             }
             MenuPage::Account => {

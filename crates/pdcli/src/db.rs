@@ -35,6 +35,23 @@ pub struct JournalEntry {
     pub retry_count: i32,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct JournalStatusEntry {
+    pub id: i64,
+    pub created_at: i64,
+    pub event_type: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub retry_count: i32,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct JournalSummary {
+    pub pending: usize,
+    pub failed: usize,
+    pub entries: Vec<JournalStatusEntry>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SyncEvent {
     pub id: i64,
@@ -57,6 +74,16 @@ fn now_unix() -> i64 {
 }
 
 impl FuseDb {
+    pub fn default_path() -> anyhow::Result<PathBuf> {
+        platform_dirs::AppDirs::new(Some("pdcli"), false)
+            .map(|dirs| dirs.config_dir.join("fuse.db"))
+            .ok_or_else(|| anyhow::anyhow!("failed to resolve config directory"))
+    }
+
+    pub fn open_default() -> anyhow::Result<Self> {
+        Self::open(&Self::default_path()?)
+    }
+
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         Self::open_with_key(path, &crate::credentials::cache_master_key()?)
     }
@@ -595,8 +622,69 @@ impl FuseDb {
     pub fn delete_completed_journal(&self) -> anyhow::Result<usize> {
         let n = self
             .conn
-            .execute("DELETE FROM journal WHERE status IN ('done', 'failed')", [])?;
+            .execute("DELETE FROM journal WHERE status = 'done'", [])?;
         Ok(n)
+    }
+
+    pub fn journal_summary(&self, limit: i64) -> JournalSummary {
+        let count = |status: &str| {
+            self.conn
+                .query_row(
+                    "SELECT count(*) FROM journal WHERE status = ?",
+                    params![status],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0) as usize
+        };
+
+        let entries = (|| -> rusqlite::Result<Vec<JournalStatusEntry>> {
+            let mut stmt = self.conn.prepare_cached(
+                "SELECT id, created_at, event_type, status, error, retry_count
+                 FROM journal WHERE status IN ('pending', 'failed')
+                 ORDER BY created_at ASC, id ASC LIMIT ?",
+            )?;
+            let rows = stmt.query_map(params![limit], |row| {
+                Ok(JournalStatusEntry {
+                    id: row.get(0)?,
+                    created_at: row.get(1)?,
+                    event_type: row.get(2)?,
+                    status: row.get(3)?,
+                    error: row.get(4)?,
+                    retry_count: row.get(5)?,
+                })
+            })?;
+            rows.collect()
+        })()
+        .unwrap_or_default();
+
+        JournalSummary {
+            pending: count("pending"),
+            failed: count("failed"),
+            entries,
+        }
+    }
+
+    pub fn retry_failed(&self, id: Option<i64>, all: bool) -> anyhow::Result<usize> {
+        anyhow::ensure!(all || id.is_some(), "provide a failed journal ID or --all");
+        anyhow::ensure!(
+            all || id.is_some_and(|value| value > 0),
+            "journal ID must be positive"
+        );
+        let changed = if all {
+            self.conn.execute(
+                "UPDATE journal SET status = 'pending', error = NULL, retry_count = 0
+                 WHERE status = 'failed'",
+                [],
+            )?
+        } else {
+            self.conn.execute(
+                "UPDATE journal SET status = 'pending', error = NULL, retry_count = 0
+                 WHERE id = ? AND status = 'failed'",
+                params![id.unwrap()],
+            )?
+        };
+        anyhow::ensure!(changed > 0, "no failed journal entry matched");
+        Ok(changed)
     }
 
     // ── Event cursors ────────────────────────────────────────────────
@@ -816,6 +904,28 @@ mod tests {
         drop(db);
         let hdr = std::fs::read(&path).unwrap();
         assert!(!hdr.starts_with(b"SQLite format 3"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn failed_journal_is_retained_and_retryable() {
+        let path = temp_db();
+        let key = [5u8; 32];
+        let db = FuseDb::open_with_key(&path, &key).unwrap();
+        let id = db
+            .enqueue_journal("upload", 2, r#"{"name":"file.txt"}"#)
+            .unwrap();
+        db.update_journal_status(id, "failed", Some("permanent failure"))
+            .unwrap();
+        let summary = db.journal_summary(10);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(
+            summary.entries[0].error.as_deref(),
+            Some("permanent failure")
+        );
+        assert_eq!(db.delete_completed_journal().unwrap(), 0);
+        assert_eq!(db.retry_failed(Some(id), false).unwrap(), 1);
+        assert_eq!(db.journal_summary(10).pending, 1);
         cleanup(&path);
     }
 

@@ -5,15 +5,13 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::Context;
-use proton_sdk_rs2::{
-    AppVersionConfiguration, client::ProtonClientOptions, session::ProtonAPISession,
-};
+use proton_drive_sdk::proton_sdk_rs2::{client::ProtonClientOptions, session::ProtonAPISession};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 
 use crate::transfer::TransferTracker;
-use crate::{credentials, db::FuseDb, fs, tray};
+use crate::{credentials, db::FuseDb, fs, tray, version::app_version_configuration};
 
 const SOCKET_NAME: &str = "pdcli-daemon.sock";
 
@@ -371,7 +369,7 @@ pub(crate) async fn restore_session(force_offline: bool) -> anyhow::Result<Proto
 
     let mut session = ProtonAPISession::from_stored_credentials(
         cred,
-        AppVersionConfiguration::new("pdcli", 0, 1, 0),
+        app_version_configuration(),
         ProtonClientOptions {
             entity_cache_repository: Some(entity_cache),
             secret_cache_repository: Some(secret_cache),

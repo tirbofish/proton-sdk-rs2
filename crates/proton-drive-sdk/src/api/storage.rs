@@ -1,5 +1,5 @@
 use crate::api::ApiResponse;
-use crate::error::TooManyRequestsException;
+use crate::error::{HttpTransferError, TooManyRequestsException, parse_retry_after};
 use async_trait::async_trait;
 use bytes::Bytes;
 use proton_sdk_rs2::auth::TokenCredential;
@@ -96,23 +96,26 @@ impl StorageApiClient for DefaultStorageApiClient {
             match builder.send().await {
                 Ok(response) => {
                     if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                        last_err = Some(
-                            TooManyRequestsException::from_headers(response.headers()).into(),
-                        );
+                        last_err =
+                            Some(TooManyRequestsException::from_headers(response.headers()).into());
                         if let Some(wait) = crate::error::parse_retry_after(response.headers()) {
                             sleep(wait).await;
                         }
                         continue;
                     }
                     if response.status().is_server_error() {
-                        last_err = Some(anyhow::anyhow!(
-                            "server error on attempt {}: {}",
-                            attempt + 1,
-                            response.status()
-                        ));
+                        last_err = Some(
+                            HttpTransferError::new(
+                                response.status(),
+                                format!("server error on attempt {}", attempt + 1),
+                                parse_retry_after(response.headers()),
+                            )
+                            .into(),
+                        );
                         continue;
                     }
                     let status = response.status();
+                    let retry_after = parse_retry_after(response.headers());
                     let body = response.text().await.unwrap_or_default();
                     // Proton's blob storage backend returns an empty body (or
                     // occasionally plain text) on a successful upload — not JSON.
@@ -124,12 +127,12 @@ impl StorageApiClient for DefaultStorageApiClient {
                                 error_message: None,
                             });
                         } else {
-                            last_err = Some(anyhow::anyhow!(
-                                "blob upload failed: status {}, body: {}",
+                            return Err(HttpTransferError::new(
                                 status,
-                                body
-                            ));
-                            continue;
+                                format!("blob upload failed: {body}"),
+                                retry_after,
+                            )
+                            .into());
                         }
                     }
                     return serde_json::from_str::<ApiResponse>(&body).map_err(|e| {
@@ -178,7 +181,19 @@ impl StorageApiClient for DefaultStorageApiClient {
         }
 
         if !response.status().is_success() {
-            anyhow::bail!("blob download failed with status {}", response.status());
+            let status = response.status();
+            let retry_after = parse_retry_after(response.headers());
+            let body = response.text().await.unwrap_or_default();
+            return Err(HttpTransferError::new(
+                status,
+                if body.is_empty() {
+                    format!("blob download failed with status {status}")
+                } else {
+                    body
+                },
+                retry_after,
+            )
+            .into());
         }
 
         Ok(response)

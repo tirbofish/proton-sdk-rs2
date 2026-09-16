@@ -12,6 +12,22 @@ use std::sync::Arc;
 pub struct FolderOperations;
 
 impl FolderOperations {
+    pub async fn get_folder_size(
+        client: &ProtonDriveClient,
+        folder_uid: NodeUid,
+    ) -> anyhow::Result<FolderSizeInfo> {
+        let response = client
+            .api()
+            .folders()
+            .get_folder_size(folder_uid.volume_id, folder_uid.link_id)
+            .await?;
+
+        Ok(FolderSizeInfo {
+            size: response.descendents_size,
+            number_of_descendants: response.descendents_count,
+        })
+    }
+
     pub async fn create(
         client: &ProtonDriveClient,
         parent_uid: NodeUid,
@@ -249,18 +265,21 @@ impl FolderOperations {
             return secrets.result().map_err(|e| anyhow::anyhow!(e.to_string()));
         }
 
-        let metadata_result: NodeMetadataResult =
-            Box::pin(DtoToMetadataConverter::get_fresh_node_metadata(
-                client,
-                folder_uid.clone(),
-                None,
-            ))
-            .await?;
+        let metadata_result: NodeMetadataResult = Box::pin(
+            DtoToMetadataConverter::get_fresh_node_metadata(client, folder_uid.clone(), None),
+        )
+        .await?;
 
         metadata_result
             .try_get_folder_secrets_else_error()
             .map_err(|e| anyhow::anyhow!(e.to_string()))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FolderSizeInfo {
+    pub size: i64,
+    pub number_of_descendants: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

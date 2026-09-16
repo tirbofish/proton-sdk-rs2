@@ -66,6 +66,26 @@ pub struct FolderDto {
     pub extended_attributes: Option<PgpArmoredMessage>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct FolderSizeResponse {
+    #[serde(flatten)]
+    pub base: ApiResponse,
+
+    #[serde(rename = "VolumeID")]
+    pub volume_id: VolumeId,
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+    pub descendents_size: i64,
+    pub descendents_count: u64,
+}
+
+impl FolderSizeResponse {
+    pub fn is_success(&self) -> bool {
+        self.base.is_success()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct FolderId {
     #[serde(rename = "ID")]
@@ -86,6 +106,12 @@ pub trait FoldersApiClient: Send + Sync {
         volume_id: VolumeId,
         request: FolderCreationRequest,
     ) -> anyhow::Result<FolderCreationResponse>;
+
+    async fn get_folder_size(
+        &self,
+        volume_id: VolumeId,
+        link_id: LinkId,
+    ) -> anyhow::Result<FolderSizeResponse>;
 }
 
 use proton_sdk_rs2::auth::TokenCredential;
@@ -181,5 +207,47 @@ impl FoldersApiClient for DefaultFoldersApiClient {
 
         let folder_creation_response: FolderCreationResponse = serde_json::from_value(res)?;
         Ok(folder_creation_response)
+    }
+
+    async fn get_folder_size(
+        &self,
+        volume_id: VolumeId,
+        link_id: LinkId,
+    ) -> anyhow::Result<FolderSizeResponse> {
+        let url = self.base_url.join(&format!(
+            "volumes/{}/folders/{}/calculate-descendents-size",
+            volume_id.raw(),
+            link_id.raw()
+        ))?;
+        let builder = self.client.get(url);
+        let builder = self.add_auth_headers(builder).await?;
+        let response: FolderSizeResponse = builder.send().await?.json().await?;
+        response.base.to_result()?;
+        Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_size_response_deserializes() {
+        let response: FolderSizeResponse = serde_json::from_str(
+            r#"{
+                "Code": 1000,
+                "VolumeID": "volume-id",
+                "LinkID": "link-id",
+                "DescendentsSize": 12345,
+                "DescendentsCount": 42
+            }"#,
+        )
+        .unwrap();
+
+        assert!(response.base.is_success());
+        assert_eq!(response.volume_id.raw(), "volume-id");
+        assert_eq!(response.link_id.raw(), "link-id");
+        assert_eq!(response.descendents_size, 12345);
+        assert_eq!(response.descendents_count, 42);
     }
 }

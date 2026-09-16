@@ -2,11 +2,9 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use poll_promise::Promise;
-use proton_sdk_rs2::{
-    AppVersionConfiguration, client::ProtonClientOptions, session::ProtonAPISession,
-};
+use proton_drive_sdk::proton_sdk_rs2::{client::ProtonClientOptions, session::ProtonAPISession};
 
-use crate::credentials;
+use crate::{credentials, version::app_version_configuration};
 
 enum LoginAction {
     Ready(ProtonAPISession),
@@ -44,7 +42,7 @@ impl AuthScreen {
 
             tracing::info!("starting browser authentication");
             ProtonAPISession::begin_via_web(
-                AppVersionConfiguration::new("pdcli", 0, 1, 0),
+                app_version_configuration(),
                 ProtonClientOptions {
                     entity_cache_repository: Some(entity_cache),
                     secret_cache_repository: Some(secret_cache),
@@ -92,6 +90,7 @@ impl AuthScreen {
             ui.add_space(40.0);
             ui.heading("Sign in to Proton Drive");
             ui.add_space(8.0);
+            ui.label("pdcli is an unofficial third-party application.");
             ui.label("Sign in securely in your browser to continue.");
             ui.add_space(20.0);
 
@@ -144,7 +143,7 @@ pub async fn login_cli() -> anyhow::Result<ProtonAPISession> {
     println!("This is a third-party application not officially supported by Proton.");
     tracing::info!("starting browser authentication");
     let session = ProtonAPISession::begin_via_web(
-        AppVersionConfiguration::new("pdcli", 0, 1, 0),
+        app_version_configuration(),
         ProtonClientOptions {
             entity_cache_repository: Some(entity_cache),
             secret_cache_repository: Some(secret_cache),

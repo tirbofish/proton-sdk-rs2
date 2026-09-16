@@ -1082,12 +1082,21 @@ impl ProtonPhotosClient {
         crate::sharing::SharingOperations::get_sharing_info(&self.drive, node_uid).await
     }
 
+    pub async fn report_abuse(
+        &self,
+        settings: crate::sharing::ReportDirectShareAbuseSettings,
+    ) -> anyhow::Result<()> {
+        crate::sharing::SharingOperations::report_abuse(&self.drive, settings).await
+    }
+
     pub async fn subscribe_to_tree_events(
         &self,
         volume_id: VolumeId,
         callback: std::sync::Arc<dyn Fn(crate::events::DriveEvent) + Send + Sync>,
     ) -> anyhow::Result<crate::events::EventSubscription> {
-        self.drive.subscribe_to_tree_events(volume_id, callback).await
+        self.drive
+            .subscribe_to_tree_events(volume_id, callback)
+            .await
     }
 
     pub async fn subscribe_to_drive_events(

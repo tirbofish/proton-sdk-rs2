@@ -62,7 +62,10 @@ pub trait SharesApiClient: Send + Sync {
         anchor_id: Option<&str>,
     ) -> anyhow::Result<InvitationsListResponse>;
 
-    async fn get_invitation(&self, invitation_id: &str) -> anyhow::Result<InvitationDetailsResponse>;
+    async fn get_invitation(
+        &self,
+        invitation_id: &str,
+    ) -> anyhow::Result<InvitationDetailsResponse>;
 
     async fn accept_invitation(
         &self,
@@ -113,7 +116,8 @@ pub trait SharesApiClient: Send + Sync {
         invitation_id: &str,
     ) -> anyhow::Result<()>;
 
-    async fn delete_invitation(&self, share_id: ShareId, invitation_id: &str) -> anyhow::Result<()>;
+    async fn delete_invitation(&self, share_id: ShareId, invitation_id: &str)
+    -> anyhow::Result<()>;
 
     async fn invite_external_user(
         &self,
@@ -155,6 +159,13 @@ pub trait SharesApiClient: Send + Sync {
         request: CreateShareUrlRequest,
     ) -> anyhow::Result<CreateShareUrlResponse>;
 
+    async fn update_share_url(
+        &self,
+        share_id: ShareId,
+        url_id: &str,
+        request: UpdateShareUrlRequest,
+    ) -> anyhow::Result<()>;
+
     async fn delete_share_url(&self, share_id: ShareId, url_id: &str) -> anyhow::Result<()>;
 
     async fn get_public_link_info(&self, token: &str) -> anyhow::Result<PublicLinkInfoResponse>;
@@ -176,6 +187,8 @@ pub trait SharesApiClient: Send + Sync {
     async fn delete_bookmark(&self, token: &str) -> anyhow::Result<()>;
 
     async fn get_srp_modulus(&self) -> anyhow::Result<SrpModulusResponse>;
+
+    async fn report_share_abuse(&self, request: ReportShareAbuseRequest) -> anyhow::Result<()>;
 }
 
 pub struct DefaultSharesApiClient {
@@ -216,9 +229,8 @@ impl DefaultSharesApiClient {
         let builder = self.add_auth_headers(builder).await?;
         let response = builder.send().await?;
         let text = response.text().await?;
-        let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-            anyhow::anyhow!("Failed to decode JSON: {}. Body: {}", e, text)
-        })?;
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("Failed to decode JSON: {}. Body: {}", e, text))?;
         if let Some(code) = value.get("Code").and_then(|c| c.as_u64()) {
             if code != 1000 {
                 let error = value
@@ -234,7 +246,9 @@ impl DefaultSharesApiClient {
 
     async fn send_ok(&self, builder: reqwest_middleware::RequestBuilder) -> anyhow::Result<()> {
         let builder = self.add_auth_headers(builder).await?;
-        ApiResponse::from_response(builder.send().await?).await?.to_result()
+        ApiResponse::from_response(builder.send().await?)
+            .await?
+            .to_result()
     }
 }
 
@@ -386,7 +400,10 @@ impl SharesApiClient for DefaultSharesApiClient {
         self.send_json(self.client.get(url)).await
     }
 
-    async fn get_invitation(&self, invitation_id: &str) -> anyhow::Result<InvitationDetailsResponse> {
+    async fn get_invitation(
+        &self,
+        invitation_id: &str,
+    ) -> anyhow::Result<InvitationDetailsResponse> {
         let url = self
             .base_url
             .join(&format!("v2/shares/invitations/{invitation_id}"))?;
@@ -430,9 +447,10 @@ impl SharesApiClient for DefaultSharesApiClient {
         &self,
         share_id: ShareId,
     ) -> anyhow::Result<ShareExternalInvitationsResponse> {
-        let url = self
-            .base_url
-            .join(&format!("v2/shares/{}/external-invitations", share_id.raw()))?;
+        let url = self.base_url.join(&format!(
+            "v2/shares/{}/external-invitations",
+            share_id.raw()
+        ))?;
         self.send_json(self.client.get(url)).await
     }
 
@@ -467,8 +485,12 @@ impl SharesApiClient for DefaultSharesApiClient {
         let url = self
             .base_url
             .join(&format!("shares/{}/editors-can-share", share_id.raw()))?;
-        self.send_ok(self.client.put(url).json(&serde_json::json!({ "Value": value })))
-            .await
+        self.send_ok(
+            self.client
+                .put(url)
+                .json(&serde_json::json!({ "Value": value })),
+        )
+        .await
     }
 
     async fn invite_proton_user(
@@ -512,7 +534,11 @@ impl SharesApiClient for DefaultSharesApiClient {
         self.send_ok(self.client.post(url)).await
     }
 
-    async fn delete_invitation(&self, share_id: ShareId, invitation_id: &str) -> anyhow::Result<()> {
+    async fn delete_invitation(
+        &self,
+        share_id: ShareId,
+        invitation_id: &str,
+    ) -> anyhow::Result<()> {
         let url = self.base_url.join(&format!(
             "v2/shares/{}/invitations/{invitation_id}",
             share_id.raw()
@@ -611,6 +637,18 @@ impl SharesApiClient for DefaultSharesApiClient {
         self.send_json(self.client.post(url).json(&request)).await
     }
 
+    async fn update_share_url(
+        &self,
+        share_id: ShareId,
+        url_id: &str,
+        request: UpdateShareUrlRequest,
+    ) -> anyhow::Result<()> {
+        let url = self
+            .base_url
+            .join(&format!("shares/{}/urls/{url_id}", share_id.raw()))?;
+        self.send_ok(self.client.put(url).json(&request)).await
+    }
+
     async fn delete_share_url(&self, share_id: ShareId, url_id: &str) -> anyhow::Result<()> {
         let url = self
             .base_url
@@ -654,6 +692,11 @@ impl SharesApiClient for DefaultSharesApiClient {
     async fn get_srp_modulus(&self) -> anyhow::Result<SrpModulusResponse> {
         let url = self.base_url.join("/auth/v4/modulus")?;
         self.send_json(self.client.get(url)).await
+    }
+
+    async fn report_share_abuse(&self, request: ReportShareAbuseRequest) -> anyhow::Result<()> {
+        let url = self.base_url.join("report/share")?;
+        self.send_ok(self.client.post(url).json(&request)).await
     }
 }
 
@@ -1217,7 +1260,10 @@ pub struct InviteProtonUserBody {
     pub key_packet: String,
     #[serde(rename = "KeyPacketSignature")]
     pub key_packet_signature: String,
-    #[serde(rename = "ExternalInvitationID", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "ExternalInvitationID",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub external_invitation_id: Option<String>,
 }
 
@@ -1309,6 +1355,30 @@ pub struct ShareUrlDto {
 pub struct CreateShareUrlRequest {
     #[serde(rename = "CreatorEmail")]
     pub creator_email: String,
+    #[serde(rename = "Permissions")]
+    pub permissions: u32,
+    #[serde(rename = "Flags")]
+    pub flags: u32,
+    #[serde(rename = "ExpirationTime")]
+    pub expiration_time: Option<i64>,
+    #[serde(rename = "SharePasswordSalt")]
+    pub share_password_salt: String,
+    #[serde(rename = "SharePassphraseKeyPacket")]
+    pub share_passphrase_key_packet: String,
+    #[serde(rename = "Password")]
+    pub password: String,
+    #[serde(rename = "UrlPasswordSalt")]
+    pub url_password_salt: String,
+    #[serde(rename = "SRPVerifier")]
+    pub srp_verifier: String,
+    #[serde(rename = "SRPModulusID")]
+    pub srp_modulus_id: String,
+    #[serde(rename = "MaxAccesses")]
+    pub max_accesses: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateShareUrlRequest {
     #[serde(rename = "Permissions")]
     pub permissions: u32,
     #[serde(rename = "Flags")]
@@ -1468,6 +1538,85 @@ pub struct SrpModulusResponse {
     pub modulus_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AbuseCategory {
+    #[serde(rename = "spam")]
+    Spam,
+    #[serde(rename = "copyright")]
+    Copyright,
+    #[serde(rename = "child-abuse")]
+    ChildAbuse,
+    #[serde(rename = "stolen-data")]
+    StolenData,
+    #[serde(rename = "malware")]
+    Malware,
+    #[serde(rename = "non-consensual-intimate")]
+    NonConsensualIntimate,
+    #[serde(rename = "other")]
+    Other,
+}
+
+impl AbuseCategory {
+    pub const ALL: &'static [AbuseCategory] = &[
+        Self::Spam,
+        Self::Copyright,
+        Self::ChildAbuse,
+        Self::StolenData,
+        Self::Malware,
+        Self::NonConsensualIntimate,
+        Self::Other,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spam => "spam",
+            Self::Copyright => "copyright",
+            Self::ChildAbuse => "child-abuse",
+            Self::StolenData => "stolen-data",
+            Self::Malware => "malware",
+            Self::NonConsensualIntimate => "non-consensual-intimate",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|category| category.as_str() == value)
+    }
+
+    pub fn requires_message(self) -> bool {
+        matches!(self, Self::Copyright | Self::StolenData)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReportShareAbuseRequest {
+    #[serde(rename = "SharePassphrase")]
+    pub share_passphrase: String,
+    #[serde(rename = "MemberSessionKey", skip_serializing_if = "Option::is_none")]
+    pub member_session_key: Option<String>,
+    #[serde(rename = "ShareID")]
+    pub share_id: String,
+    #[serde(rename = "AbuseCategory")]
+    pub abuse_category: AbuseCategory,
+    #[serde(rename = "BonaFide")]
+    pub bona_fide: bool,
+    #[serde(rename = "ReporterMessage", skip_serializing_if = "Option::is_none")]
+    pub reporter_message: Option<String>,
+    #[serde(rename = "ReporterEmail", skip_serializing_if = "Option::is_none")]
+    pub reporter_email: Option<String>,
+    #[serde(rename = "ShareURL", skip_serializing_if = "Option::is_none")]
+    pub share_url: Option<String>,
+    #[serde(rename = "ShareURLPassword", skip_serializing_if = "Option::is_none")]
+    pub share_url_password: Option<String>,
+    #[serde(rename = "LinkID", skip_serializing_if = "Option::is_none")]
+    pub link_id: Option<String>,
+    #[serde(rename = "RevisionID", skip_serializing_if = "Option::is_none")]
+    pub revision_id: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1490,5 +1639,64 @@ mod tests {
         assert_eq!(res.links.len(), 1);
         assert_eq!(res.links[0].share_target_type, ShareTargetType::File);
         assert!(res.more);
+    }
+
+    #[test]
+    fn update_share_url_request_serializes_like_create_payload() {
+        let request = UpdateShareUrlRequest {
+            permissions: 6,
+            flags: 3,
+            expiration_time: None,
+            share_password_salt: "salt".into(),
+            share_passphrase_key_packet: "packet".into(),
+            password: "password".into(),
+            url_password_salt: "url-salt".into(),
+            srp_verifier: "verifier".into(),
+            srp_modulus_id: "modulus".into(),
+            max_accesses: 0,
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["Permissions"], 6);
+        assert_eq!(value["Flags"], 3);
+        assert_eq!(value["ExpirationTime"], serde_json::Value::Null);
+        assert!(value.get("CreatorEmail").is_none());
+    }
+
+    #[test]
+    fn report_share_abuse_request_serializes_ts_field_names() {
+        let request = ReportShareAbuseRequest {
+            share_passphrase: "cGFzc3BocmFzZQ==".into(),
+            member_session_key: Some("session".into()),
+            share_id: "share".into(),
+            abuse_category: AbuseCategory::Spam,
+            bona_fide: true,
+            reporter_message: Some("note".into()),
+            reporter_email: None,
+            share_url: None,
+            share_url_password: None,
+            link_id: Some("link".into()),
+            revision_id: None,
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["SharePassphrase"], "cGFzc3BocmFzZQ==");
+        assert_eq!(value["MemberSessionKey"], "session");
+        assert_eq!(value["ShareID"], "share");
+        assert_eq!(value["AbuseCategory"], "spam");
+        assert_eq!(value["BonaFide"], true);
+        assert_eq!(value["ReporterMessage"], "note");
+        assert_eq!(value["LinkID"], "link");
+        assert!(value.get("ReporterEmail").is_none());
+        assert!(value.get("ShareURL").is_none());
+    }
+
+    #[test]
+    fn abuse_category_round_trips_official_values() {
+        for category in AbuseCategory::ALL {
+            assert_eq!(AbuseCategory::parse(category.as_str()), Some(*category));
+        }
+        assert!(AbuseCategory::parse("not-a-category").is_none());
+        assert!(AbuseCategory::Copyright.requires_message());
+        assert!(AbuseCategory::StolenData.requires_message());
+        assert!(!AbuseCategory::Spam.requires_message());
     }
 }

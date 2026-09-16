@@ -14,8 +14,8 @@ use fuser::{
 use proton_drive_sdk::client::ProtonDriveClient;
 use proton_drive_sdk::node::revision::RevisionUid;
 use proton_drive_sdk::node::{DegradedNode, Node, NodeUid};
+use proton_drive_sdk::proton_sdk_rs2::session::ProtonAPISession;
 use proton_drive_sdk::utils::PotentialObject;
-use proton_sdk_rs2::session::ProtonAPISession;
 use sha2::{Digest, Sha256};
 
 use crate::app::ProtonDrive;

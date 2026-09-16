@@ -200,7 +200,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for AsyncHashingWriteStream<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
 
     fn expected_hash(data: &[u8]) -> Vec<u8> {
         Sha256::digest(data).to_vec()
@@ -229,6 +229,24 @@ mod tests {
         reader.read_to_end(&mut output).await.unwrap();
         assert_eq!(output, b"abcdef");
         assert_eq!(reader.finalize(), expected_hash(b"abcdef"));
+    }
+
+    #[test]
+    fn async_hashing_reader_ignores_preexisting_partial_buffer_bytes() {
+        let mut reader = AsyncHashingReadStream::new(&b"abc"[..]);
+        let mut storage = [0xa5; 5];
+        let mut read_buf = ReadBuf::new(&mut storage);
+        read_buf.put_slice(&[0x01, 0x02]);
+
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(matches!(
+            std::pin::Pin::new(&mut reader).poll_read(&mut context, &mut read_buf),
+            std::task::Poll::Ready(Ok(()))
+        ));
+
+        assert_eq!(read_buf.filled(), &[0x01, 0x02, b'a', b'b', b'c']);
+        assert_eq!(reader.finalize(), expected_hash(b"abc"));
     }
 
     #[tokio::test]

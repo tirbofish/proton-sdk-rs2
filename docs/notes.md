@@ -1,31 +1,28 @@
-# notes
+# Project notes
 
-just some notes and ideas to dump
+This file records deliberately deferred ideas; it is not a list of supported
+commands.
 
----
+## Deferred CLI surface
 
-start off with root being `my_files/`, then work down from there. 
+The FUSE mount already provides normal file-manager operations. A separate
+headless command set (`ls`, `get`, `put`, `mv`, `mkdir`, `stat`, and similar)
+would duplicate that surface and is not currently implemented. Add it only if
+NAS/headless users need operations without mounting the filesystem.
 
-potential photos would have as `photos/`. 
+## Current safe defaults
 
-- ls [path]
-- cd [path]
-- pwd
-- tree [path] (potentially, not required now)
+- Computer sync is additive and does not delete either side.
+- Local and remote versions that differ create timestamped conflict copies.
+- `pdcli computers sync PATH --dry-run` validates a path without creating
+  remote state.
+- `pdcli takeout DESTINATION` is a resumable My Files export; Photos,
+  degraded/unsupported nodes, and Computer backups remain outside its scope.
 
-- cp [src] [dst]
-- mv [src] [dst]
-- mkdir [path]
+## Upstream tracking
 
-- get [remote] [local] (downloads a file)
-- put [local] [remote] (uploads a file)
-
-- stat [path]
-
-authentication:
----
-
-- whoami - displays the user information, no tokens or anything sensitive
-- login (required on initial startup)
-- logout (ends session)
-- exit (or Ctrl+C)
+The current compatibility reference is the fetched
+`ProtonDriveApps/sdk` baseline `6cbf2f44` (15 September 2026). The next
+upstream cryptographic migration is expected around late 2026/early 2027;
+review and test stored credentials at that boundary before changing SDK
+versions.

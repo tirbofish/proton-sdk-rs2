@@ -33,12 +33,30 @@ impl reqwest_middleware::Middleware for PublicLinkSessionMiddleware {
     }
 }
 
+pub fn get_unauth_endpoint(url: &str) -> String {
+    let leading_slash = url.starts_with('/');
+    let path = url.strip_prefix('/').unwrap_or(url);
+    if path.starts_with("drive/urls/")
+        || path.starts_with("drive/v2/urls/")
+        || path.starts_with("drive/unauth/")
+    {
+        return url.to_string();
+    }
+    if let Some(rest) = path.strip_prefix("drive/") {
+        let rewritten = format!("drive/unauth/{rest}");
+        if leading_slash {
+            format!("/{rewritten}")
+        } else {
+            rewritten
+        }
+    } else {
+        url.to_string()
+    }
+}
+
 fn public_link_path(path: &str) -> Option<String> {
-    (path.starts_with("/drive/")
-        && !path.starts_with("/drive/urls/")
-        && !path.starts_with("/drive/v2/urls/")
-        && !path.starts_with("/drive/unauth/"))
-    .then(|| path.replacen("/drive/", "/drive/unauth/", 1))
+    let rewritten = get_unauth_endpoint(path);
+    (rewritten != path).then_some(rewritten)
 }
 
 pub fn create_client_with_timeout(timeout_seconds: f64) -> ClientWithMiddleware {
@@ -53,6 +71,46 @@ pub fn create_client_with_timeout(timeout_seconds: f64) -> ClientWithMiddleware 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_unauth_endpoint_matches_typescript() {
+        assert_eq!(
+            get_unauth_endpoint("drive/urls/anything"),
+            "drive/urls/anything"
+        );
+        assert_eq!(
+            get_unauth_endpoint("drive/urls/drive/anything"),
+            "drive/urls/drive/anything"
+        );
+        assert_eq!(
+            get_unauth_endpoint("drive/v2/urls/anything"),
+            "drive/v2/urls/anything"
+        );
+        assert_eq!(
+            get_unauth_endpoint("drive/v2/anything"),
+            "drive/unauth/v2/anything"
+        );
+        assert_eq!(
+            get_unauth_endpoint("drive/v2/drive/anything"),
+            "drive/unauth/v2/drive/anything"
+        );
+        assert_eq!(
+            get_unauth_endpoint("drive/anything"),
+            "drive/unauth/anything"
+        );
+        assert_eq!(
+            get_unauth_endpoint("drive/anything/v2/anything"),
+            "drive/unauth/anything/v2/anything"
+        );
+        assert_eq!(
+            get_unauth_endpoint("drive/anything/drive/anything"),
+            "drive/unauth/anything/drive/anything"
+        );
+        assert_eq!(
+            get_unauth_endpoint("drive/anything/drive/v2/anything"),
+            "drive/unauth/anything/drive/v2/anything"
+        );
+    }
 
     #[test]
     fn leaves_public_link_session_routes_unchanged() {

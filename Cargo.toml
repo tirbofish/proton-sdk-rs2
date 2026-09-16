@@ -1,6 +1,6 @@
 
 [workspace]
-package.version = "0.3.0"
+package.version = "0.3.1"
 package.edition = "2024"
 package.license = "MIT"
 package.repository = "https://github.com/tirbofish/proton-sdk-rs2"

@@ -5,6 +5,29 @@ with Cargo. They install `/usr/bin/pdcli` and a systemd **user** unit at
 `/usr/lib/systemd/user/pdcli.service`; package installation does not enable or
 start that unit automatically.
 
+## GitHub release workflow
+
+From the `main` branch, run **Actions → Release → Run workflow**.
+
+- `patch` / `minor` / `major` bumps `Cargo.toml`, Debian/RPM/Arch metadata, and
+  `CHANGELOG.md`, then commits `release: vX.Y.Z` and tags `vX.Y.Z`.
+- `none` tags the current version without rewriting files.
+- The job builds Linux amd64/arm64 binaries, `.deb` packages, and a source
+  tarball, then creates a GitHub release.
+- With **Publish crates** enabled, it publishes `proton-sdk-rs2`,
+  `proton-drive-sdk`, and `pdcli` to crates.io in that order.
+
+Add a repository secret named `CARGO_REGISTRY_TOKEN` (crates.io API token).
+Use **dry run** to build artifacts without committing, tagging, or publishing.
+
+Local preview of the version/changelog rewrite:
+
+```sh
+python3 scripts/prepare-release.py --bump patch
+git checkout -- Cargo.toml crates/pdcli/Cargo.toml debian/changelog \
+  packaging/rpm/pdcli.spec packaging/arch/PKGBUILD docs/RELEASE.md CHANGELOG.md
+```
+
 ## Debian/Ubuntu
 
 Install the build dependencies listed in `debian/control`, then build a local

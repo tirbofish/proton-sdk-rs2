@@ -1,17 +1,113 @@
-name: Build and Release
+name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump to apply on the current branch
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - none
+        default: patch
+      publish_crates:
+        description: Publish proton-sdk-rs2, proton-drive-sdk, and pdcli to crates.io
+        required: true
+        type: boolean
+        default: true
+      dry_run:
+        description: Build packages without committing, tagging, or publishing
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  cut-release:
+    name: Bump version and changelog
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.prepare.outputs.version }}
+      tag: ${{ steps.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare release metadata
+        id: prepare
+        run: python3 scripts/prepare-release.py --bump "${{ inputs.bump }}"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libdbus-1-dev protobuf-compiler \
+            libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libfuse3-dev dpkg-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-prepare
+
+      - name: Test
+        run: cargo test --workspace --all-features --locked
+
+      - name: Commit and tag
+        if: ${{ !inputs.dry_run && inputs.bump != 'none' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml crates/pdcli/Cargo.toml debian/changelog \
+            packaging/rpm/pdcli.spec packaging/arch/PKGBUILD docs/RELEASE.md CHANGELOG.md
+          git commit -m "release: v${{ steps.prepare.outputs.version }}"
+          git tag "v${{ steps.prepare.outputs.version }}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git push origin "v${{ steps.prepare.outputs.version }}"
+
+      - name: Tag current version
+        if: ${{ !inputs.dry_run && inputs.bump == 'none' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "v${{ steps.prepare.outputs.version }}"
+          git push origin "v${{ steps.prepare.outputs.version }}"
+
+      - name: Dry-run amd64 packages
+        if: ${{ inputs.dry_run }}
+        run: |
+          cargo build --locked --release -p pdcli
+          bash scripts/package-linux.sh "${{ steps.prepare.outputs.version }}" x86_64-unknown-linux-gnu
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: dist/release-notes.md
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.dry_run }}
+        with:
+          name: packages-dry-run
+          path: dist/pdcli*
+          if-no-files-found: error
+
   build:
-    name: pdcli ${{ matrix.target }}
+    name: Package ${{ matrix.target }}
+    needs: cut-release
+    if: ${{ !inputs.dry_run }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -19,64 +115,102 @@ jobs:
         include:
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            deb: true
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            deb: true
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.dry_run && github.sha || needs.cut-release.outputs.tag }}
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            pkg-config \
-            libdbus-1-dev \
-            protobuf-compiler \
-            libgtk-3-dev \
-            libxdo-dev \
-            libayatana-appindicator3-dev \
-            libfuse3-dev
+          sudo apt-get install -y pkg-config libdbus-1-dev protobuf-compiler \
+            libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libfuse3-dev dpkg-dev dpkg-dev
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.target }}-release
 
       - name: Build
-        run: cargo build --release -p pdcli
+        run: cargo build --locked --release -p pdcli
 
-      - name: Package
-        run: |
-          cp target/release/pdcli "pdcli-${{ matrix.target }}"
-          chmod +x "pdcli-${{ matrix.target }}"
-          strip "pdcli-${{ matrix.target }}" || true
+      - name: Package binary and Debian archive
+        run: bash scripts/package-linux.sh "${{ needs.cut-release.outputs.version }}" "${{ matrix.target }}"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pdcli-${{ matrix.target }}
-          path: pdcli-${{ matrix.target }}
+          name: packages-${{ matrix.target }}
+          path: dist/pdcli*
           if-no-files-found: error
 
-  release:
-    name: GitHub release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+  publish:
+    name: crates.io and GitHub release
+    needs: [cut-release, build]
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.dry_run && github.sha || needs.cut-release.outputs.tag }}
+
+      - name: Install system dependencies
+        if: ${{ inputs.publish_crates }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libdbus-1-dev protobuf-compiler \
+            libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libfuse3-dev dpkg-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ inputs.publish_crates }}
+
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ inputs.publish_crates }}
+        with:
+          key: crates-publish
+
+      - name: Publish crates
+        if: ${{ inputs.publish_crates && !inputs.dry_run }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "CARGO_REGISTRY_TOKEN secret is required to publish crates" >&2
+            exit 1
+          fi
+          publish() {
+            local crate="$1"
+            local attempt
+            for attempt in 1 2 3 4 5 6; do
+              if cargo publish -p "$crate" --locked; then
+                return 0
+              fi
+              sleep 20
+            done
+            return 1
+          }
+          publish proton-sdk-rs2
+          publish proton-drive-sdk
+          publish pdcli
 
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
-      - name: Create Release
+      - name: Create GitHub release
+        if: ${{ !inputs.dry_run }}
         uses: softprops/action-gh-release@v3
         with:
-          body_path: docs/RELEASE.md
+          tag_name: ${{ needs.cut-release.outputs.tag }}
+          name: pdcli ${{ needs.cut-release.outputs.version }}
+          body_path: dist/release-notes.md
           generate_release_notes: true
-          files: dist/pdcli-*
+          files: |
+            dist/pdcli-*
+            dist/pdcli_*

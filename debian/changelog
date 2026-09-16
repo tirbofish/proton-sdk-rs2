@@ -1,3 +1,9 @@
+pdcli (0.3.1-1) unstable; urgency=medium
+
+  * Release 0.3.1.
+
+ -- pdcli contributors <4tkbytes@pm.me>  Wed, 16 Sep 2026 06:48:23 +0000
+
 pdcli (0.3.0-1) unstable; urgency=medium
 
   * Initial Debian package.

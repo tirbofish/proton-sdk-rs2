@@ -1,5 +1,5 @@
 pkgname=pdcli
-pkgver=0.3.0
+pkgver=0.3.1
 pkgrel=1
 pkgdesc='Proton Drive command-line client and filesystem daemon'
 arch=('x86_64' 'aarch64')

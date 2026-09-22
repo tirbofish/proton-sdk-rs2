@@ -82,8 +82,13 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag "v${{ steps.prepare.outputs.version }}"
-          git push origin "v${{ steps.prepare.outputs.version }}"
+          tag="v${{ steps.prepare.outputs.version }}"
+          if git show-ref --verify --quiet "refs/tags/${tag}"; then
+            echo "Using existing ${tag}"
+          else
+            git tag "${tag}"
+            git push origin "${tag}"
+          fi
 
       - name: Dry-run amd64 packages
         if: ${{ inputs.dry_run }}

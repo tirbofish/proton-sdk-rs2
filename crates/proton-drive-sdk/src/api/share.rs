@@ -793,6 +793,22 @@ pub struct ShareMembershipSummaryDto {
 
     #[serde(rename = "Permissions")]
     pub permissions: ShareMemberPermissions,
+
+    #[serde(rename = "InviteTime", with = "crate::utils::serde::epoch_seconds")]
+    pub invite_time: chrono::DateTime<chrono::Utc>,
+
+    #[serde(rename = "InviterEmail")]
+    pub inviter_email_address: Option<String>,
+
+    #[serde(
+        rename = "MemberSharePassphraseKeyPacket",
+        default,
+        with = "crate::utils::serde::forgiving_hex_bytes_opt"
+    )]
+    pub member_share_passphrase_key_packet: Option<Vec<u8>>,
+
+    #[serde(rename = "InviterSharePassphraseKeyPacketSignature")]
+    pub inviter_share_passphrase_key_packet_signature: Option<PgpArmoredSignature>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1639,6 +1655,35 @@ mod tests {
         assert_eq!(res.links.len(), 1);
         assert_eq!(res.links[0].share_target_type, ShareTargetType::File);
         assert!(res.more);
+    }
+
+    #[test]
+    fn membership_summary_parses_public_metadata() {
+        let membership: ShareMembershipSummaryDto = serde_json::from_str(
+            r#"{
+                "ShareID": "share",
+                "MembershipID": "membership",
+                "Permissions": 6,
+                "InviteTime": 1727000000,
+                "InviterEmail": "owner@example.com",
+                "MemberSharePassphraseKeyPacket": "0102"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            membership.inviter_email_address.as_deref(),
+            Some("owner@example.com")
+        );
+        assert_eq!(
+            membership.member_share_passphrase_key_packet,
+            Some(vec![1, 2])
+        );
+        assert!(
+            membership
+                .permissions
+                .contains(ShareMemberPermissions::WRITE)
+        );
     }
 
     #[test]

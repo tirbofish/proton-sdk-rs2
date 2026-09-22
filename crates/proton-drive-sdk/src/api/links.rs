@@ -447,6 +447,9 @@ pub struct LinkIdResponsePair {
 pub struct LinkSharingDto {
     #[serde(rename = "ShareID")]
     pub share_id: ShareId,
+
+    #[serde(rename = "ShareURLID")]
+    pub share_url_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]

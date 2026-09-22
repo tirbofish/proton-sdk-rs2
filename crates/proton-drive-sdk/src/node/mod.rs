@@ -424,6 +424,31 @@ pub struct NodeBase {
     pub name_author: PotentialObject<Author, SignatureVerificationError>,
     pub author: PotentialObject<Author, SignatureVerificationError>,
     pub owned_by: Option<OwnedBy>,
+    #[serde(default)]
+    pub is_shared: bool,
+    #[serde(default)]
+    pub is_shared_by_url: bool,
+    #[serde(default)]
+    pub direct_role: NodeMemberRole,
+    #[serde(default)]
+    pub membership: Option<NodeMembership>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeMemberRole {
+    #[default]
+    Inherited,
+    Viewer,
+    Editor,
+    Admin,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeMembership {
+    pub role: NodeMemberRole,
+    pub invite_time: DateTime<Utc>,
+    pub shared_by: PotentialObject<Author, SignatureVerificationError>,
 }
 
 impl NodeBase {
@@ -953,6 +978,18 @@ impl DtoToMetadataConverter {
         parent_key: Option<&PgpPrivateKey>,
     ) -> anyhow::Result<NodeMetadataResult> {
         let link_dto = link_details.link.clone();
+        let is_shared = link_details.sharing.is_some();
+        let is_shared_by_url = link_details
+            .sharing
+            .as_ref()
+            .is_some_and(|sharing| sharing.share_url_id.is_some());
+        let (direct_role, membership) = Self::build_membership_info(
+            account_client.clone(),
+            _entity_cache,
+            &_volume_id,
+            link_details.membership.as_ref(),
+        )
+        .await?;
         let parent_key_result: Result<Vec<PgpPrivateKey>, String> = match parent_key {
             Some(k) => Ok(vec![k.clone()]),
             None => {
@@ -1070,6 +1107,10 @@ impl DtoToMetadataConverter {
                             email: o.email.clone(),
                             organisation: o.organization.clone(),
                         }),
+                        is_shared,
+                        is_shared_by_url,
+                        direct_role,
+                        membership: membership.clone(),
                     };
 
                     let passphrase_decryption_output = decryption.link.passphrase.map_err(|e| {
@@ -1161,6 +1202,10 @@ impl DtoToMetadataConverter {
                             email: o.email.clone(),
                             organisation: o.organization.clone(),
                         }),
+                        is_shared,
+                        is_shared_by_url,
+                        direct_role,
+                        membership,
                     };
 
                     let passphrase_decryption_output = decryption
@@ -1276,5 +1321,80 @@ impl DtoToMetadataConverter {
                 }
             }
         }
+    }
+
+    async fn build_membership_info(
+        account: std::sync::Arc<dyn crate::account::AccountClient>,
+        entity_cache: &dyn crate::cache::entity::DriveEntityCache,
+        volume_id: &VolumeId,
+        dto: Option<&crate::api::share::ShareMembershipSummaryDto>,
+    ) -> anyhow::Result<(NodeMemberRole, Option<NodeMembership>)> {
+        let own_volume = entity_cache.try_get_main_volume_id().await?.as_ref() == Some(volume_id);
+        let role = dto.map_or(NodeMemberRole::Inherited, |membership| {
+            if membership
+                .permissions
+                .contains(crate::api::share::ShareMemberPermissions::ADMIN)
+            {
+                NodeMemberRole::Admin
+            } else if membership
+                .permissions
+                .contains(crate::api::share::ShareMemberPermissions::WRITE)
+            {
+                NodeMemberRole::Editor
+            } else {
+                NodeMemberRole::Viewer
+            }
+        });
+        let direct_role = if own_volume {
+            NodeMemberRole::Admin
+        } else {
+            role
+        };
+        let Some(dto) = dto else {
+            return Ok((direct_role, None));
+        };
+
+        let claim = crate::node::authorship::AuthorshipClaim::create(
+            account,
+            dto.inviter_email_address.as_deref(),
+        )
+        .await;
+        let verified = match (
+            dto.member_share_passphrase_key_packet.as_ref(),
+            dto.inviter_share_passphrase_key_packet_signature.as_ref(),
+        ) {
+            (Some(packet), Some(signature)) if !claim.keys.is_empty() => {
+                proton_rpgp::Verifier::default()
+                    .with_verification_keys(claim.keys.iter())
+                    .with_verification_context(proton_rpgp::VerificationContext::new_required(
+                        "drive.share-member.inviter".into(),
+                    ))
+                    .verify_detached(
+                        packet,
+                        signature.0.as_bytes(),
+                        proton_rpgp::DataEncoding::Armored,
+                    )
+                    .is_ok()
+            }
+            _ => false,
+        };
+        let shared_by = if verified {
+            PotentialObject::Node(claim.author)
+        } else {
+            PotentialObject::Degraded(SignatureVerificationError {
+                claimed_author: Some(crate::protobuf::Author {
+                    email_address: claim.author.email_address.unwrap_or_default(),
+                }),
+                message: "membership inviter signature could not be verified".into(),
+            })
+        };
+        Ok((
+            direct_role,
+            Some(NodeMembership {
+                role,
+                invite_time: dto.invite_time,
+                shared_by,
+            }),
+        ))
     }
 }

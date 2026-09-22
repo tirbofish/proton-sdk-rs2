@@ -133,6 +133,10 @@ impl FolderOperations {
                 }),
                 creation_time: Utc::now(),
                 trash_time: None,
+                is_shared: false,
+                is_shared_by_url: false,
+                direct_role: crate::node::NodeMemberRole::Admin,
+                membership: None,
                 ..NodeBase::default()
             },
         };

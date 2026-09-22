@@ -1,9 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 
 use proton_drive_sdk::client::ProtonDriveClient;
+use proton_drive_sdk::device_ops::DeviceOperations;
 use proton_drive_sdk::futures::StreamExt;
 use proton_drive_sdk::node::{Node, NodeUid};
+use proton_drive_sdk::photo::ProtonPhotosClient;
 use proton_drive_sdk::utils::PotentialObject;
 
 use crate::{computers, daemon};
@@ -14,6 +16,15 @@ const MANIFEST_NAME: &str = ".pdcli-takeout-manifest.json";
 struct Manifest {
     version: u8,
     entries: BTreeMap<String, ManifestEntry>,
+    #[serde(default)]
+    issues: Vec<ManifestIssue>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ManifestIssue {
+    uid: String,
+    path: String,
+    error: String,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -44,6 +55,23 @@ pub async fn run_cli(force_offline: bool, destination: PathBuf) -> anyhow::Resul
         &drive,
         root.base.uid,
         Path::new(""),
+        &destination,
+        &manifest_path,
+        &mut manifest,
+        &mut stats,
+    )
+    .await?;
+
+    export_photos(
+        &ProtonPhotosClient::new(&session, None)?,
+        &destination,
+        &manifest_path,
+        &mut manifest,
+        &mut stats,
+    )
+    .await?;
+    export_devices(
+        &drive,
         &destination,
         &manifest_path,
         &mut manifest,
@@ -86,7 +114,7 @@ async fn export_folder(
                 ))
                 .await?;
             }
-            PotentialObject::Node(Node::File(node)) => {
+            PotentialObject::Node(Node::File(node) | Node::Photo(node)) => {
                 export_file(
                     drive,
                     node.base.base.uid,
@@ -104,13 +132,135 @@ async fn export_folder(
                 )
                 .await?;
             }
-            PotentialObject::Node(Node::Photo(_)) | PotentialObject::Degraded(_) => {
-                stats.unsupported += 1;
-                tracing::warn!(path = %relative_dir.display(), "skipping a node that cannot be exported as a My Files file");
+            PotentialObject::Degraded(node) => {
+                record_issue(
+                    node.uid(),
+                    relative_dir,
+                    "node metadata could not be decrypted",
+                    manifest_path,
+                    manifest,
+                    stats,
+                )?;
             }
         }
     }
     Ok(())
+}
+
+async fn export_photos(
+    photos: &ProtonPhotosClient,
+    destination: &Path,
+    manifest_path: &Path,
+    manifest: &mut Manifest,
+    stats: &mut Stats,
+) -> anyhow::Result<()> {
+    let relative_dir = Path::new("Photos");
+    std::fs::create_dir_all(destination.join(relative_dir))?;
+    let timeline = photos.iterate_timeline().await?;
+    let capture_times: HashMap<NodeUid, chrono::DateTime<chrono::Utc>> = timeline
+        .iter()
+        .map(|item| (item.uid.clone(), item.capture_time))
+        .collect();
+
+    for item in photos
+        .enumerate_nodes(timeline.into_iter().map(|item| item.uid).collect())
+        .await?
+    {
+        match item {
+            PotentialObject::Node(Node::File(node) | Node::Photo(node)) => {
+                let photo_dir = capture_times
+                    .get(&node.base.base.uid)
+                    .map(|time| relative_dir.join(time.format("%Y/%m").to_string()))
+                    .unwrap_or_else(|| relative_dir.join("undated"));
+                export_file(
+                    photos.drive(),
+                    node.base.base.uid,
+                    &node.base.base.name,
+                    node.active_revision.uid.to_string(),
+                    node.active_revision
+                        .claimed_size
+                        .unwrap_or(node.total_size_on_cloud_storage)
+                        .max(0) as u64,
+                    &photo_dir,
+                    destination,
+                    manifest_path,
+                    manifest,
+                    stats,
+                )
+                .await?;
+            }
+            PotentialObject::Node(node) => record_issue(
+                node.uid(),
+                relative_dir,
+                "timeline entry is not a photo file",
+                manifest_path,
+                manifest,
+                stats,
+            )?,
+            PotentialObject::Degraded(node) => record_issue(
+                node.uid(),
+                relative_dir,
+                "photo metadata could not be decrypted",
+                manifest_path,
+                manifest,
+                stats,
+            )?,
+        }
+    }
+    Ok(())
+}
+
+async fn export_devices(
+    drive: &ProtonDriveClient,
+    destination: &Path,
+    manifest_path: &Path,
+    manifest: &mut Manifest,
+    stats: &mut Stats,
+) -> anyhow::Result<()> {
+    let relative_dir = Path::new("Computers");
+    std::fs::create_dir_all(destination.join(relative_dir))?;
+    for device in DeviceOperations::list_devices(drive).await? {
+        let device_dir = relative_dir.join(safe_name(&device.name));
+        std::fs::create_dir_all(destination.join(&device_dir))?;
+        if let Err(error) = Box::pin(export_folder(
+            drive,
+            device.root_uid.clone(),
+            &device_dir,
+            destination,
+            manifest_path,
+            manifest,
+            stats,
+        ))
+        .await
+        {
+            record_issue(
+                &device.root_uid,
+                &device_dir,
+                &error.to_string(),
+                manifest_path,
+                manifest,
+                stats,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn record_issue(
+    uid: &NodeUid,
+    path: &Path,
+    error: &str,
+    manifest_path: &Path,
+    manifest: &mut Manifest,
+    stats: &mut Stats,
+) -> anyhow::Result<()> {
+    stats.unsupported += 1;
+    manifest.issues.push(ManifestIssue {
+        uid: uid.raw(),
+        path: path.to_string_lossy().into_owned(),
+        error: error.to_string(),
+    });
+    save_manifest(manifest_path, manifest)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -280,5 +430,20 @@ mod tests {
         assert!(safe_manifest_path("../outside").is_none());
         assert!(safe_manifest_path("/outside").is_none());
         assert_eq!(safe_name("a/b"), "a_b");
+
+        let manifest = Manifest {
+            version: 1,
+            entries: BTreeMap::new(),
+            issues: vec![ManifestIssue {
+                uid: "volume~node".into(),
+                path: "Photos".into(),
+                error: "cannot decrypt".into(),
+            }],
+        };
+        assert!(
+            serde_json::to_string(&manifest)
+                .unwrap()
+                .contains("cannot decrypt")
+        );
     }
 }

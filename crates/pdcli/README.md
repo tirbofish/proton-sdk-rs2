@@ -56,9 +56,10 @@ directory and preview the job without registering a device, creating a remote
 folder, or saving a job.
 The Proton Drive mount itself cannot be used as a Computer source.
 
-`takeout` exports My Files to a directory and records completed files in
-`.pdcli-takeout-manifest.json`, so rerunning resumes safely. Photos,
-degraded/unsupported nodes, and Computers backups are currently skipped.
+`takeout` exports My Files, Photos, and Computer backups to a directory and
+records completed files in `.pdcli-takeout-manifest.json`, so rerunning resumes
+safely. Degraded or unsupported nodes are recorded in the manifest's `issues`
+list.
 Public-link commands accept a node UID; `share remove` removes that node's
 public link. Passwords passed with `--password` may be recorded by shell
 history. `share report` submits an abuse report for a shared node. `--bona-fide`

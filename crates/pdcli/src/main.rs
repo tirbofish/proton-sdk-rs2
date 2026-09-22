@@ -37,8 +37,27 @@ async fn main() {
     let cli = Cli::parse();
     if let Err(e) = dispatch(cli).await {
         tracing::error!(error = %e, "pdcli failed");
+        if is_storage_quota_error(&e) {
+            eprintln!(
+                "Proton Drive is out of storage. Free space (including Trash) or upgrade your plan:"
+            );
+            eprintln!(
+                "https://account.proton.me/drive/dashboard?plan=drive2022&target=compare&ref=upsell_drive_cli"
+            );
+        }
         std::process::exit(1);
     }
+}
+
+fn is_storage_quota_error(error: &anyhow::Error) -> bool {
+    const CODES: [u32; 4] = [200001, 200002, 200100, 200101];
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .split(|character: char| !character.is_ascii_digit())
+            .filter_map(|part| part.parse().ok())
+            .any(|code| CODES.contains(&code))
+    })
 }
 
 async fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -320,5 +339,20 @@ extern "C" fn handle_signal(sig: libc::c_int) {
     unsafe {
         libc::signal(sig, libc::SIG_DFL);
         libc::raise(sig);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_storage_quota_error;
+
+    #[test]
+    fn detects_only_storage_quota_response_codes() {
+        assert!(is_storage_quota_error(&anyhow::anyhow!(
+            "API error 200002: Storage quota exceeded"
+        )));
+        assert!(!is_storage_quota_error(&anyhow::anyhow!(
+            "API error 2500: upload failed"
+        )));
     }
 }

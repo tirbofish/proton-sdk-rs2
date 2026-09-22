@@ -176,6 +176,12 @@ pub struct NodeUid {
     pub link_id: LinkId,
 }
 
+#[derive(Debug)]
+pub struct NodeMoveResult {
+    pub uid: NodeUid,
+    pub result: anyhow::Result<()>,
+}
+
 pub const PROTON_DOC_MEDIA_TYPE: &str = "application/vnd.proton.doc";
 pub const PROTON_SHEET_MEDIA_TYPE: &str = "application/vnd.proton.sheet";
 

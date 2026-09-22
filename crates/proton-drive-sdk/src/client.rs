@@ -28,7 +28,7 @@ use crate::node::revision::{
     REVISION_WRITER_DEFAULT_BLOCK_SIZE, RevisionInfo, RevisionState, RevisionUid,
 };
 use crate::node::thumbnail::ThumbnailType;
-use crate::node::{DegradedNode, Node, NodeUid};
+use crate::node::{DegradedNode, Node, NodeMoveResult, NodeUid};
 use crate::utils::PotentialObject;
 use crate::utils::semaphore::FifoFlexibleSemaphore;
 use crate::volume::VolumeId;
@@ -942,7 +942,45 @@ impl ProtonDriveClient {
         uids: Vec<NodeUid>,
         new_parent_folder_uid: NodeUid,
     ) -> anyhow::Result<()> {
-        NodeOperations::move_multiple(self, uids, new_parent_folder_uid).await
+        let results = self.move_nodes_stream(uids, new_parent_folder_uid);
+        tokio::pin!(results);
+        let mut first_error = None;
+        while let Some(result) = futures::StreamExt::next(&mut results).await {
+            retain_first_move_error(&mut first_error, result);
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Moves nodes concurrently and yields each independent result as soon as it completes.
+    pub fn move_nodes_stream(
+        &self,
+        uids: Vec<NodeUid>,
+        new_parent_folder_uid: NodeUid,
+    ) -> impl futures::Stream<Item = NodeMoveResult> + 'static {
+        use futures::StreamExt;
+
+        let client = self.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            futures::stream::iter(uids)
+                .map(|uid| {
+                    let client = client.clone();
+                    let parent = new_parent_folder_uid.clone();
+                    async move {
+                        let result =
+                            NodeOperations::move_single(&client, uid.clone(), parent, None).await;
+                        NodeMoveResult { uid, result }
+                    }
+                })
+                .buffer_unordered(8)
+                .for_each(|result| async {
+                    let _ = tx.send(result).await;
+                })
+                .await;
+        });
+        futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|result| (result, rx))
+        })
     }
 
     /// Copies a single node to `new_parent_folder_uid`, optionally renaming it with `new_name`.
@@ -1308,4 +1346,42 @@ fn generate_uid() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("drive-client-{}", nanos)
+}
+
+fn retain_first_move_error(first_error: &mut Option<anyhow::Error>, result: NodeMoveResult) {
+    if first_error.is_none() {
+        *first_error = result.result.err();
+    }
+}
+
+#[cfg(test)]
+mod move_result_tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_move_keeps_the_first_failure_without_rejecting_successes() {
+        let mut error = None;
+        retain_first_move_error(
+            &mut error,
+            NodeMoveResult {
+                uid: NodeUid::default(),
+                result: Ok(()),
+            },
+        );
+        retain_first_move_error(
+            &mut error,
+            NodeMoveResult {
+                uid: NodeUid::default(),
+                result: Err(anyhow::anyhow!("first")),
+            },
+        );
+        retain_first_move_error(
+            &mut error,
+            NodeMoveResult {
+                uid: NodeUid::default(),
+                result: Err(anyhow::anyhow!("second")),
+            },
+        );
+        assert_eq!(error.unwrap().to_string(), "first");
+    }
 }

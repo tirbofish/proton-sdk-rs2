@@ -1329,7 +1329,8 @@ impl DtoToMetadataConverter {
         volume_id: &VolumeId,
         dto: Option<&crate::api::share::ShareMembershipSummaryDto>,
     ) -> anyhow::Result<(NodeMemberRole, Option<NodeMembership>)> {
-        let own_volume = entity_cache.try_get_main_volume_id().await?.as_ref() == Some(volume_id);
+        let own_volume = entity_cache.try_get_main_volume_id().await?.as_ref() == Some(volume_id)
+            || entity_cache.try_get_photos_volume_id().await?.as_ref() == Some(volume_id);
         let role = dto.map_or(NodeMemberRole::Inherited, |membership| {
             if membership
                 .permissions

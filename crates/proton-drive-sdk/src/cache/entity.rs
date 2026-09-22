@@ -40,6 +40,7 @@ pub trait DriveEntityCache: EntityCache + Send + Sync {
     async fn try_get_client_uid(&self) -> anyhow::Result<Option<String>>;
     async fn set_main_volume_id(&self, volume_id: VolumeId) -> anyhow::Result<()>;
     async fn try_get_main_volume_id(&self) -> anyhow::Result<Option<VolumeId>>;
+    async fn try_get_photos_volume_id(&self) -> anyhow::Result<Option<VolumeId>>;
     async fn set_my_files_share_id(&self, share_id: ShareId) -> anyhow::Result<()>;
     async fn try_get_my_files_share_id(&self) -> anyhow::Result<Option<ShareId>>;
     async fn set_share(&self, share: Share) -> anyhow::Result<()>;
@@ -114,6 +115,11 @@ impl DriveEntityCache for DefaultDriveEntityCache {
 
     async fn try_get_main_volume_id(&self) -> anyhow::Result<Option<VolumeId>> {
         let value = self.repository.try_get(MAIN_VOLUME_ID_KEY).await?;
+        Ok(value.map(VolumeId::new))
+    }
+
+    async fn try_get_photos_volume_id(&self) -> anyhow::Result<Option<VolumeId>> {
+        let value = self.repository.try_get(photos_volume_id_key()).await?;
         Ok(value.map(VolumeId::new))
     }
 
@@ -194,5 +200,25 @@ impl PhotosEntityCache for DefaultPhotosEntityCache {
             .try_get(photos_share_id_key())
             .await?
             .map(ShareId::new))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn drive_cache_reads_the_shared_photos_volume_key() {
+        let repository = Arc::new(proton_sdk_rs2::cache::InMemoryCacheRepository::new());
+        let drive = DefaultDriveEntityCache::new(repository.clone());
+        let photos = DefaultPhotosEntityCache::new(repository);
+        let volume = VolumeId::new("photos".into());
+
+        photos.set_photos_volume_id(volume.clone()).await.unwrap();
+
+        assert_eq!(
+            drive.try_get_photos_volume_id().await.unwrap(),
+            Some(volume)
+        );
     }
 }

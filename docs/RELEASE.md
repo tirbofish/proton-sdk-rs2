@@ -1,4 +1,4 @@
-# pdcli 0.3.1
+# pdcli 0.3.2
 
 This release is a Linux-only, community build of the Proton Drive client. It
 mounts `~/ProtonDrive` through FUSE, with `MyFiles/` and `Computers/` roots.

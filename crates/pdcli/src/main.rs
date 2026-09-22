@@ -15,6 +15,7 @@ mod daemon;
 mod db;
 mod flags;
 mod fs;
+mod job_control;
 mod pdignore;
 mod quoted;
 mod service;
@@ -33,6 +34,7 @@ async fn main() {
                 .unwrap_or_else(|_| "pdcli=info".into()),
         )
         .init();
+    job_control::install();
 
     let cli = Cli::parse();
     if let Err(e) = dispatch(cli).await {

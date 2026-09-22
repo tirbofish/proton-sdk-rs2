@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use proton_drive_sdk::client::ProtonDriveClient;
 use proton_drive_sdk::device_ops::DeviceOperations;
 use proton_drive_sdk::futures::StreamExt;
-use proton_drive_sdk::node::{Node, NodeUid};
+use proton_drive_sdk::node::{Node, NodeUid, is_proton_document, is_proton_sheet};
 use proton_drive_sdk::photo::ProtonPhotosClient;
 use proton_drive_sdk::utils::PotentialObject;
 
@@ -115,6 +115,17 @@ async fn export_folder(
                 .await?;
             }
             PotentialObject::Node(Node::File(node) | Node::Photo(node)) => {
+                if unsupported_media_type(&node.base.media_type) {
+                    record_issue(
+                        &node.base.base.uid,
+                        relative_dir,
+                        "Proton Docs and Sheets are not supported in takeout",
+                        manifest_path,
+                        manifest,
+                        stats,
+                    )?;
+                    continue;
+                }
                 export_file(
                     drive,
                     node.base.base.uid,
@@ -168,6 +179,17 @@ async fn export_photos(
     {
         match item {
             PotentialObject::Node(Node::File(node) | Node::Photo(node)) => {
+                if unsupported_media_type(&node.base.media_type) {
+                    record_issue(
+                        &node.base.base.uid,
+                        relative_dir,
+                        "Proton Docs and Sheets are not supported in takeout",
+                        manifest_path,
+                        manifest,
+                        stats,
+                    )?;
+                    continue;
+                }
                 let photo_dir = capture_times
                     .get(&node.base.base.uid)
                     .map(|time| relative_dir.join(time.format("%Y/%m").to_string()))
@@ -208,6 +230,10 @@ async fn export_photos(
         }
     }
     Ok(())
+}
+
+fn unsupported_media_type(media_type: &str) -> bool {
+    is_proton_document(Some(media_type)) || is_proton_sheet(Some(media_type))
 }
 
 async fn export_devices(
@@ -445,5 +471,12 @@ mod tests {
                 .unwrap()
                 .contains("cannot decrypt")
         );
+    }
+
+    #[test]
+    fn proton_documents_are_reported_as_unsupported() {
+        assert!(unsupported_media_type("application/vnd.proton.doc"));
+        assert!(unsupported_media_type("application/vnd.proton.sheet"));
+        assert!(!unsupported_media_type("image/jpeg"));
     }
 }

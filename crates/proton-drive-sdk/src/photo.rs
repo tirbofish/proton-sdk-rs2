@@ -1,9 +1,10 @@
 use crate::api::events::{CoreEventsResponse, VolumeEventsResponse};
 use crate::api::file::photos::{
     AddPhotoToAlbumItem, AddPhotosToAlbumRequest, AlbumChildItem, AlbumCreationRequest, AlbumInfo,
-    AlbumLinkCreationFields, AlbumNameUpdate, AlbumUpdateRequest, DefaultPhotosApiClient,
-    FavoritePhotoData, FavoritePhotoPayload, PhotoTagUpdate, PhotosApiClient, PhotosApiClients,
-    TimelinePhotoListRequest,
+    AlbumLinkCreationFields, AlbumNameUpdate, AlbumUpdateRequest, CopyPhotoContent,
+    CopyPhotoRelatedItem, CopyPhotoRequest, DefaultPhotosApiClient, FavoritePhotoData,
+    FavoritePhotoPayload, PhotoTagUpdate, PhotosApiClient, PhotosApiClients,
+    TimelinePhotoListRequest, TransferPhotoLinkItem, TransferPhotosRequest,
 };
 use crate::api::{DriveApiClients, DriveApiClientsFactory};
 use crate::cache::entity::{DefaultPhotosEntityCache, PhotosEntityCache};
@@ -56,6 +57,25 @@ pub struct ProtonPhotosClient {
     /// Photos-specific entity cache (volume/share IDs are stored separately
     /// from the main-drive entity cache).
     photos_entities: Arc<DefaultPhotosEntityCache>,
+}
+
+#[derive(Debug)]
+pub struct PhotoSaveResult {
+    pub uid: NodeUid,
+    pub result: anyhow::Result<()>,
+}
+
+#[derive(Clone)]
+struct PhotoTransferPayload {
+    uid: NodeUid,
+    name: crate::pgp::PgpArmoredMessage,
+    passphrase: crate::pgp::PgpArmoredMessage,
+    passphrase_signature: Option<crate::pgp::PgpArmoredSignature>,
+    signature_email: Option<String>,
+    name_hash: Vec<u8>,
+    original_name_hash: Vec<u8>,
+    content_hash: Vec<u8>,
+    related: Vec<PhotoTransferPayload>,
 }
 
 impl ProtonPhotosClient {
@@ -881,6 +901,265 @@ impl ProtonPhotosClient {
         }
 
         Ok(())
+    }
+
+    /// Saves photos into the account timeline. A failed photo does not discard
+    /// results from photos that were processed before it.
+    pub async fn save_to_timeline(&self, photo_uids: Vec<NodeUid>) -> Vec<PhotoSaveResult> {
+        let mut results = Vec::with_capacity(photo_uids.len());
+        for uid in photo_uids {
+            let result = self.save_one_to_timeline(uid.clone()).await;
+            results.push(PhotoSaveResult { uid, result });
+        }
+        results
+    }
+
+    async fn save_one_to_timeline(&self, uid: NodeUid) -> anyhow::Result<()> {
+        let root = self.get_photos_root_folder().await?;
+        let root_secrets = self.get_root_folder_secrets(&root.base.uid).await?;
+        let signing_key = self.get_signing_key().await?;
+        let address = self.drive.account().get_default_address().await?;
+        let mut extra_related = Vec::new();
+
+        for attempt in 0..=1 {
+            let payload = self
+                .build_transfer_payload(
+                    &uid,
+                    &extra_related,
+                    &root.base.uid,
+                    &root_secrets,
+                    &signing_key,
+                )
+                .await?;
+
+            let missing = if uid.volume_id == root.base.uid.volume_id {
+                self.transfer_same_volume(&root.base.uid, &address.email_address, &payload)
+                    .await?
+            } else {
+                self.copy_cross_volume(&root.base.uid, &address.email_address, &payload)
+                    .await?
+            };
+            if missing.is_empty() {
+                return Ok(());
+            }
+            if attempt == 1 {
+                anyhow::bail!("photo {} is still missing related photos", uid);
+            }
+            extra_related = missing
+                .into_iter()
+                .map(|link_id| NodeUid::new(uid.volume_id.clone(), link_id))
+                .collect();
+        }
+        unreachable!()
+    }
+
+    fn build_transfer_payload<'a>(
+        &'a self,
+        uid: &'a NodeUid,
+        extra_related: &'a [NodeUid],
+        target_uid: &'a NodeUid,
+        target_secrets: &'a FolderSecrets,
+        signing_key: &'a PgpPrivateKey,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<PhotoTransferPayload>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let response = self
+                .drive
+                .api()
+                .links()
+                .get_details(uid.volume_id.clone(), vec![uid.link_id.clone()])
+                .await?;
+            let details = response
+                .links
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("Photo {} not found", uid))?;
+            if details.link.parent_id.as_ref() == Some(&target_uid.link_id)
+                && uid.volume_id == target_uid.volume_id
+            {
+                anyhow::bail!("Photo {} is already in the timeline", uid);
+            }
+
+            let mut related_uids: Vec<NodeUid> = details
+                .photo
+                .as_ref()
+                .map(|photo| {
+                    photo
+                        .related_photos_link_ids
+                        .iter()
+                        .map(|id| NodeUid::from_parts(uid.volume_id.raw(), id))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for related in extra_related {
+                if !related_uids.contains(related) {
+                    related_uids.push(related.clone());
+                }
+            }
+
+            let content_digest = details
+                .photo
+                .as_ref()
+                .and_then(|photo| photo.content_hash.clone())
+                .ok_or_else(|| anyhow::anyhow!("Photo {} has no content hash", uid))?;
+            let metadata = DtoToMetadataConverter::convert_dto_to_node_metadata(
+                self.drive.account().clone(),
+                self.drive.cache().entities().as_ref(),
+                self.drive.cache().secrets().as_ref(),
+                uid.volume_id.clone(),
+                details,
+                None,
+            )
+            .await?
+            .result()?;
+            let original_name_hash = metadata.name_hash_digest.clone();
+            let (node, secrets) = match metadata.inner {
+                NodeAndSecrets::File(node, secrets) => (node, secrets),
+                NodeAndSecrets::Folder(..) => anyhow::bail!("Node {} is not a photo", uid),
+            };
+            let name = node.base.base.name;
+            let encrypted_name = NodeCrypto::encrypt_name(
+                &name,
+                &secrets.base.name_session_key,
+                &target_secrets.base.key,
+                signing_key,
+            )?;
+            let passphrase = NodeCrypto::reencrypt_passphrase(
+                &secrets.base.passphrase_session_key.key,
+                secrets.base.passphrase_pgp_session_key.as_ref(),
+                &target_secrets.base.key,
+                signing_key,
+            )?;
+            let name_hash = Self::hash_for_folder(&target_secrets.hash_key, name.as_bytes())?;
+            let content_hash = Self::hash_for_folder(
+                &target_secrets.hash_key,
+                hex::encode(content_digest).as_bytes(),
+            )?;
+
+            let mut related = Vec::new();
+            for related_uid in related_uids {
+                related.push(
+                    self.build_transfer_payload(
+                        &related_uid,
+                        &[],
+                        target_uid,
+                        target_secrets,
+                        signing_key,
+                    )
+                    .await?,
+                );
+            }
+
+            Ok(PhotoTransferPayload {
+                uid: uid.clone(),
+                name: encrypted_name,
+                passphrase,
+                passphrase_signature: None,
+                signature_email: None,
+                name_hash,
+                original_name_hash,
+                content_hash,
+                related,
+            })
+        })
+    }
+
+    fn hash_for_folder(key: &[u8], value: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let mut mac =
+            HmacSha256::new_from_slice(key).map_err(|_| anyhow::anyhow!("Invalid hash key"))?;
+        mac.update(value);
+        Ok(mac.finalize().into_bytes().to_vec())
+    }
+
+    async fn transfer_same_volume(
+        &self,
+        target: &NodeUid,
+        email: &str,
+        payload: &PhotoTransferPayload,
+    ) -> anyhow::Result<Vec<LinkId>> {
+        let links = std::iter::once(payload)
+            .chain(payload.related.iter())
+            .map(|item| TransferPhotoLinkItem {
+                link_id: item.uid.link_id.clone(),
+                name_hash_digest: item.name_hash.clone(),
+                original_name_hash_digest: item.original_name_hash.clone(),
+                name: item.name.clone(),
+                node_passphrase: item.passphrase.clone(),
+                content_hash: item.content_hash.clone(),
+                node_passphrase_signature: item.passphrase_signature.clone(),
+            })
+            .collect();
+        let response = self
+            .photos_api
+            .transfer_photos(
+                target.volume_id.clone(),
+                TransferPhotosRequest {
+                    parent_link_id: target.link_id.clone(),
+                    links,
+                    name_signature_email: email.to_string(),
+                    signature_email: None,
+                },
+            )
+            .await?;
+        let item = response
+            .responses
+            .into_iter()
+            .find(|item| item.link_id == payload.uid.link_id);
+        match item {
+            None => Ok(vec![]),
+            Some(item) if item.response.base.is_success() => Ok(vec![]),
+            Some(item) => match item.response.details.and_then(|details| details.missing) {
+                Some(missing) if !missing.is_empty() => Ok(missing),
+                _ => item.response.base.to_result().map(|_| vec![]),
+            },
+        }
+    }
+
+    async fn copy_cross_volume(
+        &self,
+        target: &NodeUid,
+        email: &str,
+        payload: &PhotoTransferPayload,
+    ) -> anyhow::Result<Vec<LinkId>> {
+        let response = self
+            .photos_api
+            .copy_photo(
+                payload.uid.volume_id.clone(),
+                payload.uid.link_id.clone(),
+                CopyPhotoRequest {
+                    target_volume_id: target.volume_id.clone(),
+                    target_parent_link_id: target.link_id.clone(),
+                    name_hash_digest: payload.name_hash.clone(),
+                    name: payload.name.clone(),
+                    name_signature_email: email.to_string(),
+                    node_passphrase: payload.passphrase.clone(),
+                    node_passphrase_signature: payload.passphrase_signature.clone(),
+                    signature_email: payload.signature_email.clone(),
+                    photos: CopyPhotoContent {
+                        content_hash: payload.content_hash.clone(),
+                        related_photos: payload
+                            .related
+                            .iter()
+                            .map(|item| CopyPhotoRelatedItem {
+                                link_id: item.uid.link_id.clone(),
+                                name_hash_digest: item.name_hash.clone(),
+                                name: item.name.clone(),
+                                node_passphrase: item.passphrase.clone(),
+                                content_hash: item.content_hash.clone(),
+                            })
+                            .collect(),
+                    },
+                },
+            )
+            .await?;
+        if response.base.is_success() {
+            return Ok(vec![]);
+        }
+        match response.details.and_then(|details| details.missing) {
+            Some(missing) if !missing.is_empty() => Ok(missing),
+            _ => response.base.to_result().map(|_| vec![]),
+        }
     }
 
     async fn get_root_hash_key(&self, root_uid: &NodeUid) -> anyhow::Result<Vec<u8>> {

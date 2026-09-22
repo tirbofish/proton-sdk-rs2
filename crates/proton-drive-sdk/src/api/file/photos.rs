@@ -117,6 +117,19 @@ pub trait PhotosApiClient: Send + Sync {
         payload: Option<FavoritePhotoPayload>,
     ) -> anyhow::Result<()>;
 
+    async fn transfer_photos(
+        &self,
+        volume_id: VolumeId,
+        request: TransferPhotosRequest,
+    ) -> anyhow::Result<AggregateApiResponse<TransferPhotoResponsePair>>;
+
+    async fn copy_photo(
+        &self,
+        source_volume_id: VolumeId,
+        source_link_id: LinkId,
+        request: CopyPhotoRequest,
+    ) -> anyhow::Result<CopyPhotoResponse>;
+
     async fn get_shared_albums(
         &self,
         anchor_id: Option<LinkId>,
@@ -511,6 +524,105 @@ pub struct FavoritePhotoPayload {
     pub photo_data: FavoritePhotoData,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct TransferPhotoLinkItem {
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+    #[serde(rename = "Hash", with = "crate::utils::serde::forgiving_hex_bytes")]
+    pub name_hash_digest: Vec<u8>,
+    #[serde(
+        rename = "OriginalHash",
+        with = "crate::utils::serde::forgiving_hex_bytes"
+    )]
+    pub original_name_hash_digest: Vec<u8>,
+    pub name: PgpArmoredMessage,
+    pub node_passphrase: PgpArmoredMessage,
+    #[serde(with = "crate::utils::serde::forgiving_hex_bytes")]
+    pub content_hash: Vec<u8>,
+    pub node_passphrase_signature: Option<PgpArmoredSignature>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct TransferPhotosRequest {
+    #[serde(rename = "ParentLinkID")]
+    pub parent_link_id: LinkId,
+    pub links: Vec<TransferPhotoLinkItem>,
+    pub name_signature_email: String,
+    pub signature_email: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PhotoTransferDetails {
+    pub missing: Option<Vec<LinkId>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TransferPhotoResponse {
+    #[serde(flatten)]
+    pub base: ApiResponse,
+    #[serde(rename = "Details")]
+    pub details: Option<PhotoTransferDetails>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TransferPhotoResponsePair {
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+    #[serde(rename = "Response")]
+    pub response: TransferPhotoResponse,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct CopyPhotoRelatedItem {
+    #[serde(rename = "LinkID")]
+    pub link_id: LinkId,
+    #[serde(rename = "Hash", with = "crate::utils::serde::forgiving_hex_bytes")]
+    pub name_hash_digest: Vec<u8>,
+    pub name: PgpArmoredMessage,
+    pub node_passphrase: PgpArmoredMessage,
+    #[serde(with = "crate::utils::serde::forgiving_hex_bytes")]
+    pub content_hash: Vec<u8>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct CopyPhotoContent {
+    #[serde(with = "crate::utils::serde::forgiving_hex_bytes")]
+    pub content_hash: Vec<u8>,
+    pub related_photos: Vec<CopyPhotoRelatedItem>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct CopyPhotoRequest {
+    #[serde(rename = "TargetVolumeID")]
+    pub target_volume_id: VolumeId,
+    #[serde(rename = "TargetParentLinkID")]
+    pub target_parent_link_id: LinkId,
+    #[serde(rename = "Hash", with = "crate::utils::serde::forgiving_hex_bytes")]
+    pub name_hash_digest: Vec<u8>,
+    pub name: PgpArmoredMessage,
+    pub name_signature_email: String,
+    pub node_passphrase: PgpArmoredMessage,
+    pub node_passphrase_signature: Option<PgpArmoredSignature>,
+    pub signature_email: Option<String>,
+    pub photos: CopyPhotoContent,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CopyPhotoResponse {
+    #[serde(flatten)]
+    pub base: ApiResponse,
+    #[serde(rename = "LinkID")]
+    pub link_id: Option<LinkId>,
+    #[serde(rename = "Details")]
+    pub details: Option<PhotoTransferDetails>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AlbumInfo {
     pub uid: NodeUid,
@@ -845,6 +957,38 @@ impl PhotosApiClient for DefaultPhotosApiClient {
         Ok(())
     }
 
+    async fn transfer_photos(
+        &self,
+        volume_id: VolumeId,
+        request: TransferPhotosRequest,
+    ) -> anyhow::Result<AggregateApiResponse<TransferPhotoResponsePair>> {
+        let url = self.base_url.join(&format!(
+            "photos/volumes/{}/links/transfer-multiple",
+            volume_id.raw()
+        ))?;
+        let builder = self
+            .add_auth_headers(self.client.put(url).json(&request))
+            .await?;
+        Ok(builder.send().await?.json().await?)
+    }
+
+    async fn copy_photo(
+        &self,
+        source_volume_id: VolumeId,
+        source_link_id: LinkId,
+        request: CopyPhotoRequest,
+    ) -> anyhow::Result<CopyPhotoResponse> {
+        let url = self.base_url.join(&format!(
+            "volumes/{}/links/{}/copy",
+            source_volume_id.raw(),
+            source_link_id.raw()
+        ))?;
+        let builder = self
+            .add_auth_headers(self.client.post(url).json(&request))
+            .await?;
+        Ok(builder.send().await?.json().await?)
+    }
+
     async fn get_shared_albums(
         &self,
         anchor_id: Option<LinkId>,
@@ -987,6 +1131,32 @@ impl LinksApiClient for PhotosLinksApiClient {
         request: CopyLinkRequest,
     ) -> anyhow::Result<CopyLinkResponse> {
         self.drive.copy_link(volume_id, link_id, request).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfer_response_preserves_missing_related_photos() {
+        let response: AggregateApiResponse<TransferPhotoResponsePair> = serde_json::from_str(
+            r#"{"Code":1000,"Responses":[{"LinkID":"main","Response":{"Code":2500,"Error":"missing","Details":{"Missing":["related"]}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            response.responses[0]
+                .response
+                .details
+                .as_ref()
+                .unwrap()
+                .missing
+                .as_ref()
+                .unwrap()[0]
+                .raw(),
+            "related"
+        );
     }
 }
 

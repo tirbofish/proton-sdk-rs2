@@ -1,8 +1,48 @@
 use crate::api::ApiResponse;
 use crate::api::links::NameHashDigestUnavailabilityDto;
 use crate::links::LinkId;
+use crate::node::NodeUid;
 use crate::pgp::{PgpArmoredMessage, PgpArmoredPrivateKey, PgpArmoredSignature};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// A node opened or previewed by the user. An omitted access time defaults to now.
+#[derive(Debug, Clone)]
+pub struct RecentlyAccessedItem {
+    pub node_uid: NodeUid,
+    pub access_time: Option<DateTime<Utc>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) struct RecentlyAccessedRequest {
+    pub recently_accessed_items: Vec<RecentlyAccessedDto>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct RecentlyAccessedDto {
+    #[serde(rename = "VolumeID")]
+    volume_id: crate::volume::VolumeId,
+    #[serde(rename = "LinkID")]
+    link_id: LinkId,
+    #[serde(rename = "AccessTime")]
+    access_time: i64,
+}
+
+impl RecentlyAccessedRequest {
+    pub fn new(items: &[RecentlyAccessedItem], now: DateTime<Utc>) -> Self {
+        Self {
+            recently_accessed_items: items
+                .iter()
+                .map(|item| RecentlyAccessedDto {
+                    volume_id: item.node_uid.volume_id.clone(),
+                    link_id: item.node_uid.link_id.clone(),
+                    access_time: item.access_time.unwrap_or(now).timestamp(),
+                })
+                .collect(),
+        }
+    }
+}
 
 #[derive(Debug, Serialize)]
 pub struct NodeCreationRequest {

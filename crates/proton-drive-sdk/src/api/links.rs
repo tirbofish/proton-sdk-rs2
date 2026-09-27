@@ -1,7 +1,10 @@
 use crate::api::file::FileDto;
 use crate::api::file::photos::PhotoDto;
 use crate::api::folder::FolderDto;
-use crate::api::node::{NodeNameAvailabilityRequest, NodeNameAvailabilityResponse};
+use crate::api::node::{
+    NodeNameAvailabilityRequest, NodeNameAvailabilityResponse, RecentlyAccessedItem,
+    RecentlyAccessedRequest,
+};
 use crate::api::share::{ContextShareResponse, ShareMembershipSummaryDto};
 use crate::api::{AggregateApiResponse, ApiResponse};
 use crate::links::LinkId;
@@ -16,6 +19,8 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 
 #[async_trait]
 pub trait LinksApiClient: Send + Sync {
+    async fn report_recently_accessed(&self, items: &[RecentlyAccessedItem]) -> anyhow::Result<()>;
+
     async fn get_details(
         &self,
         volume_id: VolumeId,
@@ -101,10 +106,36 @@ impl DefaultLinksApiClient {
         }
         Ok(builder)
     }
+
+    pub(crate) async fn report_recently_accessed_to(
+        &self,
+        path: &str,
+        items: &[RecentlyAccessedItem],
+    ) -> anyhow::Result<()> {
+        let url = self.base_url.join(path)?;
+        let now = Utc::now();
+        for batch in items.chunks(50) {
+            let builder = self
+                .add_auth_headers(
+                    self.client
+                        .post(url.clone())
+                        .json(&RecentlyAccessedRequest::new(batch, now)),
+                )
+                .await?;
+            let response = builder.send().await?;
+            ApiResponse::from_response(response).await?.to_result()?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl LinksApiClient for DefaultLinksApiClient {
+    async fn report_recently_accessed(&self, items: &[RecentlyAccessedItem]) -> anyhow::Result<()> {
+        self.report_recently_accessed_to("recently-accessed-items", items)
+            .await
+    }
+
     async fn get_details(
         &self,
         volume_id: VolumeId,
@@ -601,4 +632,142 @@ pub struct RenameLinkRequest {
     #[serde(rename = "OriginalHash")]
     #[serde(with = "crate::utils::serde::forgiving_hex_bytes")]
     pub original_name_hash_digest: Vec<u8>,
+}
+
+#[cfg(test)]
+mod recently_accessed_tests {
+    use super::*;
+    use crate::api::file::photos::PhotosLinksApiClient;
+    use crate::node::NodeUid;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn receive_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 8192];
+        loop {
+            let count = stream.read(&mut buffer).await.unwrap();
+            assert!(count > 0, "request ended before body");
+            bytes.extend_from_slice(&buffer[..count]);
+            if let Some(header_end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.parse().ok())
+                    })
+                    .unwrap();
+                if bytes.len() >= header_end + 4 + length {
+                    return String::from_utf8(bytes).unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recently_accessed_batches_and_routes_drive_and_photos() {
+        for (photos, path) in [
+            (false, "/drive/recently-accessed-items"),
+            (true, "/drive/photos/recently-accessed-items"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url =
+                reqwest::Url::parse(&format!("http://{}/drive/", listener.local_addr().unwrap()))
+                    .unwrap();
+            let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+            let client: Box<dyn LinksApiClient> = if photos {
+                Box::new(PhotosLinksApiClient::new(http, url, None))
+            } else {
+                Box::new(DefaultLinksApiClient::new(http, url, None))
+            };
+            let items: Vec<_> = (0..51)
+                .map(|index| RecentlyAccessedItem {
+                    node_uid: NodeUid::from_parts("volume", format!("link{index}")),
+                    access_time: Some(
+                        DateTime::<Utc>::from_timestamp(1_700_000_000, 500_000_000).unwrap(),
+                    ),
+                })
+                .collect();
+
+            let server = tokio::spawn(async move {
+                let mut requests = Vec::new();
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    requests.push(receive_request(&mut stream).await);
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"Code\":1000}")
+                        .await
+                        .unwrap();
+                }
+                requests
+            });
+            client.report_recently_accessed(&[]).await.unwrap();
+            client.report_recently_accessed(&items).await.unwrap();
+            let requests = server.await.unwrap();
+            for (index, request) in requests.iter().enumerate() {
+                assert!(request.starts_with(&format!("POST {path} HTTP/1.1")));
+                let body: serde_json::Value =
+                    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                let sent = body["RecentlyAccessedItems"].as_array().unwrap();
+                assert_eq!(sent.len(), if index == 0 { 50 } else { 1 });
+                assert_eq!(
+                    sent[0],
+                    serde_json::json!({
+                        "VolumeID": "volume",
+                        "LinkID": format!("link{}", index * 50),
+                        "AccessTime": 1_700_000_000,
+                    })
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recently_accessed_stops_after_api_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = reqwest::Url::parse(&format!("http://{}/drive/", listener.local_addr().unwrap()))
+            .unwrap();
+        let client = DefaultLinksApiClient::new(
+            reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build(),
+            url,
+            None,
+        );
+        let items: Vec<_> = (0..101)
+            .map(|index| RecentlyAccessedItem {
+                node_uid: NodeUid::from_parts("volume", format!("link{index}")),
+                access_time: None,
+            })
+            .collect();
+        let server = tokio::spawn(async move {
+            for response in [r#"{"Code":1000}"#, r#"{"Code":2500,"Error":"failure"}"#] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                receive_request(&mut stream).await;
+                stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                                response.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        assert!(
+            client
+                .report_recently_accessed(&items)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("failure")
+        );
+        server.await.unwrap();
+    }
 }

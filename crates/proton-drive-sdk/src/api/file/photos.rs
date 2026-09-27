@@ -8,7 +8,9 @@ use crate::api::links::{
     LinkDetailsResponse, LinkIdResponsePair, LinksApiClient, MoveMultipleLinksRequest,
     MoveSingleLinkRequest, RenameLinkRequest,
 };
-use crate::api::node::{NodeNameAvailabilityRequest, NodeNameAvailabilityResponse};
+use crate::api::node::{
+    NodeNameAvailabilityRequest, NodeNameAvailabilityResponse, RecentlyAccessedItem,
+};
 use crate::api::share::{
     ContextShareResponse, DefaultSharesApiClient, ShareResponseV2, SharesApiClient,
 };
@@ -1053,6 +1055,12 @@ impl PhotosLinksApiClient {
 
 #[async_trait]
 impl LinksApiClient for PhotosLinksApiClient {
+    async fn report_recently_accessed(&self, items: &[RecentlyAccessedItem]) -> anyhow::Result<()> {
+        self.drive
+            .report_recently_accessed_to("photos/recently-accessed-items", items)
+            .await
+    }
+
     /// Overridden — uses photos-specific endpoint.
     async fn get_details(
         &self,

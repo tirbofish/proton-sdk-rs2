@@ -103,6 +103,7 @@ const UPSTREAM_TEST_FILES: &[&str] = &[
     "client/js/src/internal/sharing/events.test.ts",
     "client/js/src/internal/sharing/sharingAccess.test.ts",
     "client/js/src/internal/sharing/sharingManagement.test.ts",
+    "client/js/src/internal/sharingPublic/nodes.test.ts",
     "client/js/src/internal/sharingPublic/reporting.test.ts",
     "client/js/src/internal/sharingPublic/session/url.test.ts",
     "client/js/src/internal/sharingPublic/unauthApiService.test.ts",
@@ -124,11 +125,11 @@ const UPSTREAM_TEST_FILES: &[&str] = &[
 
 #[test]
 fn catalog_lists_every_upstream_javascript_test_file() {
-    assert_eq!(UPSTREAM_TEST_FILES.len(), 105);
+    assert_eq!(UPSTREAM_TEST_FILES.len(), 106);
     let mut unique = UPSTREAM_TEST_FILES.to_vec();
     unique.sort();
     unique.dedup();
-    assert_eq!(unique.len(), 105);
+    assert_eq!(unique.len(), 106);
 }
 
 #[tokio::test]

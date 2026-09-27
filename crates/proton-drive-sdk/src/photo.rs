@@ -6,6 +6,7 @@ use crate::api::file::photos::{
     FavoritePhotoPayload, PhotoTagUpdate, PhotosApiClient, PhotosApiClients,
     TimelinePhotoListRequest, TransferPhotoLinkItem, TransferPhotosRequest,
 };
+use crate::api::node::RecentlyAccessedItem;
 use crate::api::{DriveApiClients, DriveApiClientsFactory};
 use crate::cache::entity::{DefaultPhotosEntityCache, PhotosEntityCache};
 use crate::client::{ProtonDriveClient, ProtonDriveDefaults};
@@ -1366,6 +1367,14 @@ impl ProtonPhotosClient {
         settings: crate::sharing::ReportDirectShareAbuseSettings,
     ) -> anyhow::Result<()> {
         crate::sharing::SharingOperations::report_abuse(&self.drive, settings).await
+    }
+
+    /// Reports photo nodes opened or previewed by the user.
+    pub async fn report_recently_accessed(
+        &self,
+        items: &[RecentlyAccessedItem],
+    ) -> anyhow::Result<()> {
+        self.drive.report_recently_accessed(items).await
     }
 
     pub async fn subscribe_to_tree_events(

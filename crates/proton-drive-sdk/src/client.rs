@@ -7,6 +7,7 @@ use crate::account::{AccountClient, AccountClientAdapter};
 use crate::api::DriveApiClients;
 use crate::api::devices::DeviceType;
 use crate::api::events::{CoreEventsResponse, VolumeEventsResponse};
+use crate::api::node::RecentlyAccessedItem;
 use crate::api::{DefaultDriveApiClientsFactory, DriveApiClientsFactory};
 use crate::block::download::BlockDownloader;
 use crate::block::upload::BlockUploader;
@@ -1299,6 +1300,14 @@ impl ProtonDriveClient {
         settings: crate::sharing::ReportDirectShareAbuseSettings,
     ) -> anyhow::Result<()> {
         crate::sharing::SharingOperations::report_abuse(self, settings).await
+    }
+
+    /// Reports nodes opened or previewed by the user, optionally with historical access times.
+    pub async fn report_recently_accessed(
+        &self,
+        items: &[RecentlyAccessedItem],
+    ) -> anyhow::Result<()> {
+        self.api.links().report_recently_accessed(items).await
     }
 
     pub async fn subscribe_to_tree_events(

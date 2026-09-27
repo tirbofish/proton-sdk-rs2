@@ -52,6 +52,14 @@ pub enum NonProtonInvitationState {
     UserRegistered,
 }
 
+fn external_invitation_state(state: u32) -> NonProtonInvitationState {
+    if state == 2 {
+        NonProtonInvitationState::UserRegistered
+    } else {
+        NonProtonInvitationState::Pending
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NonProtonInvitation {
     pub uid: String,
@@ -454,6 +462,11 @@ impl SharingOperations {
             .find(|i| i.uid == invitation_uid)
             .cloned()
             .ok_or_else(|| ProtonDriveError::Validation("Invitation not found".into()))?;
+        if external.state != NonProtonInvitationState::UserRegistered {
+            return Err(
+                ProtonDriveError::Validation("Invitation user is not registered".into()).into(),
+            );
+        }
         let ctx = Self::load_share_context(client, node_uid).await?;
         Self::invite_proton(
             client,
@@ -502,11 +515,7 @@ impl SharingOperations {
                 invitee_email: i.invitee_email,
                 added_by_email: i.inviter_email,
                 role: i.permissions.to_role(),
-                state: if i.state == 1 {
-                    NonProtonInvitationState::Pending
-                } else {
-                    NonProtonInvitationState::UserRegistered
-                },
+                state: external_invitation_state(i.state),
                 invitation_time: i.create_time,
             })
             .collect();
@@ -1534,11 +1543,7 @@ impl SharingOperations {
             invitee_email: response.invitation.invitee_email,
             added_by_email: response.invitation.inviter_email,
             role: response.invitation.permissions.to_role(),
-            state: if response.invitation.state == 1 {
-                NonProtonInvitationState::Pending
-            } else {
-                NonProtonInvitationState::UserRegistered
-            },
+            state: external_invitation_state(response.invitation.state),
             invitation_time: response.invitation.create_time,
         })
     }
@@ -1772,6 +1777,20 @@ mod tests {
         assert_eq!(uid, "share~inv");
         let (share, inv) = split_sharing_uid(&uid).unwrap();
         assert_eq!((share, inv), ("share", "inv"));
+    }
+
+    #[test]
+    fn only_registered_external_invitations_are_registered() {
+        for state in [0, 1, 4] {
+            assert_eq!(
+                external_invitation_state(state),
+                NonProtonInvitationState::Pending
+            );
+        }
+        assert_eq!(
+            external_invitation_state(2),
+            NonProtonInvitationState::UserRegistered
+        );
     }
 
     macro_rules! valid_public_link_url {

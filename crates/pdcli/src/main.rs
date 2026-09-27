@@ -26,8 +26,17 @@ mod transfer;
 mod tray;
 mod version;
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // ponytail: ML-DSA key parsing overflows default worker stacks; revisit when upstream reduces stack use.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(16 * 1024 * 1024)
+        .build()
+        .expect("Tokio runtime");
+    runtime.block_on(async_main());
+}
+
+async fn async_main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -38,7 +47,7 @@ async fn main() {
 
     let cli = Cli::parse();
     if let Err(e) = dispatch(cli).await {
-        tracing::error!(error = %e, "pdcli failed");
+        tracing::error!(error = %format!("{e:#}"), "pdcli failed");
         if is_storage_quota_error(&e) {
             eprintln!(
                 "Proton Drive is out of storage. Free space (including Trash) or upgrade your plan:"

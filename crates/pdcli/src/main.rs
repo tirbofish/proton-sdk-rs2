@@ -7,6 +7,7 @@ use serde::Serialize;
 use crate::flags::{Cli, Command, ServiceCommand, is_wsl};
 
 mod auth;
+mod browser;
 mod computers;
 mod credentials;
 mod daemon;
@@ -93,6 +94,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Computers { command }) => {
             computers::run_cli(flags.force_offline, command).await
         }
+        Some(Command::Browse { command }) => browser::run_cli(flags.force_offline, command).await,
         Some(Command::Daemon) => run_daemon(flags.force_offline, !flags.no_tray).await,
         None if cli.daemon => run_daemon(flags.force_offline, !flags.no_tray).await,
         None if cli.cli => cmd_mount(flags.force_offline, flags.no_tray).await,

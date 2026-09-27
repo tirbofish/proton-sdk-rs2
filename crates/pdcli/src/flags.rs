@@ -91,9 +91,24 @@ pub enum Command {
         #[command(subcommand)]
         command: Option<ComputersCommand>,
     },
+    /// SDK-backed file operations for the desktop window
+    #[command(hide = true)]
+    Browse {
+        #[command(subcommand)]
+        command: BrowseCommand,
+    },
     /// Run the background daemon
     #[command(hide = true)]
     Daemon,
+}
+
+#[derive(Subcommand)]
+pub enum BrowseCommand {
+    List { folder: Option<String> },
+    Mkdir { parent: String, name: String },
+    Rename { node: String, name: String },
+    Trash { node: String },
+    Url { node: String },
 }
 
 #[derive(Subcommand)]

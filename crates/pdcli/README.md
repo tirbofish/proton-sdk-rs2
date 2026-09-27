@@ -20,9 +20,11 @@ AppIndicator tray remain in a separate GTK3 process. On WSL, `pdcli` without
 a subcommand mounts; use `pdcli gui` for the window. `--force-offline` uses
 local state only and `--no-tray` suppresses the tray icon.
 
-The window currently provides browser sign-in, mount and sync controls,
-Computer backup/restore commands, global `.pdignore` settings, and account
-actions. The FUSE mount provides file-manager access to My Files and Computers.
+The window groups My Files browsing, Computer backup/restore, mount and sync
+status, account actions, and global `.pdignore` settings into separate pages.
+My Files supports folder navigation, creating folders, renaming items,
+opening items in the web app, and confirmed trash; the FUSE mount remains the
+way to upload and download with a file manager.
 
 ## Commands
 

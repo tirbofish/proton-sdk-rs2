@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 use std::io::Write;
-use std::time::Duration;
 
 use anyhow::Context;
 use futures::StreamExt;
-use proton_drive_sdk::api::file::photos::{AlbumChildItem, AlbumInfo};
+use proton_drive_sdk::api::file::photos::AlbumInfo;
 use proton_drive_sdk::links::LinkId;
 use proton_drive_sdk::node::file::FileThumbnail;
 use proton_drive_sdk::node::photo::{PhotoTag, TimelineEntry};
@@ -17,9 +16,6 @@ use serde::Serialize;
 
 use crate::{daemon, flags::PhotosCommand};
 
-const MAX_ALBUMS: usize = 200;
-const MAX_ALBUM_PHOTOS: u64 = 500;
-const ALBUM_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Serialize)]
@@ -50,12 +46,20 @@ struct Album {
 #[derive(Serialize)]
 struct AlbumList {
     albums: Vec<Album>,
+    next_cursor: Option<String>,
 }
 
 #[derive(Serialize)]
 struct AlbumDetails {
-    album: Album,
+    album: AlbumSelection,
     items: Vec<AlbumPhoto>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AlbumSelection {
+    uid: String,
+    name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -129,22 +133,24 @@ async fn album_name(photos: &ProtonPhotosClient, uid: NodeUid) -> anyhow::Result
     }
 }
 
-async fn album_infos(photos: &ProtonPhotosClient) -> anyhow::Result<Vec<AlbumInfo>> {
-    // ponytail: SDK album iterators eagerly scan all pages; use page APIs when exposed.
-    let albums = tokio::time::timeout(ALBUM_TIMEOUT, photos.iterate_albums())
-        .await
-        .context("album list timed out")??;
-    anyhow::ensure!(
-        albums.len() <= MAX_ALBUMS,
-        "album list exceeds {MAX_ALBUMS} albums; this SDK does not expose an album page API"
-    );
-    Ok(albums)
+fn page_cursor(value: Option<String>) -> anyhow::Result<Option<LinkId>> {
+    value
+        .map(|value| {
+            anyhow::ensure!(
+                !value.trim().is_empty()
+                    && !value.contains(['&', '?', '#'])
+                    && !value.chars().any(char::is_control),
+                "invalid page cursor"
+            );
+            Ok(LinkId::new(value))
+        })
+        .transpose()
 }
 
-fn check_album_size(info: &AlbumInfo) -> anyhow::Result<()> {
+fn validate_album_name(name: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
-        info.photo_count <= MAX_ALBUM_PHOTOS,
-        "album exceeds {MAX_ALBUM_PHOTOS} photos; this SDK does not expose an album page API"
+        !name.trim().is_empty() && !name.contains(['/', '\\', '\0']) && name != "." && name != "..",
+        "invalid album name"
     );
     Ok(())
 }
@@ -211,8 +217,9 @@ pub async fn run_cli(force_offline: bool, command: PhotosCommand) -> anyhow::Res
             };
             println!("{}", serde_json::to_string(&page)?);
         }
-        PhotosCommand::Albums => {
-            let infos = album_infos(&photos).await?;
+        PhotosCommand::Albums { cursor } => {
+            let cursor = page_cursor(cursor)?;
+            let (infos, next_cursor) = photos.get_albums_page(cursor.as_ref()).await?;
             let names: HashMap<_, _> = photos
                 .enumerate_nodes(infos.iter().map(|info| info.uid.clone()).collect())
                 .await?
@@ -231,30 +238,20 @@ pub async fn run_cli(force_offline: bool, command: PhotosCommand) -> anyhow::Res
                     album(info, name)
                 })
                 .collect();
-            println!("{}", serde_json::to_string(&AlbumList { albums })?);
+            println!(
+                "{}",
+                serde_json::to_string(&AlbumList {
+                    albums,
+                    next_cursor: next_cursor.map(|id| id.raw().to_owned()),
+                })?
+            );
         }
-        PhotosCommand::Album { uid } => {
-            let uid = NodeUid::parse(&uid).map_err(anyhow::Error::msg)?;
+        PhotosCommand::Album { uid, cursor } => {
             let volume_id = photos.get_photos_volume_id().await?;
-            anyhow::ensure!(
-                uid.volume_id == volume_id,
-                "album is not in the Photos volume"
-            );
-            let info = album_infos(&photos)
-                .await?
-                .into_iter()
-                .find(|info| info.uid == uid)
-                .context("album not found")?;
-            check_album_size(&info)?;
+            let uid = photo_uid(&uid, &volume_id)?;
+            let cursor = page_cursor(cursor)?;
             let name = album_name(&photos, uid.clone()).await?;
-            let items: Vec<AlbumChildItem> =
-                tokio::time::timeout(ALBUM_TIMEOUT, photos.iterate_album(uid))
-                    .await
-                    .context("album photos timed out")??;
-            anyhow::ensure!(
-                items.len() <= MAX_ALBUM_PHOTOS as usize,
-                "album returned more photos than its advertised count"
-            );
+            let (items, next_cursor) = photos.get_album_page(uid.clone(), cursor.as_ref()).await?;
             let nodes = nodes_by_uid(
                 photos
                     .enumerate_nodes(items.iter().map(|item| item.uid.clone()).collect())
@@ -263,7 +260,10 @@ pub async fn run_cli(force_offline: bool, command: PhotosCommand) -> anyhow::Res
             println!(
                 "{}",
                 serde_json::to_string(&AlbumDetails {
-                    album: album(info, name),
+                    album: AlbumSelection {
+                        uid: uid.raw(),
+                        name,
+                    },
                     items: items
                         .into_iter()
                         .map(|item| {
@@ -277,8 +277,23 @@ pub async fn run_cli(force_offline: bool, command: PhotosCommand) -> anyhow::Res
                             }
                         })
                         .collect(),
+                    next_cursor: next_cursor.map(|id| id.raw().to_owned()),
                 })?
             );
+        }
+        PhotosCommand::Favorite { uid, off } => {
+            let volume_id = photos.get_photos_volume_id().await?;
+            let uid = photo_uid(&uid, &volume_id)?;
+            photos.favorite_photo(uid.clone(), !off).await?;
+            println!(
+                "{}",
+                serde_json::json!({ "uid": uid.raw(), "favorite": !off })
+            );
+        }
+        PhotosCommand::CreateAlbum { name } => {
+            validate_album_name(&name)?;
+            let uid = photos.create_album(name).await?;
+            println!("{}", serde_json::json!({ "uid": uid.raw() }));
         }
         PhotosCommand::Thumbnail { uid, preview } => {
             let volume_id = photos.get_photos_volume_id().await?;
@@ -335,18 +350,33 @@ mod tests {
     }
 
     #[test]
-    fn album_size_is_bounded_before_listing_children() {
+    fn album_pages_serialize_cursor_and_metadata() {
         let info = AlbumInfo {
             uid: NodeUid::from_parts("volume", "album"),
-            photo_count: MAX_ALBUM_PHOTOS + 1,
+            photo_count: 501,
             last_activity_time: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
             cover_uid: None,
         };
-        assert!(check_album_size(&info).is_err());
-        let json = serde_json::to_value(album(info, Some("Summer".into()))).unwrap();
-        assert_eq!(json["uid"], "volume~album");
-        assert_eq!(json["name"], "Summer");
-        assert_eq!(json["photo_count"], MAX_ALBUM_PHOTOS + 1);
+        let json = serde_json::to_value(AlbumList {
+            albums: vec![album(info, Some("Summer".into()))],
+            next_cursor: Some("next".into()),
+        })
+        .unwrap();
+        assert_eq!(json["albums"][0]["uid"], "volume~album");
+        assert_eq!(json["albums"][0]["name"], "Summer");
+        assert_eq!(json["albums"][0]["photo_count"], 501);
+        assert_eq!(json["next_cursor"], "next");
+        let details = serde_json::to_value(AlbumDetails {
+            album: AlbumSelection {
+                uid: "volume~album".into(),
+                name: Some("Summer".into()),
+            },
+            items: vec![],
+            next_cursor: None,
+        })
+        .unwrap();
+        assert!(details["next_cursor"].is_null());
+        assert!(details["album"].get("photo_count").is_none());
     }
 
     #[test]
@@ -360,9 +390,43 @@ mod tests {
                 command: PhotosCommand::Timeline { cursor: Some(cursor) }
             }) if cursor == "next"
         ));
-        assert!(crate::flags::Cli::try_parse_from(["pdcli", "photos", "albums"]).is_ok());
+        let cli =
+            crate::flags::Cli::try_parse_from(["pdcli", "photos", "albums", "--cursor", "next"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(crate::flags::Command::Photos {
+                command: PhotosCommand::Albums { cursor: Some(cursor) }
+            }) if cursor == "next"
+        ));
+        let cli = crate::flags::Cli::try_parse_from([
+            "pdcli",
+            "photos",
+            "album",
+            "volume~album",
+            "--cursor",
+            "next",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(crate::flags::Command::Photos {
+                command: PhotosCommand::Album { uid, cursor: Some(cursor) }
+            }) if uid == "volume~album" && cursor == "next"
+        ));
         assert!(
-            crate::flags::Cli::try_parse_from(["pdcli", "photos", "album", "volume~album"]).is_ok()
+            crate::flags::Cli::try_parse_from([
+                "pdcli",
+                "photos",
+                "favorite",
+                "volume~photo",
+                "--off"
+            ])
+            .is_ok()
+        );
+        assert!(
+            crate::flags::Cli::try_parse_from(["pdcli", "photos", "create-album", "Summer"])
+                .is_ok()
         );
         let cli =
             crate::flags::Cli::try_parse_from(["pdcli", "photos", "thumbnail", "volume~photo"])
@@ -411,5 +475,20 @@ mod tests {
         assert!(
             thumbnail_bytes(&uid, item(uid.clone(), vec![0; MAX_THUMBNAIL_BYTES + 1])).is_err()
         );
+    }
+
+    #[test]
+    fn album_names_and_page_cursors_are_validated() {
+        assert!(validate_album_name("Summer 2026").is_ok());
+        for invalid in ["", " ", ".", "..", "a/b", "a\\b", "a\0b"] {
+            assert!(validate_album_name(invalid).is_err());
+        }
+        assert_eq!(
+            page_cursor(Some("next".into())).unwrap().unwrap().raw(),
+            "next"
+        );
+        for invalid in ["", " ", "a&b", "a?b", "a#b", "a\nb"] {
+            assert!(page_cursor(Some(invalid.into())).is_err());
+        }
     }
 }

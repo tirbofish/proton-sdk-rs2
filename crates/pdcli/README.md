@@ -28,10 +28,11 @@ backup list. The account menu provides Settings and Log out; Settings includes
 automatic mounting, default start page, and global `.pdignore` patterns. The FUSE mount remains the
 way to upload and download with a file manager.
 
-Photos displays paginated timeline entries and albums. Selecting a photo loads
-an in-memory preview; opening the full photo hands off to the web app. Album
-listing currently stops with an error beyond 200 albums or 500 photos in one
-album because the SDK's album iterators are not page-based yet.
+Photos displays paginated timeline, album lists, and album contents. Selecting
+a photo loads an in-memory preview; opening the full photo hands off to the web
+app. Timeline photos can be marked as favorites, and new albums can be created.
+Favorite state is not shown for album photos because the album API does not
+return photo tags.
 
 ## Commands
 
@@ -49,8 +50,10 @@ pdcli logout
 
 pdcli computers --json
 pdcli photos timeline [--cursor LINK_ID]
-pdcli photos albums
-pdcli photos album VOLUME~LINK
+pdcli photos albums [--cursor LINK_ID]
+pdcli photos album VOLUME~LINK [--cursor LINK_ID]
+pdcli photos favorite VOLUME~LINK [--off]
+pdcli photos create-album NAME
 pdcli photos thumbnail VOLUME~LINK [--preview] > image
 
 pdcli computers

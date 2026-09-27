@@ -130,6 +130,8 @@ mod desktop {
         uid: String,
         name: Option<String>,
         capture_time: String,
+        #[serde(default)]
+        tags: Option<Vec<u8>>,
     }
 
     #[derive(Deserialize)]
@@ -148,12 +150,20 @@ mod desktop {
     #[derive(Deserialize)]
     struct AlbumList {
         albums: Vec<AlbumItem>,
+        next_cursor: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct AlbumSelection {
+        uid: String,
+        name: Option<String>,
     }
 
     #[derive(Deserialize)]
     struct AlbumDetails {
-        album: AlbumItem,
+        album: AlbumSelection,
         items: Vec<PhotoItem>,
+        next_cursor: Option<String>,
     }
 
     #[derive(Serialize, Deserialize)]
@@ -215,6 +225,9 @@ mod desktop {
     struct PhotosState {
         request: u64,
         next_cursor: Option<String>,
+        albums_cursor: Option<String>,
+        album_cursor: Option<String>,
+        album_uid: Option<String>,
         selected: Option<String>,
         items: Vec<PhotoItem>,
     }
@@ -226,8 +239,8 @@ mod desktop {
         IgnoreLoaded(String),
         Files(u64, Vec<Folder>, Result<FileListing, String>),
         Photos(u64, Option<String>, Result<PhotoPage, String>),
-        Albums(u64, Result<AlbumList, String>),
-        Album(u64, Result<AlbumDetails, String>),
+        Albums(u64, Option<String>, Result<AlbumList, String>),
+        Album(u64, String, Option<String>, Result<AlbumDetails, String>),
         Preview(String, Result<Vec<u8>, String>),
     }
 
@@ -344,6 +357,49 @@ mod desktop {
                     .map_err(|error| format!("Invalid Photos response: {error}"))
             });
             let _ = tx.send(Event::Photos(request, cursor, result));
+        });
+    }
+
+    fn load_albums(tx: &Sender<Event>, state: &Rc<RefCell<PhotosState>>, cursor: Option<String>) {
+        let mut state = state.borrow_mut();
+        state.request += 1;
+        let request = state.request;
+        drop(state);
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut args = vec!["photos".into(), "albums".into()];
+            if let Some(cursor) = &cursor {
+                args.extend(["--cursor".into(), cursor.clone()]);
+            }
+            let result = run_command(&args).and_then(|text| {
+                serde_json::from_str(&text)
+                    .map_err(|error| format!("Invalid albums response: {error}"))
+            });
+            let _ = tx.send(Event::Albums(request, cursor, result));
+        });
+    }
+
+    fn load_album(
+        tx: &Sender<Event>,
+        state: &Rc<RefCell<PhotosState>>,
+        uid: String,
+        cursor: Option<String>,
+    ) {
+        let mut state = state.borrow_mut();
+        state.request += 1;
+        let request = state.request;
+        drop(state);
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut args = vec!["photos".into(), "album".into(), uid.clone()];
+            if let Some(cursor) = &cursor {
+                args.extend(["--cursor".into(), cursor.clone()]);
+            }
+            let result = run_command(&args).and_then(|text| {
+                serde_json::from_str(&text)
+                    .map_err(|error| format!("Invalid album response: {error}"))
+            });
+            let _ = tx.send(Event::Album(request, uid, cursor, result));
         });
     }
 
@@ -643,11 +699,19 @@ mod desktop {
                 .unwrap()
                 .1
                 .clone();
-            move || settings.set_active(true)
+            let profile = profile.clone();
+            move || {
+                settings.set_active(true);
+                profile.popdown();
+            }
         });
         button("Log out", &profile_menu, {
             let tx = tx.clone();
-            move || command(&tx, "Sign out", vec!["logout".into()])
+            let profile = profile.clone();
+            move || {
+                profile.popdown();
+                command(&tx, "Sign out", vec!["logout".into()]);
+            }
         });
         let popover = gtk4::Popover::new();
         popover.set_child(Some(&profile_menu));
@@ -1144,7 +1208,7 @@ mod desktop {
         photos_views.add_named(&scroll(&albums), Some("albums"));
         photos_views.add_named(&scroll(&album_photos), Some("album"));
         let album_items = Rc::new(RefCell::new(Vec::<AlbumItem>::new()));
-        button("Timeline", &photos_controls, {
+        let timeline_button = button("Timeline", &photos_controls, {
             let views = photos_views.clone();
             let timeline = timeline.clone();
             let state = photos_state.clone();
@@ -1161,25 +1225,22 @@ mod desktop {
                 load_photos(&tx, &state, None);
             }
         });
-        button("Albums", &photos_controls, {
+        let albums_button = button("Albums", &photos_controls, {
             let views = photos_views.clone();
             let state = photos_state.clone();
             let tx = tx.clone();
             let status = photos_status.clone();
+            let albums = albums.clone();
+            let album_items = album_items.clone();
             move || {
                 views.set_visible_child_name("albums");
                 status.set_text("Loading albums…");
-                state.borrow_mut().request += 1;
-                let request = state.borrow().request;
-                let tx = tx.clone();
-                std::thread::spawn(move || {
-                    let result =
-                        run_command(&["photos".into(), "albums".into()]).and_then(|text| {
-                            serde_json::from_str(&text)
-                                .map_err(|error| format!("Invalid albums response: {error}"))
-                        });
-                    let _ = tx.send(Event::Albums(request, result));
-                });
+                state.borrow_mut().albums_cursor = None;
+                album_items.borrow_mut().clear();
+                while let Some(child) = albums.first_child() {
+                    albums.remove(&child);
+                }
+                load_albums(&tx, &state, None);
             }
         });
         let back_to_albums = button("Back to albums", &photos_controls, {
@@ -1188,6 +1249,20 @@ mod desktop {
         });
         back_to_albums.set_visible(false);
         back_to_albums.connect_clicked(|button| button.set_visible(false));
+        button("New album", &photos_controls, {
+            let tx = tx.clone();
+            let window = window.clone();
+            move || {
+                let tx = tx.clone();
+                name_dialog(&window, "Create album", "", move |name| {
+                    command(
+                        &tx,
+                        "Photos create album",
+                        vec!["photos".into(), "create-album".into(), name],
+                    );
+                });
+            }
+        });
         photos.append(&photos_controls);
         photos.append(&photos_status);
         photos_views.set_vexpand(true);
@@ -1196,29 +1271,108 @@ mod desktop {
             let state = photos_state.clone();
             let tx = tx.clone();
             let status = photos_status.clone();
-            move || {
-                if let Some(cursor) = state.borrow().next_cursor.clone() {
-                    status.set_text("Loading more photos…");
-                    load_photos(&tx, &state, Some(cursor));
+            let views = photos_views.clone();
+            move || match views.visible_child_name().as_deref() {
+                Some("timeline") => {
+                    let cursor = state.borrow().next_cursor.clone();
+                    if let Some(cursor) = cursor {
+                        status.set_text("Loading more photos…");
+                        load_photos(&tx, &state, Some(cursor));
+                    }
                 }
+                Some("albums") => {
+                    let cursor = state.borrow().albums_cursor.clone();
+                    if let Some(cursor) = cursor {
+                        status.set_text("Loading more albums…");
+                        load_albums(&tx, &state, Some(cursor));
+                    }
+                }
+                Some("album") => {
+                    let (uid, cursor) = {
+                        let state = state.borrow();
+                        (state.album_uid.clone(), state.album_cursor.clone())
+                    };
+                    if let (Some(uid), Some(cursor)) = (uid, cursor) {
+                        status.set_text("Loading more album photos…");
+                        load_album(&tx, &state, uid, Some(cursor));
+                    }
+                }
+                _ => {}
             }
         });
         load_more.set_visible(false);
-        let preview_group = section("Preview", "Select a photo to view its encrypted thumbnail.");
+        load_more.connect_clicked(|button| button.set_sensitive(false));
+        for button in [&timeline_button, &albums_button] {
+            let more = load_more.clone();
+            button.connect_clicked(move |_| {
+                more.set_visible(false);
+                more.set_sensitive(true);
+            });
+        }
+        back_to_albums.connect_clicked({
+            let state = photos_state.clone();
+            let more = load_more.clone();
+            move |_| {
+                state.borrow_mut().request += 1;
+                more.set_visible(state.borrow().albums_cursor.is_some());
+                more.set_sensitive(true);
+            }
+        });
+        let preview_group = section("Preview", "Select a photo to view an in-memory preview.");
         let preview = gtk4::Picture::new();
         preview.set_size_request(-1, 260);
         preview.set_can_shrink(true);
         preview_group.append(&preview);
+        let favorite = button("Add to favorites", &preview_group, {
+            let state = photos_state.clone();
+            let tx = tx.clone();
+            move || {
+                let state = state.borrow();
+                if let Some(item) = state.items.iter().find(|item| {
+                    state.selected.as_deref() == Some(item.uid.as_str()) && item.tags.is_some()
+                }) {
+                    let mut args = vec!["photos".into(), "favorite".into(), item.uid.clone()];
+                    let favorite = !item.tags.as_ref().is_some_and(|tags| tags.contains(&0));
+                    if !favorite {
+                        args.push("--off".into());
+                    }
+                    command(
+                        &tx,
+                        &format!(
+                            "Photo favorite {} {}",
+                            if favorite { "on" } else { "off" },
+                            item.uid
+                        ),
+                        args,
+                    );
+                }
+            }
+        });
+        favorite.set_sensitive(false);
+        favorite.set_tooltip_text(Some("Favorite controls are available in the timeline."));
         let photo_web = gtk4::LinkButton::new("https://drive.proton.me");
         photo_web.set_label("Open in Proton Drive");
         photo_web.set_visible(false);
         preview_group.append(&photo_web);
         photos.append(&preview_group);
+        for button in [&timeline_button, &albums_button, &back_to_albums] {
+            let preview = preview.clone();
+            let favorite = favorite.clone();
+            let photo_web = photo_web.clone();
+            let state = photos_state.clone();
+            button.connect_clicked(move |_| {
+                state.borrow_mut().selected = None;
+                preview.set_paintable(None::<&gtk4::gdk::Paintable>);
+                favorite.set_sensitive(false);
+                photo_web.set_visible(false);
+            });
+        }
         for list in [&timeline, &album_photos] {
             list.connect_row_selected({
                 let state = photos_state.clone();
                 let tx = tx.clone();
                 let preview = preview.clone();
+                let favorite = favorite.clone();
                 let photo_web = photo_web.clone();
                 let status = photos_status.clone();
                 move |_, row| {
@@ -1227,6 +1381,17 @@ mod desktop {
                     preview.set_paintable(None::<&gtk4::gdk::Paintable>);
                     photo_web.set_visible(false);
                     state.borrow_mut().selected = selected.as_ref().map(|item| item.uid.clone());
+                    favorite
+                        .set_sensitive(selected.as_ref().is_some_and(|item| item.tags.is_some()));
+                    favorite.set_label(
+                        if selected.as_ref().is_some_and(|item| {
+                            item.tags.as_ref().is_some_and(|tags| tags.contains(&0))
+                        }) {
+                            "Remove from favorites"
+                        } else {
+                            "Add to favorites"
+                        },
+                    );
                     if let Some(item) = selected {
                         status.set_text(&format!(
                             "Loading preview: {}",
@@ -1256,21 +1421,23 @@ mod desktop {
             let state = photos_state.clone();
             let tx = tx.clone();
             let status = photos_status.clone();
+            let more = load_more.clone();
+            let preview = preview.clone();
+            let favorite = favorite.clone();
+            let photo_web = photo_web.clone();
             move |_, row| {
                 if let Some(album) = items.borrow().get(row.index() as usize) {
                     status.set_text("Loading album…");
-                    state.borrow_mut().request += 1;
-                    let request = state.borrow().request;
+                    more.set_visible(false);
+                    more.set_sensitive(true);
+                    preview.set_paintable(None::<&gtk4::gdk::Paintable>);
+                    favorite.set_sensitive(false);
+                    photo_web.set_visible(false);
                     let uid = album.uid.clone();
-                    let tx = tx.clone();
-                    std::thread::spawn(move || {
-                        let result =
-                            run_command(&["photos".into(), "album".into(), uid]).and_then(|text| {
-                                serde_json::from_str(&text)
-                                    .map_err(|error| format!("Invalid album response: {error}"))
-                            });
-                        let _ = tx.send(Event::Album(request, result));
-                    });
+                    state.borrow_mut().album_uid = Some(uid.clone());
+                    state.borrow_mut().album_cursor = None;
+                    state.borrow_mut().selected = None;
+                    load_album(&tx, &state, uid, None);
                 }
             }
         });
@@ -1636,6 +1803,7 @@ mod desktop {
                         files_state.borrow_mut().selected = None;
                         photos_state.borrow_mut().request += 1;
                         photos_state.borrow_mut().selected = None;
+                        favorite.set_sensitive(false);
                         preview.set_paintable(None::<&gtk4::gdk::Paintable>);
                         files_status.set_text("Sign in to browse files.");
                         login_link.set_visible(false);
@@ -1727,6 +1895,7 @@ mod desktop {
                         if request != photos_state.borrow().request {
                             continue;
                         }
+                        load_more.set_sensitive(true);
                         match result {
                             Ok(page) => {
                                 back_to_albums.set_visible(false);
@@ -1735,6 +1904,7 @@ mod desktop {
                                 let mut state = photos_state.borrow_mut();
                                 if !append {
                                     state.items.clear();
+                                    state.selected = None;
                                 }
                                 state.items.extend(page.items);
                                 state.next_cursor = page.next_cursor;
@@ -1751,19 +1921,21 @@ mod desktop {
                             }
                         }
                     }
-                    Event::Albums(request, result) => {
+                    Event::Albums(request, cursor, result) => {
                         if request != photos_state.borrow().request {
                             continue;
                         }
+                        load_more.set_sensitive(true);
                         match result {
                             Ok(result) => {
                                 back_to_albums.set_visible(false);
-                                load_more.set_visible(false);
-                                while let Some(child) = albums.first_child() {
-                                    albums.remove(&child);
+                                if cursor.is_none() {
+                                    album_items.borrow_mut().clear();
+                                    while let Some(child) = albums.first_child() {
+                                        albums.remove(&child);
+                                    }
                                 }
-                                album_items.replace(result.albums);
-                                for album in album_items.borrow().iter() {
+                                for album in &result.albums {
                                     let row = gtk4::ListBoxRow::new();
                                     row.set_child(Some(&gtk4::Label::new(Some(&format!(
                                         "{} — {} photos",
@@ -1772,6 +1944,10 @@ mod desktop {
                                     )))));
                                     albums.append(&row);
                                 }
+                                album_items.borrow_mut().extend(result.albums);
+                                photos_state.borrow_mut().albums_cursor = result.next_cursor;
+                                load_more
+                                    .set_visible(photos_state.borrow().albums_cursor.is_some());
                                 photos_status.set_text(if album_items.borrow().is_empty() {
                                     "No albums yet."
                                 } else {
@@ -1784,21 +1960,37 @@ mod desktop {
                             }
                         }
                     }
-                    Event::Album(request, result) => {
-                        if request != photos_state.borrow().request {
+                    Event::Album(request, uid, cursor, result) => {
+                        if request != photos_state.borrow().request
+                            || photos_state.borrow().album_uid.as_deref() != Some(&uid)
+                        {
                             continue;
                         }
+                        load_more.set_sensitive(true);
                         match result {
                             Ok(result) => {
+                                if result.album.uid != uid {
+                                    photos_status.set_text(
+                                        "Album response did not match the selected album.",
+                                    );
+                                    continue;
+                                }
                                 back_to_albums.set_visible(true);
-                                load_more.set_visible(false);
+                                let append = cursor.is_some();
+                                show_photos(&album_photos, &result.items, append);
+                                let mut state = photos_state.borrow_mut();
+                                if !append {
+                                    state.items.clear();
+                                    state.selected = None;
+                                }
+                                state.items.extend(result.items);
+                                state.album_cursor = result.next_cursor;
+                                load_more.set_visible(state.album_cursor.is_some());
                                 photos_status.set_text(&format!(
                                     "{} — {} photos",
                                     result.album.name.as_deref().unwrap_or("Album"),
-                                    result.items.len()
+                                    state.items.len()
                                 ));
-                                photos_state.borrow_mut().items = result.items.clone();
-                                show_photos(&album_photos, &result.items, false);
                                 photos_views.set_visible_child_name("album");
                             }
                             Err(error) => {
@@ -1979,6 +2171,8 @@ mod desktop {
                                     refresh_status(&tx);
                                 } else if action == "Cancel download" {
                                     refresh_status(&tx);
+                                } else if action == "Photos create album" {
+                                    albums_button.emit_clicked();
                                 } else if action == "Sign in" {
                                     login_button.set_sensitive(true);
                                     let tx = tx.clone();
@@ -2030,6 +2224,29 @@ mod desktop {
                                     {
                                         photo_web.set_uri(&text);
                                         photo_web.set_visible(true);
+                                    }
+                                } else if let Some(change) = action.strip_prefix("Photo favorite ")
+                                {
+                                    if let Some((mode, uid)) = change.split_once(' ') {
+                                        let mut state = photos_state.borrow_mut();
+                                        if state.selected.as_deref() == Some(uid) {
+                                            if let Some(item) =
+                                                state.items.iter_mut().find(|item| item.uid == uid)
+                                            {
+                                                if let Some(tags) = &mut item.tags {
+                                                    tags.retain(|tag| *tag != 0);
+                                                    if mode == "on" {
+                                                        tags.push(0);
+                                                    }
+                                                }
+                                                favorite.set_label(if mode == "on" {
+                                                    "Remove from favorites"
+                                                } else {
+                                                    "Add to favorites"
+                                                });
+                                                photos_status.set_text("Favorite updated.");
+                                            }
+                                        }
                                     }
                                 } else if let Some(uid) = action.strip_prefix("Share status ") {
                                     if files_state
@@ -2207,6 +2424,28 @@ mod desktop {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn photos_pages_keep_cursors_and_only_timeline_has_favorite_state() {
+            let albums: AlbumList = serde_json::from_str(
+                r#"{"albums":[{"uid":"v~a","name":"Trips","photo_count":2}],"next_cursor":"more"}"#,
+            )
+            .unwrap();
+            assert_eq!(albums.next_cursor.as_deref(), Some("more"));
+
+            let album: AlbumDetails = serde_json::from_str(
+                r#"{"album":{"uid":"v~a","name":"Trips"},"items":[{"uid":"v~p","capture_time":"2026-01-01T00:00:00Z"}],"next_cursor":"next"}"#,
+            )
+            .unwrap();
+            assert_eq!(album.next_cursor.as_deref(), Some("next"));
+            assert!(album.items[0].tags.is_none());
+
+            let timeline: PhotoPage = serde_json::from_str(
+                r#"{"items":[{"uid":"v~p","capture_time":"2026-01-01T00:00:00Z","tags":[0]}],"next_cursor":null}"#,
+            )
+            .unwrap();
+            assert_eq!(timeline.items[0].tags.as_deref(), Some([0].as_slice()));
+        }
 
         #[test]
         fn gui_accepts_known_page_and_global_flags() {

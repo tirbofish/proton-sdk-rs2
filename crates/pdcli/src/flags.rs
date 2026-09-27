@@ -129,10 +129,28 @@ pub enum PhotosCommand {
         #[arg(long)]
         cursor: Option<String>,
     },
-    /// List albums and their cover/count metadata
-    Albums,
-    /// Show an album and its photos
-    Album { uid: String },
+    /// Fetch one page of albums and their cover/count metadata
+    Albums {
+        /// Anchor returned as next_cursor by the previous page
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Fetch one page of an album's photos
+    Album {
+        uid: String,
+        /// Anchor returned as next_cursor by the previous page
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Add or remove a photo's Favorite tag
+    Favorite {
+        uid: String,
+        /// Remove the Favorite tag
+        #[arg(long)]
+        off: bool,
+    },
+    /// Create an album in Photos
+    CreateAlbum { name: String },
     /// Write a decrypted thumbnail image to stdout
     Thumbnail {
         uid: String,

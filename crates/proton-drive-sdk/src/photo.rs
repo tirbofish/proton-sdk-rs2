@@ -29,6 +29,23 @@ use std::sync::Arc;
 
 type HmacSha256 = Hmac<sha2::Sha256>;
 
+fn next_album_anchor(
+    more: bool,
+    anchor: Option<LinkId>,
+    previous: Option<&LinkId>,
+) -> anyhow::Result<Option<LinkId>> {
+    if !more {
+        return Ok(None);
+    }
+    let anchor = anchor.ok_or_else(|| anyhow::anyhow!("album page has More without AnchorID"))?;
+    anyhow::ensure!(!anchor.raw().is_empty(), "album page has an empty AnchorID");
+    anyhow::ensure!(
+        previous != Some(&anchor),
+        "album page did not advance its AnchorID"
+    );
+    Ok(Some(anchor))
+}
+
 struct PhotosApiClientsFactory;
 
 impl DriveApiClientsFactory for PhotosApiClientsFactory {
@@ -533,65 +550,83 @@ impl ProtonPhotosClient {
         Ok(!self.find_photo_duplicates(name, sha1_hex).await?.is_empty())
     }
 
+    /// Fetch one page of albums. Pass the returned anchor to fetch the next page.
+    pub async fn get_albums_page(
+        &self,
+        cursor: Option<&LinkId>,
+    ) -> anyhow::Result<(Vec<AlbumInfo>, Option<LinkId>)> {
+        let volume_id = self.get_photos_volume_id().await?;
+        let response = self
+            .photos_api
+            .get_albums(volume_id.clone(), cursor.cloned())
+            .await?;
+        let next_cursor = next_album_anchor(response.more, response.anchor_id, cursor)?;
+        let albums = response
+            .albums
+            .into_iter()
+            .map(|dto| AlbumInfo {
+                uid: NodeUid::new(volume_id.clone(), dto.link_id),
+                photo_count: dto.photo_count,
+                last_activity_time: dto.last_activity_time,
+                cover_uid: dto
+                    .cover_link_id
+                    .map(|id| NodeUid::new(volume_id.clone(), id)),
+            })
+            .collect();
+        Ok((albums, next_cursor))
+    }
+
     /// Returns a list of all albums in the photos volume, paginated internally.
     pub async fn iterate_albums(&self) -> anyhow::Result<Vec<AlbumInfo>> {
-        let volume_id = self.get_photos_volume_id().await?;
         let mut albums = Vec::new();
-        let mut anchor: Option<LinkId> = None;
-
+        let mut cursor = None;
         loop {
-            let response = self
-                .photos_api
-                .get_albums(volume_id.clone(), anchor.clone())
-                .await?;
-
-            for dto in &response.albums {
-                albums.push(AlbumInfo {
-                    uid: NodeUid::new(volume_id.clone(), dto.link_id.clone()),
-                    photo_count: dto.photo_count,
-                    last_activity_time: dto.last_activity_time,
-                    cover_uid: dto
-                        .cover_link_id
-                        .clone()
-                        .map(|id| NodeUid::new(volume_id.clone(), id)),
-                });
+            let (page, next_cursor) = self.get_albums_page(cursor.as_ref()).await?;
+            albums.extend(page);
+            match next_cursor {
+                Some(next) => cursor = Some(next),
+                None => return Ok(albums),
             }
-
-            if !response.more || response.anchor_id.is_none() {
-                break;
-            }
-            anchor = response.anchor_id;
         }
+    }
 
-        Ok(albums)
+    /// Fetch one page of an album's photos, sorted by capture time descending.
+    pub async fn get_album_page(
+        &self,
+        album_uid: NodeUid,
+        cursor: Option<&LinkId>,
+    ) -> anyhow::Result<(Vec<AlbumChildItem>, Option<LinkId>)> {
+        let volume_id = album_uid.volume_id.clone();
+        let response = self
+            .photos_api
+            .get_album_children(volume_id.clone(), album_uid.link_id, cursor.cloned())
+            .await?;
+        let next_cursor = next_album_anchor(response.more, response.anchor_id, cursor)?;
+        let items = response
+            .photos
+            .into_iter()
+            .map(|dto| AlbumChildItem {
+                uid: NodeUid::new(volume_id.clone(), dto.link_id),
+                capture_time: dto.capture_time,
+            })
+            .collect();
+        Ok((items, next_cursor))
     }
 
     /// Returns all photo entries inside an album, sorted by capture time descending.
     pub async fn iterate_album(&self, album_uid: NodeUid) -> anyhow::Result<Vec<AlbumChildItem>> {
-        let volume_id = album_uid.volume_id.clone();
         let mut items = Vec::new();
-        let mut anchor: Option<LinkId> = None;
-
+        let mut cursor = None;
         loop {
-            let response = self
-                .photos_api
-                .get_album_children(volume_id.clone(), album_uid.link_id.clone(), anchor.clone())
+            let (page, next_cursor) = self
+                .get_album_page(album_uid.clone(), cursor.as_ref())
                 .await?;
-
-            for dto in &response.photos {
-                items.push(AlbumChildItem {
-                    uid: NodeUid::new(volume_id.clone(), dto.link_id.clone()),
-                    capture_time: dto.capture_time,
-                });
+            items.extend(page);
+            match next_cursor {
+                Some(next) => cursor = Some(next),
+                None => return Ok(items),
             }
-
-            if !response.more || response.anchor_id.is_none() {
-                break;
-            }
-            anchor = response.anchor_id;
         }
-
-        Ok(items)
     }
 
     /// Creates a new album under the photos root folder and returns its `NodeUid`.
@@ -1410,5 +1445,27 @@ impl ProtonPhotosClient {
             },
         };
         self.update_photos(vec![update]).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn album_anchor_requires_progress_when_more_pages_exist() {
+        let first = LinkId::new("first".into());
+        let next = LinkId::new("next".into());
+        assert_eq!(
+            next_album_anchor(true, Some(next.clone()), Some(&first)).unwrap(),
+            Some(next.clone())
+        );
+        assert_eq!(
+            next_album_anchor(false, Some(next), Some(&first)).unwrap(),
+            None
+        );
+        assert!(next_album_anchor(true, None, None).is_err());
+        assert!(next_album_anchor(true, Some(first.clone()), Some(&first)).is_err());
+        assert!(next_album_anchor(true, Some(LinkId::new(String::new())), None).is_err());
     }
 }

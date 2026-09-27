@@ -88,10 +88,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             println!("sync retry requested");
             Ok(())
         }
-        Some(Command::Open) => {
-            daemon::open_folder();
-            Ok(())
-        }
+        Some(Command::Open) => daemon::open_folder(),
         Some(Command::Share { command }) => share::run_cli(flags.force_offline, command).await,
         Some(Command::Takeout { destination }) => {
             takeout::run_cli(flags.force_offline, destination).await

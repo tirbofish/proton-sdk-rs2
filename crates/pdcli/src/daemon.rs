@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -111,15 +111,26 @@ fn set_paused(want_paused: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn open_folder() {
-    let path = fs::default_mountpoint()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("MyFiles");
+pub fn open_folder() -> anyhow::Result<()> {
+    anyhow::ensure!(
+        is_running(),
+        "Proton Drive is not mounted; mount it from Status first"
+    );
+    let path = fs::default_mountpoint()?.join("MyFiles");
+    std::fs::metadata(&path)
+        .with_context(|| format!("cannot access mounted folder {}", path.display()))?;
     #[cfg(target_os = "macos")]
     let opener = "open";
     #[cfg(not(target_os = "macos"))]
     let opener = "xdg-open";
-    let _ = std::process::Command::new(opener).arg(path).spawn();
+    let output = std::process::Command::new(opener).arg(&path).output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "could not open {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
 }
 
 pub fn recent_events() -> Vec<crate::db::SyncEvent> {
@@ -143,14 +154,22 @@ pub fn ensure_running(force_offline: bool, enable_tray: bool) -> anyhow::Result<
 
     let exe = std::env::current_exe()?;
     let mut command = std::process::Command::new(exe);
-    command.arg("daemon");
+    command
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(if std::io::stderr().is_terminal() {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        });
     if force_offline {
         command.arg("--force-offline");
     }
     if !enable_tray {
         command.arg("--no-tray");
     }
-    let mut child = command.stdin(Stdio::null()).spawn()?;
+    let mut child = command.spawn()?;
 
     for _ in 0..600 {
         if is_running() {
@@ -331,7 +350,9 @@ fn daemon_tray_state() -> tray::TrayState {
 fn handle_tray_action(action: tray::TrayAction) -> bool {
     match action {
         tray::TrayAction::OpenFolder => {
-            open_folder();
+            if let Err(error) = open_folder() {
+                tracing::error!(%error, "could not open mounted folder");
+            }
             false
         }
         tray::TrayAction::ShowHideWindow => {

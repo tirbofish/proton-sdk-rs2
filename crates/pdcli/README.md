@@ -20,16 +20,24 @@ AppIndicator tray remain in a separate GTK3 process. On WSL, `pdcli` without
 a subcommand mounts; use `pdcli gui` for the window. `--force-offline` uses
 local state only and `--no-tray` suppresses the tray icon.
 
-The window groups My Files browsing, Computer backup/restore, mount and sync
-status, account actions, and global `.pdignore` settings into separate pages.
-My Files supports folder navigation, creating folders, renaming items,
-opening items in the web app, and confirmed trash; the FUSE mount remains the
+The window groups My Files, Photos, Computers, and Status in primary navigation.
+Status shows active transfer progress, cancellation for downloads, sync controls,
+and mount actions. Files supports folder navigation, rename, sharing, web
+handoff, and confirmed trash. Computers offers a folder chooser and a structured
+backup list. The account menu provides Settings and Log out; Settings includes
+automatic mounting, default start page, and global `.pdignore` patterns. The FUSE mount remains the
 way to upload and download with a file manager.
+
+Photos displays paginated timeline entries and albums. Selecting a photo loads
+an in-memory preview; opening the full photo hands off to the web app. Album
+listing currently stops with an error beyond 200 albums or 500 photos in one
+album because the SDK's album iterators are not page-based yet.
 
 ## Commands
 
 ```text
 pdcli status [--json]
+pdcli cancel-transfer <ID>   # active downloads only
 pdcli retry <ID>
 pdcli retry --all
 pdcli pause
@@ -39,22 +47,30 @@ pdcli open
 pdcli stop                 # also: unmount
 pdcli logout
 
+pdcli computers --json
+pdcli photos timeline [--cursor LINK_ID]
+pdcli photos albums
+pdcli photos album VOLUME~LINK
+pdcli photos thumbnail VOLUME~LINK [--preview] > image
+
 pdcli computers
 pdcli computers register [--name NAME] [--bind DEVICE_ID]
 pdcli computers sync PATH [--name NAME] [--dry-run]
 pdcli computers restore COMPUTER FOLDER PATH
 pdcli computers unsync JOB
 
-pdcli share link NODE_UID [--role viewer|editor] [--password PASSWORD]
+pdcli share link NODE_UID [--role viewer|editor] [--expires RFC3339] [--password-stdin]
 pdcli share status NODE_UID [--json]
 pdcli share remove NODE_UID
+pdcli share invite NODE_UID EMAIL [--role viewer|editor]
+pdcli share revoke NODE_UID EMAIL
 pdcli share report NODE_UID --category CATEGORY --bona-fide [--message TEXT] [--email EMAIL] [--revision UID] [--invitation UID]
 
 pdcli takeout DESTINATION
 ```
 
-`status --json` is intended for scripts and includes login, daemon, mount, and
-journal information. Failed journal entries remain available for inspection;
+`status --json` is intended for scripts and includes login, daemon, mount,
+journal, and active transfer information. Failed journal entries remain available for inspection;
 retry one with `pdcli retry ID`, or retry all with `pdcli retry --all`.
 
 Computer sync is additive: it does not delete local or remote files. When
@@ -99,6 +115,12 @@ On Linux, pdcli uses `$XDG_CONFIG_HOME/pdcli`, falling back to
 `$HOME/.config/pdcli`. It stores the encrypted FUSE database, SDK caches
 (including an encrypted secret cache), Computer job state, and downloaded file
 cache there.
+**Downloaded FUSE file content is currently plaintext on disk**, even though the
+FUSE database and SDK secret cache are encrypted. Do not treat a downloaded
+file as protected against someone with filesystem access; place the
+configuration directory on an encrypted filesystem if needed. There is not yet
+a safe in-app way to evict offline copies. A thumbnail redirected from the CLI
+is also a plaintext file.
 Session tokens and the cache master key use the `pdcli` OS-keyring service when
 available; otherwise
 `cred.ron` and `cache.key` are created with `0600` permissions on Unix.

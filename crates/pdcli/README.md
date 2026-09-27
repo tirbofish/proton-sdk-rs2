@@ -22,15 +22,19 @@ local state only and `--no-tray` suppresses the tray icon.
 
 The window groups My Files, Photos, Computers, and Status in primary navigation.
 Status shows active transfer progress, cancellation for downloads, sync controls,
-and mount actions. Files supports folder navigation, rename, sharing, web
-handoff, and confirmed trash. Computers offers a folder chooser and a structured
-backup list. The account menu provides Settings and Log out; Settings includes
-automatic mounting, default start page, and global `.pdignore` patterns. The FUSE mount remains the
-way to upload and download with a file manager.
+and mount actions. Files uses the available pane for the folder list; right-click
+an item for open, rename, sharing, web handoff, and confirmed trash actions.
+Computers offers a folder chooser and a structured backup list. The profile
+menu in the header is the entry point for Account, Settings, About, and Quit;
+sign-out is on Account. Settings includes automatic mounting, default start
+page, and global `.pdignore` patterns. The FUSE mount remains the way to
+upload and download with a file manager.
 
-Photos displays paginated timeline, album lists, and album contents. Selecting
-a photo loads an in-memory preview; opening the full photo hands off to the web
-app. Timeline photos can be marked as favorites, and new albums can be created.
+Photos displays paginated timeline, album lists, and album contents without
+loading previews. Import streams one local image into the timeline without
+removing its source; export writes a resumable local copy of timeline Photos.
+Full photo viewing hands off to the web app. Timeline photos can be marked as
+favorites, and new albums can be created.
 Favorite state is not shown for album photos because the album API does not
 return photo tags.
 
@@ -55,6 +59,8 @@ pdcli photos album VOLUME~LINK [--cursor LINK_ID]
 pdcli photos favorite VOLUME~LINK [--off]
 pdcli photos create-album NAME
 pdcli photos thumbnail VOLUME~LINK [--preview] > image
+pdcli photos import PATH
+pdcli photos export DEST
 
 pdcli computers
 pdcli computers register [--name NAME] [--bind DEVICE_ID]
@@ -87,6 +93,14 @@ The Proton Drive mount itself cannot be used as a Computer source.
 records completed files in `.pdcli-takeout-manifest.json`, so rerunning resumes
 safely. Degraded or unsupported nodes are recorded in the manifest's `issues`
 list.
+`photos export DEST` exports only timeline Photos into `DEST/Photos/YYYY/MM`,
+using the same resumable manifest but writing directly to destination files
+without plaintext temporary files. An interrupted file may remain incomplete
+without a manifest entry; rerunning chooses a new name and skips completed
+files. It does not export My Files, Computers, or album-only photos. `photos import
+PATH` imports one supported image, preserving the local source and skipping
+Photos timeline duplicates by name and SHA-1. Import and export have not been
+verified against a live account.
 Public-link commands accept a node UID; `share remove` removes that node's
 public link. Passwords passed with `--password` may be recorded by shell
 history. `share report` submits an abuse report for a shared node. `--bona-fide`

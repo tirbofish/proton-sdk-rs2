@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 use std::io::Write;
+use std::path::Path;
 
 use anyhow::Context;
 use futures::StreamExt;
 use proton_drive_sdk::api::file::photos::AlbumInfo;
 use proton_drive_sdk::links::LinkId;
 use proton_drive_sdk::node::file::FileThumbnail;
+use proton_drive_sdk::node::file::FileUploadMetadata;
+use proton_drive_sdk::node::photo::PhotosFileUploadMetadata;
 use proton_drive_sdk::node::photo::{PhotoTag, TimelineEntry};
 use proton_drive_sdk::node::thumbnail::ThumbnailType;
 use proton_drive_sdk::node::{DegradedNode, Node, NodeUid};
@@ -13,8 +16,10 @@ use proton_drive_sdk::photo::ProtonPhotosClient;
 use proton_drive_sdk::utils::PotentialObject;
 use proton_drive_sdk::volume::VolumeId;
 use serde::Serialize;
+use sha1::{Digest, Sha1};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-use crate::{daemon, flags::PhotosCommand};
+use crate::{daemon, flags::PhotosCommand, takeout};
 
 const MAX_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
 
@@ -185,7 +190,109 @@ fn thumbnail_bytes(uid: &NodeUid, item: FileThumbnail) -> anyhow::Result<Vec<u8>
     Ok(bytes)
 }
 
+async fn import_photo(photos: &ProtonPhotosClient, path: &Path) -> anyhow::Result<()> {
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .context("open local photo")?;
+    let metadata = file.metadata().await?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "not a local photo file: {}",
+        path.display()
+    );
+    let size = i64::try_from(metadata.len()).context("photo is too large")?;
+    anyhow::ensure!(size > 0, "photo is empty: {}", path.display());
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .context("photo name must be valid UTF-8")?
+        .to_owned();
+    let media_type = mime_guess::from_path(path)
+        .first_or_octet_stream()
+        .to_string();
+    anyhow::ensure!(
+        media_type.starts_with("image/"),
+        "not a recognized image file: {}",
+        path.display()
+    );
+
+    let digest = hash_photo(&mut file).await?;
+    let sha1_hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if let Some(uid) = photos
+        .find_photo_duplicates(&name, &sha1_hex)
+        .await?
+        .first()
+    {
+        println!(
+            "{}",
+            serde_json::json!({"uid": uid.raw(), "duplicate": true})
+        );
+        return Ok(());
+    }
+    let root = photos.get_photos_root_folder().await?;
+    let modified = metadata.modified().ok().map(chrono::DateTime::from);
+    let mut uploader = photos
+        .get_file_uploader(
+            root.base.uid,
+            name,
+            media_type,
+            size,
+            PhotosFileUploadMetadata {
+                base: FileUploadMetadata {
+                    last_modification_time: modified,
+                    additional_metadata: None,
+                },
+                capture_time: modified,
+                main_photo_uid: None,
+                tags: None,
+            },
+        )
+        .await?;
+    uploader.set_expected_sha1(digest.to_vec());
+    file.rewind().await?;
+    let uid = uploader
+        .upload_from_stream(Box::new(file), vec![], Box::new(|_, _| {}))
+        .await?;
+    println!(
+        "{}",
+        serde_json::json!({"uid": uid.raw(), "duplicate": false})
+    );
+    Ok(())
+}
+
+async fn hash_photo(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> anyhow::Result<Vec<u8>> {
+    let mut hasher = Sha1::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finalize().to_vec())
+}
+
 pub async fn run_cli(force_offline: bool, command: PhotosCommand) -> anyhow::Result<()> {
+    if let PhotosCommand::Import { path } = command {
+        anyhow::ensure!(
+            !force_offline,
+            "Photos import requires a network connection"
+        );
+        let session = daemon::restore_session(force_offline).await?;
+        return import_photo(&ProtonPhotosClient::new(&session, None)?, &path).await;
+    }
+    if let PhotosCommand::Export { destination } = command {
+        anyhow::ensure!(
+            !force_offline,
+            "Photos export requires a network connection"
+        );
+        return takeout::run_photos_cli(force_offline, destination).await;
+    }
     anyhow::ensure!(
         !force_offline,
         "Photos browsing requires a network connection"
@@ -193,6 +300,7 @@ pub async fn run_cli(force_offline: bool, command: PhotosCommand) -> anyhow::Res
     let session = daemon::restore_session(force_offline).await?;
     let photos = ProtonPhotosClient::new(&session, None)?;
     match command {
+        PhotosCommand::Import { .. } | PhotosCommand::Export { .. } => unreachable!(),
         PhotosCommand::Timeline { cursor } => {
             anyhow::ensure!(
                 cursor.as_ref().is_none_or(|id| !id.is_empty()),
@@ -451,6 +559,46 @@ mod tests {
                 command: PhotosCommand::Thumbnail { preview: true, .. }
             })
         ));
+    }
+
+    #[test]
+    fn photos_input_output_require_one_path() {
+        let cli = crate::flags::Cli::try_parse_from(["pdcli", "photos", "export", "path"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(crate::flags::Command::Photos {
+                command: PhotosCommand::Export { .. }
+            })
+        ));
+        assert!(crate::flags::Cli::try_parse_from(["pdcli", "photos", "export"]).is_err());
+        assert!(
+            crate::flags::Cli::try_parse_from(["pdcli", "photos", "export", "one", "two"]).is_err()
+        );
+        let cli = crate::flags::Cli::try_parse_from(["pdcli", "photos", "import", "path"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(crate::flags::Command::Photos {
+                command: PhotosCommand::Import { .. }
+            })
+        ));
+        assert!(crate::flags::Cli::try_parse_from(["pdcli", "photos", "import"]).is_err());
+        assert!(
+            crate::flags::Cli::try_parse_from(["pdcli", "photos", "import", "one", "two"]).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn photo_hash_streams_sha1_without_consuming_source() {
+        let mut source = std::io::Cursor::new(b"abc".to_vec());
+        let hash = hash_photo(&mut source).await.unwrap();
+        assert_eq!(
+            hash.iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        source.rewind().await.unwrap();
+        assert_eq!(source.into_inner(), b"abc");
     }
 
     #[test]

@@ -311,7 +311,7 @@ impl ProtonPhotosClient {
     /// Creates a file uploader for a new photo in the given parent folder.
     ///
     /// `media_type` should be a MIME type such as `"image/jpeg"`.  The upload
-    /// is committed when [`FileUploader::finish`] is called on the result.
+    /// is committed when [`FileUploader::upload_from_stream`] completes.
     pub async fn get_file_uploader(
         &self,
         parent_uid: NodeUid,
@@ -320,7 +320,16 @@ impl ProtonPhotosClient {
         size: i64,
         metadata: PhotosFileUploadMetadata,
     ) -> anyhow::Result<FileUploader> {
-        self.drive
+        anyhow::ensure!(
+            parent_uid.volume_id == self.get_photos_volume_id().await?,
+            "photo parent is not in the Photos volume"
+        );
+        let hash_key =
+            crate::node::folder::FolderOperations::get_secrets(&self.drive, parent_uid.clone())
+                .await?
+                .hash_key;
+        let mut uploader = self
+            .drive
             .get_file_uploader(
                 parent_uid,
                 name,
@@ -330,11 +339,13 @@ impl ProtonPhotosClient {
                     .base
                     .last_modification_time
                     .map(|dt| std::time::SystemTime::from(dt)),
-                metadata.base.additional_metadata,
+                metadata.base.additional_metadata.clone(),
                 None,  // media_info
                 false, // override_existing_draft_by_other_client
             )
-            .await
+            .await?;
+        uploader.set_photos_metadata(metadata, hash_key);
+        Ok(uploader)
     }
 
     /// Creates a downloader for the active revision of a photo or file node.

@@ -4,6 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use proton_drive_sdk::client::ProtonDriveClient;
 use proton_drive_sdk::device_ops::DeviceOperations;
 use proton_drive_sdk::futures::StreamExt;
+use proton_drive_sdk::node::revision::RevisionUid;
 use proton_drive_sdk::node::{Node, NodeUid, is_proton_document, is_proton_sheet};
 use proton_drive_sdk::photo::ProtonPhotosClient;
 use proton_drive_sdk::utils::PotentialObject;
@@ -68,6 +69,7 @@ pub async fn run_cli(force_offline: bool, destination: PathBuf) -> anyhow::Resul
         &manifest_path,
         &mut manifest,
         &mut stats,
+        false,
     )
     .await?;
     export_devices(
@@ -81,6 +83,30 @@ pub async fn run_cli(force_offline: bool, destination: PathBuf) -> anyhow::Resul
 
     println!(
         "takeout complete: {} exported, {} already present, {} unsupported",
+        stats.exported, stats.skipped, stats.unsupported
+    );
+    Ok(())
+}
+
+pub async fn run_photos_cli(force_offline: bool, destination: PathBuf) -> anyhow::Result<()> {
+    let session = daemon::restore_session(force_offline).await?;
+    let photos = ProtonPhotosClient::new(&session, None)?;
+    let destination = computers::expand_path(&destination.to_string_lossy());
+    std::fs::create_dir_all(&destination)?;
+    let manifest_path = destination.join(MANIFEST_NAME);
+    let mut manifest = load_manifest(&manifest_path)?;
+    let mut stats = Stats::default();
+    export_photos(
+        &photos,
+        &destination,
+        &manifest_path,
+        &mut manifest,
+        &mut stats,
+        true,
+    )
+    .await?;
+    println!(
+        "Photos export complete: {} exported, {} already present, {} unsupported",
         stats.exported, stats.skipped, stats.unsupported
     );
     Ok(())
@@ -130,7 +156,7 @@ async fn export_folder(
                     drive,
                     node.base.base.uid,
                     &node.base.base.name,
-                    node.active_revision.uid.to_string(),
+                    node.active_revision.uid.clone(),
                     node.active_revision
                         .claimed_size
                         .unwrap_or(node.total_size_on_cloud_storage)
@@ -140,6 +166,7 @@ async fn export_folder(
                     manifest_path,
                     manifest,
                     stats,
+                    false,
                 )
                 .await?;
             }
@@ -164,69 +191,86 @@ async fn export_photos(
     manifest_path: &Path,
     manifest: &mut Manifest,
     stats: &mut Stats,
+    direct_output: bool,
 ) -> anyhow::Result<()> {
     let relative_dir = Path::new("Photos");
     std::fs::create_dir_all(destination.join(relative_dir))?;
-    let timeline = photos.iterate_timeline().await?;
-    let capture_times: HashMap<NodeUid, chrono::DateTime<chrono::Utc>> = timeline
-        .iter()
-        .map(|item| (item.uid.clone(), item.capture_time))
-        .collect();
-
-    for item in photos
-        .enumerate_nodes(timeline.into_iter().map(|item| item.uid).collect())
-        .await?
-    {
-        match item {
-            PotentialObject::Node(Node::File(node) | Node::Photo(node)) => {
-                if unsupported_media_type(&node.base.media_type) {
-                    record_issue(
-                        &node.base.base.uid,
-                        relative_dir,
-                        "Proton Docs and Sheets are not supported in takeout",
+    let volume_id = photos.get_photos_volume_id().await?;
+    let mut cursor = None;
+    loop {
+        let (timeline, next_cursor) = photos
+            .get_timeline_page(&volume_id, cursor.as_ref())
+            .await?;
+        let capture_times: HashMap<NodeUid, chrono::DateTime<chrono::Utc>> = timeline
+            .iter()
+            .map(|item| (item.uid.clone(), item.capture_time))
+            .collect();
+        for item in photos
+            .enumerate_nodes(timeline.into_iter().map(|item| item.uid).collect())
+            .await?
+        {
+            match item {
+                PotentialObject::Node(Node::File(node) | Node::Photo(node)) => {
+                    if unsupported_media_type(&node.base.media_type) {
+                        record_issue(
+                            &node.base.base.uid,
+                            relative_dir,
+                            "Proton Docs and Sheets are not supported in takeout",
+                            manifest_path,
+                            manifest,
+                            stats,
+                        )?;
+                        continue;
+                    }
+                    let photo_dir = capture_times
+                        .get(&node.base.base.uid)
+                        .map(|time| relative_dir.join(time.format("%Y/%m").to_string()))
+                        .unwrap_or_else(|| relative_dir.join("undated"));
+                    export_file(
+                        photos.drive(),
+                        node.base.base.uid,
+                        &node.base.base.name,
+                        node.active_revision.uid.clone(),
+                        node.active_revision
+                            .claimed_size
+                            .unwrap_or(node.total_size_on_cloud_storage)
+                            .max(0) as u64,
+                        &photo_dir,
+                        destination,
                         manifest_path,
                         manifest,
                         stats,
-                    )?;
-                    continue;
+                        direct_output,
+                    )
+                    .await?;
                 }
-                let photo_dir = capture_times
-                    .get(&node.base.base.uid)
-                    .map(|time| relative_dir.join(time.format("%Y/%m").to_string()))
-                    .unwrap_or_else(|| relative_dir.join("undated"));
-                export_file(
-                    photos.drive(),
-                    node.base.base.uid,
-                    &node.base.base.name,
-                    node.active_revision.uid.to_string(),
-                    node.active_revision
-                        .claimed_size
-                        .unwrap_or(node.total_size_on_cloud_storage)
-                        .max(0) as u64,
-                    &photo_dir,
-                    destination,
+                PotentialObject::Node(node) => record_issue(
+                    node.uid(),
+                    relative_dir,
+                    "timeline entry is not a photo file",
                     manifest_path,
                     manifest,
                     stats,
-                )
-                .await?;
+                )?,
+                PotentialObject::Degraded(node) => record_issue(
+                    node.uid(),
+                    relative_dir,
+                    "photo metadata could not be decrypted",
+                    manifest_path,
+                    manifest,
+                    stats,
+                )?,
             }
-            PotentialObject::Node(node) => record_issue(
-                node.uid(),
-                relative_dir,
-                "timeline entry is not a photo file",
-                manifest_path,
-                manifest,
-                stats,
-            )?,
-            PotentialObject::Degraded(node) => record_issue(
-                node.uid(),
-                relative_dir,
-                "photo metadata could not be decrypted",
-                manifest_path,
-                manifest,
-                stats,
-            )?,
+        }
+        match next_cursor {
+            None => break,
+            Some(next) => {
+                anyhow::ensure!(
+                    cursor.as_ref() != Some(&next),
+                    "Photos timeline did not advance"
+                );
+                cursor = Some(next);
+            }
         }
     }
     Ok(())
@@ -294,26 +338,28 @@ async fn export_file(
     drive: &ProtonDriveClient,
     uid: NodeUid,
     name: &str,
-    revision: String,
+    revision: RevisionUid,
     size: u64,
     relative_dir: &Path,
     destination: &Path,
     manifest_path: &Path,
     manifest: &mut Manifest,
     stats: &mut Stats,
+    direct_output: bool,
 ) -> anyhow::Result<()> {
     let key = uid.raw();
-    let relative = manifest
+    let mut relative = manifest
         .entries
         .get(&key)
         .and_then(|entry| safe_manifest_path(&entry.path))
+        .filter(|path| !direct_output || path.starts_with(relative_dir))
         .unwrap_or_else(|| {
             unique_relative_path(relative_dir, &safe_name(name), destination, manifest)
         });
-    let output = destination.join(&relative);
+    let mut output = destination.join(&relative);
 
     if let Some(entry) = manifest.entries.get(&key) {
-        if entry.revision == revision
+        if entry.revision == revision.to_string()
             && entry.size == size
             && output.is_file()
             && std::fs::metadata(&output)
@@ -325,27 +371,65 @@ async fn export_file(
         }
     }
 
+    if direct_output && output.exists() {
+        relative = unique_relative_path(relative_dir, &safe_name(name), destination, manifest);
+        output = destination.join(&relative);
+    }
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let partial = output.with_file_name(format!(
-        ".{}.pdcli-partial",
-        output
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("file")
-    ));
-    let _ = std::fs::remove_file(&partial);
-    if let Err(error) = drive
-        .download_to_file(uid.clone(), &partial, Box::new(|_, _| {}))
-        .await
-    {
-        let _ = std::fs::remove_file(&partial);
+    let (download_path, file) = if direct_output {
+        (
+            output.clone(),
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&output)?,
+        )
+    } else {
+        let partial_name = format!(
+            ".{}.pdcli-partial",
+            output
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("file")
+        );
+        (0..10_000)
+            .find_map(|index| {
+                let path = output.with_file_name(if index == 0 {
+                    partial_name.clone()
+                } else {
+                    format!("{partial_name}.{index}")
+                });
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(file) => Some(Ok((path, file))),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("no available partial path for {}", output.display())
+            })??
+    };
+    let download = async {
+        let downloader = drive.get_file_downloader(revision.clone()).await?;
+        downloader
+            .download_to_stream(Box::new(file), Box::new(|_, _| {}))
+            .completion
+            .await??;
+        Ok::<_, anyhow::Error>(())
+    };
+    if let Err(error) = download.await {
+        let _ = std::fs::remove_file(&download_path);
         return Err(error);
     }
-    if size != 0 && std::fs::metadata(&partial)?.len() != size {
-        let actual = std::fs::metadata(&partial)?.len();
-        let _ = std::fs::remove_file(&partial);
+    if size != 0 && std::fs::metadata(&download_path)?.len() != size {
+        let actual = std::fs::metadata(&download_path)?.len();
+        let _ = std::fs::remove_file(&download_path);
         anyhow::bail!(
             "downloaded {} with {} bytes; expected {}",
             relative.display(),
@@ -353,12 +437,14 @@ async fn export_file(
             size
         );
     }
-    std::fs::rename(&partial, &output)?;
+    if !direct_output {
+        std::fs::rename(&download_path, &output)?;
+    }
     manifest.entries.insert(
         key,
         ManifestEntry {
             path: relative.to_string_lossy().into_owned(),
-            revision,
+            revision: revision.to_string(),
             size,
         },
     );
@@ -478,5 +564,17 @@ mod tests {
         assert!(unsupported_media_type("application/vnd.proton.doc"));
         assert!(unsupported_media_type("application/vnd.proton.sheet"));
         assert!(!unsupported_media_type("image/jpeg"));
+    }
+
+    #[test]
+    fn export_name_does_not_overwrite_existing_file() {
+        let destination = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let relative = unique_relative_path(
+            Path::new(""),
+            "Cargo.toml",
+            destination,
+            &Manifest::default(),
+        );
+        assert_eq!(relative, Path::new("Cargo (1).toml"));
     }
 }

@@ -241,7 +241,6 @@ mod desktop {
         Photos(u64, Option<String>, Result<PhotoPage, String>),
         Albums(u64, Option<String>, Result<AlbumList, String>),
         Album(u64, String, Option<String>, Result<AlbumDetails, String>),
-        Preview(String, Result<Vec<u8>, String>),
     }
 
     fn run_command_bytes(args: &[String]) -> Result<Vec<u8>, String> {
@@ -482,8 +481,8 @@ mod desktop {
 
     fn show_photos(list: &gtk4::ListBox, items: &[PhotoItem], append: bool) {
         if !append {
-            while let Some(child) = list.first_child() {
-                list.remove(&child);
+            while let Some(row) = list.row_at_index(0) {
+                list.remove(&row);
             }
         }
         for item in items {
@@ -661,9 +660,9 @@ mod desktop {
             "status",
             nav_button(&sidebar, &pages, Some(&first), "Status", "status"),
         ));
-        sidebar.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-        let secondary = section("More", "Device and account");
-        sidebar.append(&secondary);
+        let account_navigation = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        account_navigation.set_visible(false);
+        sidebar.append(&account_navigation);
         for (title, page) in [
             ("Account", "account"),
             ("Settings", "settings"),
@@ -671,7 +670,7 @@ mod desktop {
         ] {
             navigation.push((
                 page,
-                nav_button(&sidebar, &pages, Some(&first), title, page),
+                nav_button(&account_navigation, &pages, Some(&first), title, page),
             ));
         }
         let sidebar_column = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
@@ -692,31 +691,34 @@ mod desktop {
         let profile_name = gtk4::Label::new(Some("Account"));
         profile_name.set_selectable(true);
         profile_menu.append(&profile_name);
-        button("Settings", &profile_menu, {
-            let settings = navigation
+        for (title, page) in [
+            ("Account", "account"),
+            ("Settings", "settings"),
+            ("About", "about"),
+        ] {
+            let destination = navigation
                 .iter()
-                .find(|(page, _)| *page == "settings")
+                .find(|(name, _)| *name == page)
                 .unwrap()
                 .1
                 .clone();
             let profile = profile.clone();
-            move || {
-                settings.set_active(true);
+            button(title, &profile_menu, move || {
+                destination.set_active(true);
                 profile.popdown();
-            }
-        });
-        button("Log out", &profile_menu, {
-            let tx = tx.clone();
+            });
+        }
+        button("Quit", &profile_menu, {
+            let app = app.clone();
             let profile = profile.clone();
             move || {
                 profile.popdown();
-                command(&tx, "Sign out", vec!["logout".into()]);
+                app.quit();
             }
         });
         let popover = gtk4::Popover::new();
         popover.set_child(Some(&profile_menu));
         profile.set_popover(Some(&popover));
-        sidebar_column.append(&profile);
         let main = gtk4::Paned::new(gtk4::Orientation::Horizontal);
         main.set_start_child(Some(&sidebar_column));
         main.set_end_child(Some(&pages));
@@ -813,12 +815,21 @@ mod desktop {
         breadcrumb_scroll.set_policy(gtk4::PolicyType::Automatic, gtk4::PolicyType::Never);
         breadcrumb_scroll.set_child(Some(&breadcrumb));
         files.append(&breadcrumb_scroll);
-        files.append(&files_status);
+        let files_feedback = row();
+        let files_spinner = gtk4::Spinner::new();
+        files_spinner.set_visible(false);
+        files_feedback.append(&files_spinner);
+        files_feedback.append(&files_status);
+        files_status.connect_notify_local(Some("label"), move |label, _| {
+            let loading = label.text().starts_with("Loading files");
+            files_spinner.set_visible(loading);
+            files_spinner.set_spinning(loading);
+        });
+        files.append(&files_feedback);
         let files_list = gtk4::ListBox::new();
         files_list.set_selection_mode(gtk4::SelectionMode::Single);
         files_list.add_css_class("boxed-list");
         let file_rows = scroll(&files_list);
-        file_rows.set_min_content_height(220);
         files.append(&file_rows);
         let selection_group = section("Selected item", "Actions affect only the selected item.");
         let selected_label =
@@ -827,6 +838,27 @@ mod desktop {
         selected_label.set_wrap(true);
         selection_group.append(&selected_label);
         let selection_actions = row();
+        let open_folder = button("Open folder", &selection_actions, {
+            let state = files_state.clone();
+            let tx = tx.clone();
+            let status = files_status.clone();
+            move || {
+                let current = state.borrow();
+                if let Some(item) = current.selected.as_ref().filter(|item| {
+                    !item.degraded && (item.kind == "folder" || item.kind == "album")
+                }) {
+                    let mut trail = current.trail.clone();
+                    trail.push(Folder {
+                        uid: item.uid.clone(),
+                        name: item.name.clone(),
+                    });
+                    drop(current);
+                    status.set_text("Loading files…");
+                    load_files(&tx, &state, trail);
+                }
+            }
+        });
+        open_folder.set_sensitive(false);
         let rename = button("Rename", &selection_actions, {
             let state = files_state.clone();
             let tx = tx.clone();
@@ -910,7 +942,6 @@ mod desktop {
         web_link.set_visible(false);
         selection_group.append(&web_link);
         selection_group.set_visible(false);
-        files.append(&selection_group);
         let sharing = section(
             "Sharing",
             "Invite someone or create a public link for this item.",
@@ -1128,11 +1159,68 @@ mod desktop {
         people_expander.set_child(Some(&people_fields));
         sharing.append(&people_expander);
         sharing.set_visible(false);
-        files.append(&sharing);
+        let file_menu = gtk4::Popover::new();
+        let file_menu_content = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+        file_menu_content.set_margin_start(12);
+        file_menu_content.set_margin_end(12);
+        file_menu_content.set_margin_top(12);
+        file_menu_content.set_margin_bottom(12);
+        file_menu_content.append(&selection_group);
+        file_menu_content.append(&sharing);
+        let menu_scroll = scroll(&file_menu_content);
+        menu_scroll.set_size_request(440, 420);
+        file_menu.set_child(Some(&menu_scroll));
+        file_menu.set_parent(&files_list);
+        let right_click = gtk4::GestureClick::new();
+        right_click.set_button(3);
+        right_click.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        right_click.connect_pressed({
+            let list = files_list.clone();
+            let menu = file_menu.clone();
+            move |_, _, x, y| {
+                if let Some(row) = list.row_at_y(y as i32) {
+                    list.select_row(Some(&row));
+                    menu.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
+                        x as i32, y as i32, 1, 1,
+                    )));
+                    menu.popup();
+                } else {
+                    menu.popdown();
+                }
+            }
+        });
+        files_list.add_controller(right_click);
+        let context_key = gtk4::EventControllerKey::new();
+        context_key.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        context_key.connect_key_pressed({
+            let list = files_list.clone();
+            let menu = file_menu.clone();
+            move |_, key, _, modifiers| {
+                if key == gtk4::gdk::Key::Menu
+                    || (key == gtk4::gdk::Key::F10
+                        && modifiers.contains(gtk4::gdk::ModifierType::SHIFT_MASK))
+                {
+                    if let Some(row) = list.selected_row() {
+                        let bounds = row.allocation();
+                        menu.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
+                            bounds.x(),
+                            bounds.y(),
+                            1,
+                            bounds.height(),
+                        )));
+                        menu.popup();
+                    }
+                    return gtk4::glib::Propagation::Stop;
+                }
+                gtk4::glib::Propagation::Proceed
+            }
+        });
+        files_list.add_controller(context_key);
         files_list.connect_row_selected({
             let state = files_state.clone();
             let label = selected_label.clone();
             let selection_group = selection_group.clone();
+            let open_folder = open_folder.clone();
             let rename = rename.clone();
             let trash = trash.clone();
             let web = web.clone();
@@ -1162,6 +1250,9 @@ mod desktop {
                 sharing_status.set_text("Check sharing to see current access.");
                 share_link.set_visible(false);
                 let mutable = selected.as_ref().is_some_and(|item| !item.degraded);
+                open_folder.set_sensitive(selected.as_ref().is_some_and(|item| {
+                    !item.degraded && (item.kind == "folder" || item.kind == "album")
+                }));
                 rename.set_sensitive(mutable);
                 trash.set_sensitive(mutable);
                 web.set_sensitive(enabled);
@@ -1189,7 +1280,7 @@ mod desktop {
                 }
             }
         });
-        pages.add_titled(&scroll(&files), Some("files"), "Files");
+        pages.add_titled(&files, Some("files"), "Files");
 
         let photos_state = Rc::new(RefCell::new(PhotosState::default()));
         let photos = page("Photos");
@@ -1197,6 +1288,18 @@ mod desktop {
         let photos_status = gtk4::Label::new(Some("Loading photos…"));
         photos_status.set_halign(gtk4::Align::Start);
         photos_status.set_wrap(true);
+        let photos_feedback = row();
+        let photos_spinner = gtk4::Spinner::new();
+        photos_spinner.set_spinning(true);
+        photos_feedback.append(&photos_spinner);
+        photos_feedback.append(&photos_status);
+        photos_status.connect_notify_local(Some("label"), move |label, _| {
+            let loading = label.text().starts_with("Loading ")
+                || label.text().starts_with("Importing ")
+                || label.text().starts_with("Exporting ");
+            photos_spinner.set_visible(loading);
+            photos_spinner.set_spinning(loading);
+        });
         let photos_views = gtk4::Stack::new();
         let timeline = gtk4::ListBox::new();
         timeline.add_css_class("boxed-list");
@@ -1219,8 +1322,8 @@ mod desktop {
                 status.set_text("Loading photos…");
                 state.borrow_mut().items.clear();
                 state.borrow_mut().selected = None;
-                while let Some(child) = timeline.first_child() {
-                    timeline.remove(&child);
+                while let Some(row) = timeline.row_at_index(0) {
+                    timeline.remove(&row);
                 }
                 load_photos(&tx, &state, None);
             }
@@ -1237,8 +1340,8 @@ mod desktop {
                 status.set_text("Loading albums…");
                 state.borrow_mut().albums_cursor = None;
                 album_items.borrow_mut().clear();
-                while let Some(child) = albums.first_child() {
-                    albums.remove(&child);
+                while let Some(row) = albums.row_at_index(0) {
+                    albums.remove(&row);
                 }
                 load_albums(&tx, &state, None);
             }
@@ -1263,8 +1366,78 @@ mod desktop {
                 });
             }
         });
+        let photo_io = row();
+        button("Import photo…", &photo_io, {
+            let window = window.clone();
+            let tx = tx.clone();
+            let status = photos_status.clone();
+            move || {
+                let dialog = gtk4::FileChooserNative::builder()
+                    .title("Choose a photo to import")
+                    .action(gtk4::FileChooserAction::Open)
+                    .transient_for(&window)
+                    .build();
+                let tx = tx.clone();
+                let status = status.clone();
+                dialog.connect_response(move |dialog, response| {
+                    if response == gtk4::ResponseType::Accept {
+                        if let Some(path) = dialog.file().and_then(|file| file.path()) {
+                            status.set_text("Importing photo…");
+                            command(
+                                &tx,
+                                "Photos import",
+                                vec![
+                                    "photos".into(),
+                                    "import".into(),
+                                    path.to_string_lossy().into_owned(),
+                                ],
+                            );
+                        } else {
+                            status.set_text("Choose a local photo file to import.");
+                        }
+                    }
+                    dialog.destroy();
+                });
+                dialog.show();
+            }
+        });
+        button("Export Photos…", &photo_io, {
+            let window = window.clone();
+            let tx = tx.clone();
+            let status = photos_status.clone();
+            move || {
+                let dialog = gtk4::FileChooserNative::builder()
+                    .title("Choose a folder for Photos export")
+                    .action(gtk4::FileChooserAction::SelectFolder)
+                    .transient_for(&window)
+                    .build();
+                let tx = tx.clone();
+                let status = status.clone();
+                dialog.connect_response(move |dialog, response| {
+                    if response == gtk4::ResponseType::Accept {
+                        if let Some(path) = dialog.file().and_then(|file| file.path()) {
+                            status.set_text("Exporting Photos…");
+                            command(
+                                &tx,
+                                "Photos export",
+                                vec![
+                                    "photos".into(),
+                                    "export".into(),
+                                    path.to_string_lossy().into_owned(),
+                                ],
+                            );
+                        } else {
+                            status.set_text("Choose a local folder for Photos export.");
+                        }
+                    }
+                    dialog.destroy();
+                });
+                dialog.show();
+            }
+        });
         photos.append(&photos_controls);
-        photos.append(&photos_status);
+        photos.append(&photo_io);
+        photos.append(&photos_feedback);
         photos_views.set_vexpand(true);
         photos.append(&photos_views);
         let load_more = button("Load more", &photos, {
@@ -1318,12 +1491,8 @@ mod desktop {
                 more.set_sensitive(true);
             }
         });
-        let preview_group = section("Preview", "Select a photo to view an in-memory preview.");
-        let preview = gtk4::Picture::new();
-        preview.set_size_request(-1, 260);
-        preview.set_can_shrink(true);
-        preview_group.append(&preview);
-        let favorite = button("Add to favorites", &preview_group, {
+        let photo_actions = row();
+        let favorite = button("Add to favorites", &photo_actions, {
             let state = photos_state.clone();
             let tx = tx.clone();
             move || {
@@ -1353,16 +1522,14 @@ mod desktop {
         let photo_web = gtk4::LinkButton::new("https://drive.proton.me");
         photo_web.set_label("Open in Proton Drive");
         photo_web.set_visible(false);
-        preview_group.append(&photo_web);
-        photos.append(&preview_group);
+        photo_actions.append(&photo_web);
+        photos.append(&photo_actions);
         for button in [&timeline_button, &albums_button, &back_to_albums] {
-            let preview = preview.clone();
             let favorite = favorite.clone();
             let photo_web = photo_web.clone();
             let state = photos_state.clone();
             button.connect_clicked(move |_| {
                 state.borrow_mut().selected = None;
-                preview.set_paintable(None::<&gtk4::gdk::Paintable>);
                 favorite.set_sensitive(false);
                 photo_web.set_visible(false);
             });
@@ -1371,14 +1538,12 @@ mod desktop {
             list.connect_row_selected({
                 let state = photos_state.clone();
                 let tx = tx.clone();
-                let preview = preview.clone();
                 let favorite = favorite.clone();
                 let photo_web = photo_web.clone();
                 let status = photos_status.clone();
                 move |_, row| {
                     let selected =
                         row.and_then(|row| state.borrow().items.get(row.index() as usize).cloned());
-                    preview.set_paintable(None::<&gtk4::gdk::Paintable>);
                     photo_web.set_visible(false);
                     state.borrow_mut().selected = selected.as_ref().map(|item| item.uid.clone());
                     favorite
@@ -1393,25 +1558,12 @@ mod desktop {
                         },
                     );
                     if let Some(item) = selected {
-                        status.set_text(&format!(
-                            "Loading preview: {}",
-                            item.name.as_deref().unwrap_or("Photo")
-                        ));
+                        status.set_text(item.name.as_deref().unwrap_or("Photo"));
                         command(
                             &tx,
                             &format!("Photo web {}", item.uid),
                             vec!["browse".into(), "url".into(), item.uid.clone()],
                         );
-                        let tx = tx.clone();
-                        std::thread::spawn(move || {
-                            let result = run_command_bytes(&[
-                                "photos".into(),
-                                "thumbnail".into(),
-                                item.uid.clone(),
-                                "--preview".into(),
-                            ]);
-                            let _ = tx.send(Event::Preview(item.uid, result));
-                        });
                     }
                 }
             });
@@ -1422,7 +1574,6 @@ mod desktop {
             let tx = tx.clone();
             let status = photos_status.clone();
             let more = load_more.clone();
-            let preview = preview.clone();
             let favorite = favorite.clone();
             let photo_web = photo_web.clone();
             move |_, row| {
@@ -1430,7 +1581,6 @@ mod desktop {
                     status.set_text("Loading album…");
                     more.set_visible(false);
                     more.set_sensitive(true);
-                    preview.set_paintable(None::<&gtk4::gdk::Paintable>);
                     favorite.set_sensitive(false);
                     photo_web.set_visible(false);
                     let uid = album.uid.clone();
@@ -1724,6 +1874,7 @@ mod desktop {
             sidebar_column.set_visible(!sidebar_column.is_visible());
         });
         header.pack_start(&sidebar_toggle);
+        header.pack_end(&profile);
         toolbar.add_top_bar(&header);
         let notifications = adw::ToastOverlay::new();
         notifications.set_child(Some(&root));
@@ -1801,10 +1952,10 @@ mod desktop {
                         root.set_visible_child_name("login");
                         files_state.borrow_mut().request += 1;
                         files_state.borrow_mut().selected = None;
+                        file_menu.popdown();
                         photos_state.borrow_mut().request += 1;
                         photos_state.borrow_mut().selected = None;
                         favorite.set_sensitive(false);
-                        preview.set_paintable(None::<&gtk4::gdk::Paintable>);
                         files_status.set_text("Sign in to browse files.");
                         login_link.set_visible(false);
                         login_details.set_text("No saved account.");
@@ -1823,6 +1974,7 @@ mod desktop {
                         if request != files_state.borrow().request {
                             continue;
                         }
+                        file_menu.popdown();
                         match result {
                             Ok(listing) => {
                                 if trail.is_empty() {
@@ -1843,8 +1995,8 @@ mod desktop {
                                         load_files(&tx, &state, destination.clone());
                                     });
                                 }
-                                while let Some(child) = files_list.first_child() {
-                                    files_list.remove(&child);
+                                while let Some(row) = files_list.row_at_index(0) {
+                                    files_list.remove(&row);
                                 }
                                 let count = listing.items.len();
                                 files_state.borrow_mut().trail = trail;
@@ -1912,7 +2064,7 @@ mod desktop {
                                 photos_status.set_text(if state.items.is_empty() {
                                     "No photos in the timeline."
                                 } else {
-                                    "Select a photo to preview it."
+                                    "Select a photo for favorite and web actions."
                                 });
                                 photos_views.set_visible_child_name("timeline");
                             }
@@ -1931,8 +2083,8 @@ mod desktop {
                                 back_to_albums.set_visible(false);
                                 if cursor.is_none() {
                                     album_items.borrow_mut().clear();
-                                    while let Some(child) = albums.first_child() {
-                                        albums.remove(&child);
+                                    while let Some(row) = albums.row_at_index(0) {
+                                        albums.remove(&row);
                                     }
                                 }
                                 for album in &result.albums {
@@ -1995,33 +2147,6 @@ mod desktop {
                             }
                             Err(error) => {
                                 photos_status.set_text(&format!("Could not open album: {error}"))
-                            }
-                        }
-                    }
-                    Event::Preview(uid, result) => {
-                        if photos_state.borrow().selected.as_deref() != Some(&uid) {
-                            continue;
-                        }
-                        match result {
-                            Ok(bytes) => {
-                                let loader = gtk4::gdk_pixbuf::PixbufLoader::new();
-                                match loader.write(&bytes).and_then(|_| loader.close()) {
-                                    Ok(()) => {
-                                        if let Some(pixbuf) = loader.pixbuf() {
-                                            preview.set_paintable(Some(
-                                                &gtk4::gdk::Texture::for_pixbuf(&pixbuf),
-                                            ));
-                                            photos_status.set_text("Preview ready.");
-                                        } else {
-                                            photos_status.set_text("Preview image is empty.");
-                                        }
-                                    }
-                                    Err(error) => photos_status
-                                        .set_text(&format!("Could not decode preview: {error}")),
-                                }
-                            }
-                            Err(error) => {
-                                photos_status.set_text(&format!("Could not load preview: {error}"))
                             }
                         }
                     }
@@ -2173,6 +2298,10 @@ mod desktop {
                                     refresh_status(&tx);
                                 } else if action == "Photos create album" {
                                     albums_button.emit_clicked();
+                                } else if action == "Photos import" {
+                                    timeline_button.emit_clicked();
+                                } else if action == "Photos export" {
+                                    photos_status.set_text("Photos export complete.");
                                 } else if action == "Sign in" {
                                     login_button.set_sensitive(true);
                                     let tx = tx.clone();
@@ -2190,8 +2319,8 @@ mod desktop {
                                     files_state.borrow_mut().trail.clear();
                                     files_state.borrow_mut().items.clear();
                                     files_state.borrow_mut().selected = None;
-                                    while let Some(child) = files_list.first_child() {
-                                        files_list.remove(&child);
+                                    while let Some(row) = files_list.row_at_index(0) {
+                                        files_list.remove(&row);
                                     }
                                     while let Some(child) = breadcrumb.first_child() {
                                         breadcrumb.remove(&child);
@@ -2401,7 +2530,7 @@ mod desktop {
                                 if action.starts_with("Share ") {
                                     sharing_status.set_text(&format!("{action} failed: {error}"));
                                 }
-                                if action.starts_with("Photo ") {
+                                if action.starts_with("Photo ") || action.starts_with("Photos ") {
                                     photos_status.set_text(&format!("{action} failed: {error}"));
                                 }
                                 if action == "Sign in" {

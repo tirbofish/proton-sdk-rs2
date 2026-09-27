@@ -2,6 +2,7 @@ use crate::client::ProtonDriveClient;
 use crate::meta::AdditionalMetadataProperty;
 use crate::node::download::ControllerState;
 use crate::node::draft::RevisionDraftProvider;
+use crate::node::photo::{PhotoUploadContext, PhotosFileUploadMetadata};
 use crate::node::revision::RevisionOperations;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
@@ -68,6 +69,7 @@ pub struct FileUploader {
     additional_metadata: Option<Vec<AdditionalMetadataProperty>>,
     media_info: Option<crate::api::attr::MediaExtendedAttributes>,
     expected_sha1: Option<Vec<u8>>,
+    photos: Option<PhotoUploadContext>,
     state_tx: watch::Sender<ControllerState>,
     request_started: Instant,
 }
@@ -98,6 +100,7 @@ impl FileUploader {
             additional_metadata,
             media_info,
             expected_sha1: None,
+            photos: None,
             state_tx,
             request_started,
         })
@@ -113,6 +116,14 @@ impl FileUploader {
     /// When set, commit fails with [`ChecksumMismatchIntegrityException`] if the uploaded content SHA-1 differs.
     pub fn set_expected_sha1(&mut self, sha1: Vec<u8>) {
         self.expected_sha1 = Some(sha1);
+    }
+
+    pub(crate) fn set_photos_metadata(
+        &mut self,
+        metadata: PhotosFileUploadMetadata,
+        hash_key: Vec<u8>,
+    ) {
+        self.photos = Some(PhotoUploadContext { metadata, hash_key });
     }
 
     pub async fn upload_from_stream(
@@ -193,6 +204,7 @@ impl FileUploader {
             self.additional_metadata.clone(),
             self.media_info.clone(),
             self.expected_sha1.clone(),
+            self.photos.as_ref(),
         )
         .await?;
 

@@ -123,6 +123,10 @@ pub enum BrowseCommand {
 
 #[derive(Subcommand)]
 pub enum PhotosCommand {
+    /// Import one local image into the Photos timeline (leave the source intact)
+    Import { path: std::path::PathBuf },
+    /// Export only Photos to DEST/Photos, resuming from a manifest
+    Export { destination: std::path::PathBuf },
     /// Fetch one timeline page (up to 500 entries)
     Timeline {
         /// Link ID returned as next_cursor by the previous page

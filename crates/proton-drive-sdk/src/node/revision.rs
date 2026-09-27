@@ -10,6 +10,7 @@ use crate::node::NodeUid;
 use crate::node::download::DownloadState;
 use crate::node::draft::RevisionDraft;
 use crate::node::file::FileContentDigests;
+use crate::node::photo::PhotoUploadContext;
 use crate::pgp::PgpArmoredMessage;
 use crate::protobuf::SignatureVerificationError;
 use crate::protobuf::ThumbnailHeader;
@@ -171,7 +172,7 @@ impl TryFrom<String> for RevisionUid {
 pub struct RevisionOperations;
 
 impl RevisionOperations {
-    pub async fn open_for_writing(
+    pub(crate) async fn open_for_writing(
         client: &ProtonDriveClient,
         draft: RevisionDraft,
         release_blocks_action: Box<dyn Fn(i32) + Send + Sync>,
@@ -180,6 +181,7 @@ impl RevisionOperations {
         additional_metadata: Option<Vec<AdditionalMetadataProperty>>,
         media_info: Option<crate::api::attr::MediaExtendedAttributes>,
         expected_sha1: Option<Vec<u8>>,
+        photos: Option<&PhotoUploadContext>,
     ) -> anyhow::Result<RevisionWriter> {
         let file_permit = client.block_uploader().queue.start_file().await?;
 
@@ -201,6 +203,7 @@ impl RevisionOperations {
             additional_metadata,
             media_info,
             expected_sha1,
+            photos: photos.cloned(),
         })
     }
 
@@ -290,6 +293,7 @@ pub struct RevisionWriter {
     additional_metadata: Option<Vec<AdditionalMetadataProperty>>,
     media_info: Option<crate::api::attr::MediaExtendedAttributes>,
     expected_sha1: Option<Vec<u8>>,
+    photos: Option<PhotoUploadContext>,
 }
 
 impl RevisionWriter {
@@ -702,7 +706,7 @@ impl RevisionWriter {
                 modification_time: self.last_modification_time,
                 block_sizes: Some(self.block_sizes.clone()),
                 digests: Some(crate::api::file::FileContentDigestsDto {
-                    sha1: Some(sha1_digest),
+                    sha1: Some(sha1_digest.clone()),
                 }),
             }),
             media: self.media_info.clone(),
@@ -722,7 +726,11 @@ impl RevisionWriter {
             signature_email_address: self.draft.membership_address.email_address.clone(),
             checksum_verified,
             extended_attributes: Some(encrypted_xattr),
-            photos_attributes: None,
+            photos_attributes: self
+                .photos
+                .as_ref()
+                .map(|photos| photos.attributes(&sha1_digest))
+                .transpose()?,
         };
 
         self.client

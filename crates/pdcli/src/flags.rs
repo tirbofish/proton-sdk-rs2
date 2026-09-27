@@ -34,7 +34,7 @@ pub struct Cli {
 pub enum Command {
     /// Open the graphical app
     Gui {
-        /// Initial page: status, computers, mount, about, account, settings
+        /// Initial page: files, photos, computers, status, account, settings, about (mount opens Status)
         #[arg(long)]
         page: Option<String>,
     },
@@ -61,6 +61,8 @@ pub enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Cancel an active download by transfer ID
+    CancelTransfer { id: usize },
     /// Sign in if needed and mount ~/ProtonDrive
     Mount,
     /// Unmount and stop the daemon
@@ -88,6 +90,9 @@ pub enum Command {
     },
     /// List computers, register this machine, or manage folder sync jobs
     Computers {
+        /// Emit machine-readable JSON when listing computers
+        #[arg(long)]
+        json: bool,
         #[command(subcommand)]
         command: Option<ComputersCommand>,
     },
@@ -96,6 +101,11 @@ pub enum Command {
     Browse {
         #[command(subcommand)]
         command: BrowseCommand,
+    },
+    /// Browse the Photos timeline and albums as JSON
+    Photos {
+        #[command(subcommand)]
+        command: PhotosCommand,
     },
     /// Run the background daemon
     #[command(hide = true)]
@@ -109,6 +119,27 @@ pub enum BrowseCommand {
     Rename { node: String, name: String },
     Trash { node: String },
     Url { node: String },
+}
+
+#[derive(Subcommand)]
+pub enum PhotosCommand {
+    /// Fetch one timeline page (up to 500 entries)
+    Timeline {
+        /// Link ID returned as next_cursor by the previous page
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// List albums and their cover/count metadata
+    Albums,
+    /// Show an album and its photos
+    Album { uid: String },
+    /// Write a decrypted thumbnail image to stdout
+    Thumbnail {
+        uid: String,
+        /// Request the larger preview image instead of the small thumbnail
+        #[arg(long)]
+        preview: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -151,8 +182,14 @@ pub enum ShareCommand {
         #[arg(long, default_value = "viewer")]
         role: String,
         /// Optional custom public-link password
-        #[arg(long)]
+        #[arg(long, conflicts_with = "password_stdin")]
         password: Option<String>,
+        /// Read the public-link password from standard input
+        #[arg(long)]
+        password_stdin: bool,
+        /// Public-link expiry as an RFC 3339 timestamp
+        #[arg(long)]
+        expires: Option<String>,
     },
     /// Show members and public-link status for a node UID
     Status {
@@ -162,6 +199,15 @@ pub enum ShareCommand {
     },
     /// Remove the public link for a node UID
     Remove { node: String },
+    /// Invite a person to a file or folder
+    Invite {
+        node: String,
+        email: String,
+        #[arg(long, default_value = "viewer")]
+        role: String,
+    },
+    /// Remove a person's access to a file or folder
+    Revoke { node: String, email: String },
     /// Report a shared node for abuse
     Report {
         node: String,

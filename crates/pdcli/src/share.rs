@@ -2,8 +2,10 @@ use proton_drive_sdk::api::share::{AbuseCategory, MemberRole};
 use proton_drive_sdk::node::NodeUid;
 use proton_drive_sdk::node::revision::RevisionUid;
 use proton_drive_sdk::sharing::{
-    ReportDirectShareAbuseSettings, ShareUrlSettings, UnshareNodeSettings,
+    ReportDirectShareAbuseSettings, ShareNodeSettings, ShareUrlSettings, ShareUser,
+    UnshareNodeSettings,
 };
+use tokio::io::AsyncReadExt;
 
 use crate::{daemon, flags::ShareCommand};
 
@@ -15,15 +17,35 @@ pub async fn run_cli(force_offline: bool, command: ShareCommand) -> anyhow::Resu
             node,
             role,
             password,
+            password_stdin,
+            expires,
         } => {
             let uid = parse_node(&node)?;
+            let password = if password_stdin {
+                let mut input = Vec::new();
+                tokio::io::stdin()
+                    .take(1025)
+                    .read_to_end(&mut input)
+                    .await?;
+                anyhow::ensure!(input.len() <= 1024, "link password is too long");
+                let text = String::from_utf8(input)?;
+                Some(text.trim_end_matches(['\r', '\n']).to_owned())
+            } else {
+                password
+            };
+            let expiration = expires
+                .map(|text| {
+                    chrono::DateTime::parse_from_rfc3339(&text)
+                        .map(|value| value.with_timezone(&chrono::Utc))
+                })
+                .transpose()?;
             let url = drive
                 .create_public_link(
                     uid,
                     ShareUrlSettings {
                         role: parse_role(&role)?,
                         custom_password: password,
-                        expiration: None,
+                        expiration,
                     },
                 )
                 .await?;
@@ -84,6 +106,35 @@ pub async fn run_cli(force_offline: bool, command: ShareCommand) -> anyhow::Resu
                 )
                 .await?;
             println!("public link removed");
+        }
+        ShareCommand::Invite { node, email, role } => {
+            anyhow::ensure!(!email.trim().is_empty(), "email is required");
+            drive
+                .share_node(
+                    parse_node(&node)?,
+                    ShareNodeSettings {
+                        users: vec![ShareUser {
+                            email,
+                            role: parse_role(&role)?,
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            println!("invitation sent");
+        }
+        ShareCommand::Revoke { node, email } => {
+            anyhow::ensure!(!email.trim().is_empty(), "email is required");
+            drive
+                .unshare_node(
+                    parse_node(&node)?,
+                    UnshareNodeSettings {
+                        users: vec![email],
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            println!("member access removed");
         }
         ShareCommand::Report {
             node,
@@ -147,5 +198,57 @@ fn parse_role(value: &str) -> anyhow::Result<MemberRole> {
         "viewer" | "read" | "reader" => Ok(MemberRole::Viewer),
         "editor" | "write" => Ok(MemberRole::Editor),
         _ => anyhow::bail!("public-link role must be viewer or editor"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn sharing_commands_parse_without_exposing_password_on_argv() {
+        let cli = crate::flags::Cli::try_parse_from([
+            "pdcli",
+            "share",
+            "link",
+            "volume~node",
+            "--password-stdin",
+            "--expires",
+            "2027-01-01T00:00:00Z",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(crate::flags::Command::Share {
+                command: ShareCommand::Link {
+                    password_stdin: true,
+                    ..
+                }
+            })
+        ));
+        assert!(
+            crate::flags::Cli::try_parse_from([
+                "pdcli",
+                "share",
+                "link",
+                "volume~node",
+                "--password-stdin",
+                "--password",
+                "secret",
+            ])
+            .is_err()
+        );
+        assert!(
+            crate::flags::Cli::try_parse_from([
+                "pdcli",
+                "share",
+                "invite",
+                "volume~node",
+                "user@example.com",
+            ])
+            .is_ok()
+        );
+        assert!(parse_role("owner").is_err());
     }
 }

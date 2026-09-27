@@ -51,16 +51,24 @@ fn request(command: &str) -> anyhow::Result<String> {
     stream.write_all(command.as_bytes())?;
     stream.write_all(b"\n")?;
 
-    let mut buf = [0_u8; 64];
-    let n = stream.read(&mut buf)?;
-    Ok(std::str::from_utf8(&buf[..n])
-        .unwrap_or_default()
-        .trim()
-        .to_string())
+    let mut buf = Vec::new();
+    stream.take(1_048_577).read_to_end(&mut buf)?;
+    anyhow::ensure!(buf.len() <= 1_048_576, "daemon response too large");
+    Ok(String::from_utf8(buf)?.trim().to_string())
 }
 
 pub fn is_running() -> bool {
     request("ping").is_ok_and(|response| response == "ok")
+}
+
+pub fn active_transfers() -> anyhow::Result<Vec<crate::transfer::TransferEntry>> {
+    Ok(serde_json::from_str(&request("transfers")?)?)
+}
+
+pub fn cancel_transfer(id: usize) -> anyhow::Result<()> {
+    let response = request(&format!("cancel-transfer {id}"))?;
+    anyhow::ensure!(response == "ok", "{response}");
+    Ok(())
 }
 
 pub fn status() -> Option<DaemonStatus> {
@@ -187,7 +195,8 @@ pub async fn run(force_offline: bool, enable_tray: bool) -> anyhow::Result<()> {
     let session = restore_session(force_offline)
         .await
         .context("failed to restore daemon session")?;
-    let fuse_session = fs::spawn_fuse_session(&session, TransferTracker::new(), force_offline)
+    let transfers = TransferTracker::new();
+    let fuse_session = fs::spawn_fuse_session(&session, transfers.clone(), force_offline)
         .await
         .context("failed to mount Proton Drive filesystem")?;
 
@@ -198,7 +207,7 @@ pub async fn run(force_offline: bool, enable_tray: bool) -> anyhow::Result<()> {
         tokio::select! {
             accept_result = listener.accept() => {
                 let (stream, _) = accept_result?;
-                if handle_client_command(stream).await? {
+                if handle_client_command(stream, &transfers).await? {
                     break;
                 }
             }
@@ -227,7 +236,10 @@ pub async fn run(force_offline: bool, enable_tray: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle_client_command(stream: tokio::net::UnixStream) -> anyhow::Result<bool> {
+async fn handle_client_command(
+    stream: tokio::net::UnixStream,
+    transfers: &TransferTracker,
+) -> anyhow::Result<bool> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     if reader.read_line(&mut line).await? == 0 {
@@ -253,6 +265,23 @@ async fn handle_client_command(stream: tokio::net::UnixStream) -> anyhow::Result
             let events = load_recent_events();
             let body = serde_json::to_string(&events)?;
             write_client_response(reader.get_mut(), body.as_bytes()).await;
+            write_client_response(reader.get_mut(), b"\n").await;
+        }
+        "transfers" => {
+            let body = serde_json::to_string(&transfers.snapshot())?;
+            write_client_response(reader.get_mut(), body.as_bytes()).await;
+            write_client_response(reader.get_mut(), b"\n").await;
+        }
+        other if other.starts_with("cancel-transfer ") => {
+            let result = other["cancel-transfer ".len()..]
+                .parse::<usize>()
+                .map_err(anyhow::Error::from)
+                .and_then(|id| transfers.cancel(id));
+            let response = match result {
+                Ok(()) => "ok".to_string(),
+                Err(error) => format!("error: {error}"),
+            };
+            write_client_response(reader.get_mut(), response.as_bytes()).await;
             write_client_response(reader.get_mut(), b"\n").await;
         }
         "quit" => {

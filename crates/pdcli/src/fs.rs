@@ -165,6 +165,7 @@ impl ProtonDriveFs {
         let db = self.db.clone();
         let drive = self.drive.clone();
         let cache_dir = self.cache_dir.clone();
+        let tracker = self.tracker.clone();
         let storage_info = self.storage_info.clone();
 
         // Event poller
@@ -172,7 +173,7 @@ impl ProtonDriveFs {
 
         // Journal flusher
         self.rt
-            .spawn(journal_flush_loop(db, drive.clone(), cache_dir));
+            .spawn(journal_flush_loop(db, drive.clone(), cache_dir, tracker));
 
         // Quota refresher. FUSE statfs must never do network I/O because file
         // managers call it synchronously while opening the mount.
@@ -537,6 +538,7 @@ impl ProtonDriveFs {
         // tokio::spawn inside the downloader can stall until the kernel
         // times the open() out as EIO.
         let drive = self.drive.clone();
+        let tracker = self.tracker.clone();
         let cache_path_task = cache_path.clone();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.rt.spawn(async move {
@@ -546,6 +548,7 @@ impl ProtonDriveFs {
                 let writer: Box<dyn std::io::Write + Send> =
                     Box::new(std::io::BufWriter::new(file));
                 let controller = downloader.download_to_stream(writer, on_progress);
+                tracker.register_cancel(idx, controller.completion.abort_handle());
                 controller.completion.await??;
                 Ok::<_, anyhow::Error>(())
             }
@@ -1860,7 +1863,12 @@ async fn event_poll_loop(db: Arc<Mutex<FuseDb>>, drive: ProtonDriveClient) {
 
 // ── Background journal-flush loop ────────────────────────────────────
 
-async fn journal_flush_loop(db: Arc<Mutex<FuseDb>>, drive: ProtonDriveClient, cache_dir: PathBuf) {
+async fn journal_flush_loop(
+    db: Arc<Mutex<FuseDb>>,
+    drive: ProtonDriveClient,
+    cache_dir: PathBuf,
+    tracker: TransferTracker,
+) {
     loop {
         let _ = SYNC_NOW.swap(false, Ordering::Relaxed);
         let can_flush = is_online()
@@ -1878,13 +1886,20 @@ async fn journal_flush_loop(db: Arc<Mutex<FuseDb>>, drive: ProtonDriveClient, ca
                 if matches!(entry.event_type.as_str(), "create_file" | "update_revision") {
                     file_batch.push(entry);
                 } else {
-                    flush_file_entries(&db, &drive, &cache_dir, std::mem::take(&mut file_batch))
-                        .await;
-                    let result = process_journal_entry(&db, &drive, &cache_dir, &entry).await;
+                    flush_file_entries(
+                        &db,
+                        &drive,
+                        &cache_dir,
+                        &tracker,
+                        std::mem::take(&mut file_batch),
+                    )
+                    .await;
+                    let result =
+                        process_journal_entry(&db, &drive, &cache_dir, &tracker, &entry).await;
                     apply_journal_result(&db, &entry, result);
                 }
             }
-            flush_file_entries(&db, &drive, &cache_dir, file_batch).await;
+            flush_file_entries(&db, &drive, &cache_dir, &tracker, file_batch).await;
 
             let _ = db.lock().unwrap().delete_completed_journal();
 
@@ -1947,6 +1962,7 @@ async fn flush_file_entries(
     db: &Arc<Mutex<FuseDb>>,
     drive: &ProtonDriveClient,
     cache_dir: &std::path::Path,
+    tracker: &TransferTracker,
     entries: Vec<crate::db::JournalEntry>,
 ) {
     if entries.is_empty() {
@@ -1959,9 +1975,10 @@ async fn flush_file_entries(
             let db = db.clone();
             let drive = drive.clone();
             let cache_dir = cache_dir.to_path_buf();
+            let tracker = tracker.clone();
             let entry = entry.clone();
             set.spawn(async move {
-                let result = process_journal_entry(&db, &drive, &cache_dir, &entry).await;
+                let result = process_journal_entry(&db, &drive, &cache_dir, &tracker, &entry).await;
                 (entry, result)
             });
         }
@@ -2056,6 +2073,7 @@ async fn process_journal_entry(
     db: &Arc<Mutex<FuseDb>>,
     drive: &ProtonDriveClient,
     cache_dir: &std::path::Path,
+    tracker: &TransferTracker,
     entry: &crate::db::JournalEntry,
 ) -> anyhow::Result<()> {
     let payload: serde_json::Value = serde_json::from_str(&entry.payload)?;
@@ -2162,28 +2180,43 @@ async fn process_journal_entry(
                 )
                 .await?;
 
-            let file = tokio::fs::File::open(&cached_path).await?;
-            let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(file);
-            let node_uid = match uploader
-                .upload_from_stream(reader, vec![], Box::new(|_, _| {}))
-                .await
-            {
-                Ok(uid) => uid,
-                Err(e) if e.to_string().contains("already exists") => {
-                    let Some((_uid, rev)) = find_child_file(drive, parent_uid, &name).await? else {
-                        return Err(e);
-                    };
-                    let uploader = drive
-                        .get_file_revision_uploader(rev, size, last_mod, None, None)
-                        .await?;
-                    let file = tokio::fs::File::open(&cached_path).await?;
-                    let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(file);
-                    uploader
-                        .upload_from_stream(reader, vec![], Box::new(|_, _| {}))
-                        .await?
+            let transfer_id = tracker.add(name.clone(), TransferDirection::Upload, size);
+            let upload_result: anyhow::Result<NodeUid> = async {
+                let file = tokio::fs::File::open(&cached_path).await?;
+                let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(file);
+                match uploader
+                    .upload_from_stream(reader, vec![], tracker.progress_callback(transfer_id))
+                    .await
+                {
+                    Ok(uid) => Ok(uid),
+                    Err(e) if e.to_string().contains("already exists") => {
+                        let Some((_uid, rev)) = find_child_file(drive, parent_uid, &name).await?
+                        else {
+                            return Err(e);
+                        };
+                        let uploader = drive
+                            .get_file_revision_uploader(rev, size, last_mod, None, None)
+                            .await?;
+                        let file = tokio::fs::File::open(&cached_path).await?;
+                        let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(file);
+                        Ok(uploader
+                            .upload_from_stream(
+                                reader,
+                                vec![],
+                                tracker.progress_callback(transfer_id),
+                            )
+                            .await?)
+                    }
+                    Err(error) => Err(error),
                 }
-                Err(e) => return Err(e),
-            };
+            }
+            .await;
+            if upload_result.is_ok() {
+                tracker.mark_complete(transfer_id);
+            } else {
+                tracker.mark_failed(transfer_id);
+            }
+            let node_uid = upload_result?;
 
             let uid_raw = node_uid.raw();
             {
@@ -2251,9 +2284,17 @@ async fn process_journal_entry(
 
             let file = tokio::fs::File::open(&cached_path).await?;
             let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(file);
-            let new_node_uid = uploader
-                .upload_from_stream(reader, vec![], Box::new(|_, _| {}))
-                .await?;
+            let transfer_id =
+                tracker.add(current_row.name.clone(), TransferDirection::Upload, size);
+            let result = uploader
+                .upload_from_stream(reader, vec![], tracker.progress_callback(transfer_id))
+                .await;
+            if result.is_ok() {
+                tracker.mark_complete(transfer_id);
+            } else {
+                tracker.mark_failed(transfer_id);
+            }
+            let new_node_uid = result?;
 
             // Refresh the node to get the new revision UID.
             if let Ok(PotentialObject::Node(Node::File(f)))

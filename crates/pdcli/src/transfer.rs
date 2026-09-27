@@ -1,15 +1,21 @@
 #![allow(dead_code)] // for now
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TransferEntry {
+    pub id: usize,
     pub filename: String,
     pub direction: TransferDirection,
     pub bytes_transferred: i64,
     pub total_bytes: i64,
+    pub cancellable: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TransferDirection {
     Upload,
     Download,
@@ -32,7 +38,13 @@ impl TransferEntry {
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct TransferTracker {
-    inner: Arc<Mutex<Vec<TransferEntry>>>,
+    inner: Arc<
+        Mutex<(
+            usize,
+            HashMap<usize, TransferEntry>,
+            HashMap<usize, tokio::task::AbortHandle>,
+        )>,
+    >,
 }
 
 impl TransferTracker {
@@ -41,14 +53,20 @@ impl TransferTracker {
     }
 
     pub fn add(&self, filename: String, direction: TransferDirection, total_bytes: i64) -> usize {
-        let mut entries = self.inner.lock().unwrap();
-        let idx = entries.len();
-        entries.push(TransferEntry {
-            filename,
-            direction,
-            bytes_transferred: 0,
-            total_bytes,
-        });
+        let mut state = self.inner.lock().unwrap();
+        let idx = state.0;
+        state.0 += 1;
+        state.1.insert(
+            idx,
+            TransferEntry {
+                id: idx,
+                filename,
+                direction,
+                bytes_transferred: 0,
+                total_bytes,
+                cancellable: false,
+            },
+        );
         idx
     }
 
@@ -56,7 +74,7 @@ impl TransferTracker {
         let inner = self.inner.clone();
         Box::new(move |transferred, total| {
             if let Ok(mut entries) = inner.lock() {
-                if let Some(entry) = entries.get_mut(index) {
+                if let Some(entry) = entries.1.get_mut(&index) {
                     entry.bytes_transferred = transferred;
                     entry.total_bytes = total;
                 }
@@ -65,23 +83,40 @@ impl TransferTracker {
     }
 
     pub fn snapshot(&self) -> Vec<TransferEntry> {
-        self.inner.lock().unwrap().clone()
+        let state = self.inner.lock().unwrap();
+        let mut entries: Vec<_> = state.1.values().cloned().collect();
+        entries.sort_by_key(|entry| entry.id);
+        entries
+    }
+
+    pub fn register_cancel(&self, index: usize, handle: tokio::task::AbortHandle) {
+        let mut state = self.inner.lock().unwrap();
+        if let Some(entry) = state.1.get_mut(&index) {
+            entry.cancellable = true;
+            state.2.insert(index, handle);
+        }
+    }
+
+    pub fn cancel(&self, index: usize) -> anyhow::Result<()> {
+        let state = self.inner.lock().unwrap();
+        let handle = state.2.get(&index).ok_or_else(|| {
+            anyhow::anyhow!("transfer {index} is not cancellable or is no longer active")
+        })?;
+        handle.abort();
+        Ok(())
     }
 
     pub fn mark_complete(&self, index: usize) {
         if let Ok(mut entries) = self.inner.lock() {
-            if let Some(entry) = entries.get_mut(index) {
-                entry.bytes_transferred = entry.total_bytes;
-            }
+            entries.1.remove(&index);
+            entries.2.remove(&index);
         }
     }
 
     pub fn mark_failed(&self, index: usize) {
         if let Ok(mut entries) = self.inner.lock() {
-            // Remove failed entries so they don't linger.
-            if index < entries.len() {
-                entries.remove(index);
-            }
+            entries.1.remove(&index);
+            entries.2.remove(&index);
         }
     }
 
@@ -89,7 +124,8 @@ impl TransferTracker {
         self.inner
             .lock()
             .unwrap()
-            .retain(|e| e.bytes_transferred < e.total_bytes);
+            .1
+            .retain(|_, e| e.bytes_transferred < e.total_bytes);
     }
 }
 
@@ -106,5 +142,44 @@ pub fn format_bytes(bytes: i64) -> String {
         format!("{:.1} KB", b / KB)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_transfer_does_not_shift_active_progress() {
+        let tracker = TransferTracker::new();
+        let first = tracker.add("first".into(), TransferDirection::Download, 10);
+        let second = tracker.add("second".into(), TransferDirection::Upload, 20);
+        let progress = tracker.progress_callback(second);
+        tracker.mark_complete(first);
+        progress(8, 20);
+        let entries = tracker.snapshot();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].filename, "second");
+        assert_eq!(entries[0].bytes_transferred, 8);
+    }
+
+    #[tokio::test]
+    async fn only_registered_downloads_can_be_cancelled() {
+        let tracker = TransferTracker::new();
+        let upload = tracker.add("upload".into(), TransferDirection::Upload, 10);
+        assert!(tracker.cancel(upload).is_err());
+        let download = tracker.add("download".into(), TransferDirection::Download, 10);
+        let task = tokio::spawn(std::future::pending::<()>());
+        tracker.register_cancel(download, task.abort_handle());
+        assert!(
+            tracker
+                .snapshot()
+                .iter()
+                .any(|entry| entry.id == download && entry.cancellable)
+        );
+        tracker.cancel(download).unwrap();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tracker.mark_failed(download);
+        assert!(tracker.cancel(download).is_err());
     }
 }

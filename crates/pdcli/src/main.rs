@@ -16,6 +16,7 @@ mod flags;
 mod fs;
 mod job_control;
 mod pdignore;
+mod photos;
 mod quoted;
 mod service;
 mod share;
@@ -73,6 +74,11 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Logout) => cmd_logout(),
         Some(Command::Status { json }) => cmd_status(json),
         Some(Command::Retry { id, all }) => cmd_retry(id, all),
+        Some(Command::CancelTransfer { id }) => {
+            daemon::cancel_transfer(id)?;
+            println!("cancelled download {id}");
+            Ok(())
+        }
         Some(Command::Mount) => cmd_mount(flags.force_offline, flags.no_tray).await,
         Some(Command::Stop) => cmd_stop(),
         Some(Command::Pause) => cmd_pause(true),
@@ -91,10 +97,11 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             takeout::run_cli(flags.force_offline, destination).await
         }
         Some(Command::Service { command }) => cmd_service(command),
-        Some(Command::Computers { command }) => {
-            computers::run_cli(flags.force_offline, command).await
+        Some(Command::Computers { json, command }) => {
+            computers::run_cli(flags.force_offline, command, json).await
         }
         Some(Command::Browse { command }) => browser::run_cli(flags.force_offline, command).await,
+        Some(Command::Photos { command }) => photos::run_cli(flags.force_offline, command).await,
         Some(Command::Daemon) => run_daemon(flags.force_offline, !flags.no_tray).await,
         None if cli.daemon => run_daemon(flags.force_offline, !flags.no_tray).await,
         None if cli.cli => cmd_mount(flags.force_offline, flags.no_tray).await,
@@ -209,7 +216,13 @@ fn cmd_status(json: bool) -> anyhow::Result<()> {
             mountpoint: String,
             mounted: bool,
             journal: Option<db::JournalSummary>,
+            transfers: Vec<transfer::TransferEntry>,
         }
+        let transfers = if daemon.is_some() || daemon::is_running() {
+            daemon::active_transfers()?
+        } else {
+            Vec::new()
+        };
         let daemon = match daemon {
             Some(daemon::DaemonStatus::Online) => "online",
             Some(daemon::DaemonStatus::Offline) => "offline",
@@ -225,6 +238,7 @@ fn cmd_status(json: bool) -> anyhow::Result<()> {
                 mountpoint: mount.display().to_string(),
                 mounted,
                 journal,
+                transfers,
             })?
         );
         return Ok(());

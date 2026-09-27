@@ -34,6 +34,7 @@ dirs = "6"
 rusqlite = { workspace = true }
 libc = "0.2"
 chrono = "0.4"
+futures.workspace = true
 filetime = "0.2"
 sha2 = "0.10"
 mime_guess = "2"

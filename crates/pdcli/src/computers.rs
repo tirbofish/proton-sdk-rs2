@@ -164,7 +164,12 @@ pub async fn open_drive(session: &ProtonAPISession) -> anyhow::Result<ProtonDriv
 pub async fn run_cli(
     force_offline: bool,
     command: Option<flags::ComputersCommand>,
+    json: bool,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !json || command.is_none(),
+        "--json only applies to the computer list"
+    );
     if let Some(flags::ComputersCommand::Sync {
         path,
         name,
@@ -194,6 +199,21 @@ pub async fn run_cli(
     match command {
         None => {
             let snap = snapshot(&drive).await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "this_device_id": snap.this_device_id,
+                        "computers": snap.computers.iter().map(|device| serde_json::json!({
+                            "id": device.device_id,
+                            "name": device.name,
+                            "last_sync_time": device.last_sync_time,
+                        })).collect::<Vec<_>>(),
+                        "jobs": snap.jobs,
+                    })
+                );
+                return Ok(());
+            }
             if snap.computers.is_empty() {
                 println!("no computers registered");
             }

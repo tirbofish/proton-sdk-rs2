@@ -386,9 +386,14 @@ mod desktop {
                 nav_button(&sidebar, &pages, Some(&first), title, page),
             ));
         }
-        let main = row();
-        main.append(&scroll(&sidebar));
-        main.append(&pages);
+        let main = gtk4::Paned::new(gtk4::Orientation::Horizontal);
+        let navigation_scroll = scroll(&sidebar);
+        navigation_scroll.set_min_content_width(150);
+        main.set_start_child(Some(&navigation_scroll));
+        main.set_end_child(Some(&pages));
+        main.set_position(200);
+        main.set_shrink_start_child(false);
+        main.set_wide_handle(true);
         root.add_named(&main, Some("main"));
         root.set_visible_child_name("login");
 

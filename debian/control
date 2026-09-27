@@ -2,7 +2,7 @@ Source: pdcli
 Section: net
 Priority: optional
 Maintainer: pdcli contributors <4tkbytes@pm.me>
-Build-Depends: debhelper-compat (= 13), cargo, rustc, pkg-config, protobuf-compiler, libdbus-1-dev, libgtk-3-dev, libxdo-dev, libayatana-appindicator3-dev, libfuse3-dev
+Build-Depends: debhelper-compat (= 13), cargo, rustc, pkg-config, protobuf-compiler, libdbus-1-dev, libgtk-3-dev, libgtk-4-dev, libadwaita-1-dev, libxdo-dev, libayatana-appindicator3-dev, libfuse3-dev
 Standards-Version: 4.6.2
 Homepage: https://github.com/tirbofish/proton-sdk-rs2
 Rules-Requires-Root: no
@@ -10,6 +10,6 @@ Rules-Requires-Root: no
 Package: pdcli
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}, fuse3
-Description: Proton Drive command-line client and filesystem daemon
- pdcli mounts Proton Drive through FUSE and provides command-line controls
- for authentication, synchronization, and the background daemon.
+Description: Unofficial Proton Drive desktop and command-line client
+ pdcli mounts Proton Drive through FUSE and provides a GNOME desktop window,
+ command-line controls, and a background synchronization daemon.

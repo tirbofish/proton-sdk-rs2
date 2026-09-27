@@ -1,7 +1,8 @@
 # pdcli packages
 
-The package recipes expect a tagged source tree and build the `pdcli` binary
-with Cargo. They install `/usr/bin/pdcli` and a systemd **user** unit at
+The package recipes expect a tagged source tree and build the `pdcli` and
+`pdcli-gui` binaries with Cargo. They install both binaries, a GNOME desktop
+launcher, and a systemd **user** unit at
 `/usr/lib/systemd/user/pdcli.service`; package installation does not enable or
 start that unit automatically.
 
@@ -35,7 +36,7 @@ package from the repository root:
 
 ```sh
 sudo apt install build-essential cargo rustc debhelper-compat pkg-config protobuf-compiler \
-  libdbus-1-dev libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libfuse3-dev
+  libdbus-1-dev libgtk-3-dev libgtk-4-dev libadwaita-1-dev libxdo-dev libayatana-appindicator3-dev libfuse3-dev
 dpkg-buildpackage -us -uc -b
 sudo apt install ../pdcli_0.3.0-1_$(dpkg --print-architecture).deb
 ```
@@ -46,7 +47,7 @@ Create a source archive from the tagged checkout and build the RPM:
 
 ```sh
 sudo dnf install rpm-build cargo rust protobuf-compiler \
-  dbus-devel gtk3-devel libX11-xcb-devel libxdo-devel fuse3-devel \
+  dbus-devel gtk3-devel gtk4-devel libadwaita-devel libX11-xcb-devel libxdo-devel fuse3-devel \
   systemd-rpm-macros
 git archive --format=tar.gz --prefix=pdcli-0.3.0/ v0.3.0 > ~/rpmbuild/SOURCES/pdcli-0.3.0.tar.gz
 rpmbuild -ba packaging/rpm/pdcli.spec

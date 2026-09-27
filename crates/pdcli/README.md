@@ -14,9 +14,15 @@ pdcli status
 ```
 
 The first login opens the browser. `pdcli mount` also logs in when no session
-exists. On WSL, `pdcli` without a subcommand mounts; use `pdcli gui` for the
-window. `--force-offline` uses local state only and `--no-tray` suppresses the
-tray icon.
+exists. On Linux, `pdcli gui` (or the desktop launcher) opens the separate
+GTK4/libadwaita window; install `pdcli-gui` beside `pdcli`. The daemon and
+AppIndicator tray remain in a separate GTK3 process. On WSL, `pdcli` without
+a subcommand mounts; use `pdcli gui` for the window. `--force-offline` uses
+local state only and `--no-tray` suppresses the tray icon.
+
+The window currently provides browser sign-in, mount and sync controls,
+Computer backup/restore commands, global `.pdignore` settings, and account
+actions. The FUSE mount provides file-manager access to My Files and Computers.
 
 ## Commands
 

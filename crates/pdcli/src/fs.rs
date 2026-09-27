@@ -18,7 +18,6 @@ use proton_drive_sdk::proton_sdk_rs2::session::ProtonAPISession;
 use proton_drive_sdk::utils::PotentialObject;
 use sha2::{Digest, Sha256};
 
-use crate::app::ProtonDrive;
 use crate::db::{FuseDb, InodeRow};
 use crate::pdignore::IgnoreMatcher;
 use crate::thumbnail::ThumbnailConfig;
@@ -2407,17 +2406,5 @@ fn reconcile_cached_file_sizes(db: &FuseDb) {
             continue;
         };
         let _ = db.update_size_only(ino, metadata.len());
-    }
-}
-
-impl Drop for ProtonDrive {
-    fn drop(&mut self) {
-        // Only unmount when this process owns the FUSE session. The GUI normally
-        // delegates mounting to the daemon, so ordinary window shutdown must not
-        // tear down the daemon-owned mount.
-        if let Some(session) = self.fuse_session.take() {
-            drop(session);
-            force_unmount();
-        }
     }
 }

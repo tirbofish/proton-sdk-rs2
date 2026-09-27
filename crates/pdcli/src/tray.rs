@@ -152,13 +152,8 @@ fn build_menu() -> Menu {
 /// Initialise the system-tray icon.
 ///
 /// On Linux/BSD the tray is created on a dedicated GTK thread (required by
-/// `libappindicator`).  On other platforms the returned [`TrayIcon`] handle
-/// must be kept alive for the icon to remain visible; it is created lazily
-/// inside the eframe creation callback so that a winit event-loop is
-/// already running.
-///
-/// Returns a closure that **must** be called from inside the
-/// `eframe::run_native` app-creation callback on non-Linux platforms.
+/// `libappindicator`), isolated from the GTK4 desktop process. On other
+/// platforms the returned [`TrayIcon`] handle must be kept alive.
 pub fn init(icon_path: &std::path::Path) -> impl FnOnce() -> Option<TrayIcon> {
     let icon = load_icon(icon_path);
 

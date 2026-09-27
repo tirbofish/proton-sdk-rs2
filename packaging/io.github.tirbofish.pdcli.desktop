@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=pdcli Drive
+Comment=Unofficial Proton Drive client
+Exec=pdcli gui
+Icon=folder-remote
+Categories=Network;
+StartupNotify=true

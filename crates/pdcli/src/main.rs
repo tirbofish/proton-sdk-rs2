@@ -4,10 +4,8 @@ use anyhow::Context;
 use clap::Parser;
 use serde::Serialize;
 
-use crate::app::ProtonDrive;
 use crate::flags::{Cli, Command, ServiceCommand, is_wsl};
 
-mod app;
 mod auth;
 mod computers;
 mod credentials;
@@ -104,13 +102,22 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
 }
 
 fn run_gui(flags: flags::ClientFlags) -> anyhow::Result<()> {
-    let native_options = eframe::NativeOptions::default();
-    eframe::run_native(
-        "pdcli (unofficial)",
-        native_options,
-        Box::new(move |_| Ok(Box::new(ProtonDrive::new(flags)))),
-    )
-    .map_err(|e| anyhow::anyhow!(e.to_string()))
+    let gui = std::env::current_exe()?.with_file_name("pdcli-gui");
+    let mut command = std::process::Command::new(gui);
+    if let Some(page) = flags.page {
+        command.arg("--page").arg(page);
+    }
+    if flags.force_offline {
+        command.arg("--force-offline");
+    }
+    if flags.no_tray {
+        command.arg("--no-tray");
+    }
+    let status = command
+        .status()
+        .context("could not launch pdcli-gui; install both binaries")?;
+    anyhow::ensure!(status.success(), "pdcli-gui exited with {status}");
+    Ok(())
 }
 
 async fn run_daemon(force_offline: bool, enable_tray: bool) -> anyhow::Result<()> {

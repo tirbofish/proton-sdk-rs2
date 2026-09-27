@@ -1,11 +1,11 @@
 pkgname=pdcli
 pkgver=0.3.2
 pkgrel=1
-pkgdesc='Proton Drive command-line client and filesystem daemon'
+pkgdesc='Unofficial Proton Drive desktop and command-line client'
 arch=('x86_64' 'aarch64')
 url='https://github.com/tirbofish/proton-sdk-rs2'
 license=('MIT')
-depends=('fuse3' 'gtk3' 'libxdo' 'libayatana-appindicator')
+depends=('fuse3' 'gtk3' 'gtk4' 'libadwaita' 'libxdo' 'libayatana-appindicator')
 makedepends=('cargo' 'protobuf' 'pkgconf')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/tirbofish/proton-sdk-rs2/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
@@ -18,6 +18,9 @@ build() {
 package() {
   cd "$srcdir/proton-sdk-rs2-$pkgver"
   install -Dm755 target/release/pdcli "$pkgdir/usr/bin/pdcli"
+  install -Dm755 target/release/pdcli-gui "$pkgdir/usr/bin/pdcli-gui"
+  install -Dm644 packaging/io.github.tirbofish.pdcli.desktop \
+    "$pkgdir/usr/share/applications/io.github.tirbofish.pdcli.desktop"
   install -Dm644 packaging/systemd/pdcli.service \
     "$pkgdir/usr/lib/systemd/user/pdcli.service"
   install -Dm644 LICENSE.md "$pkgdir/usr/share/licenses/$pkgname/LICENSE.md"

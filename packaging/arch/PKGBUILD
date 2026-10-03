@@ -1,5 +1,5 @@
 pkgname=pdcli
-pkgver=0.3.2
+pkgver=0.4.0
 pkgrel=1
 pkgdesc='Unofficial Proton Drive desktop and command-line client'
 arch=('x86_64' 'aarch64')

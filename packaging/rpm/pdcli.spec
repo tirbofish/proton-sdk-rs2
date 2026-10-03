@@ -1,5 +1,5 @@
 Name:           pdcli
-Version:        0.3.2
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        Unofficial Proton Drive desktop and command-line client
 License:        MIT
@@ -45,6 +45,8 @@ install -Dpm0644 packaging/systemd/pdcli.service %{buildroot}%{_prefix}/lib/syst
 %{_prefix}/lib/systemd/user/pdcli.service
 
 %changelog
+* Sat Oct 03 2026 pdcli contributors <4tkbytes@pm.me> - 0.4.0-1
+- Release 0.4.0
 * Tue Sep 22 2026 pdcli contributors <4tkbytes@pm.me> - 0.3.2-1
 - Release 0.3.2
 * Wed Sep 16 2026 pdcli contributors <4tkbytes@pm.me> - 0.3.1-1

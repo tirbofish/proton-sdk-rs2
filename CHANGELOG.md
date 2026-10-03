@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.0 - 2026-10-04
+
+- Bump all workspace crates from 0.3.2 to 0.4.0. Protobuf integrity payloads now use recency and creator fields; downstream struct literals must be updated.
+- feat(drive-sdk): sync upstream SDK v0.22.1
+- create SYNC.md for quicker agent workflow
+- fix(pdcli): give crypto workers sufficient stack
+- feat(pdcli): import and export Photos from desktop
+- fix(pdcli): report mount access failures
+- feat(pdcli): page albums and manage photo favorites
+- feat(pdcli): organize desktop transfers, sharing, and Photos
+- feat(pdcli): expose transfers, sharing, and Photos CLI
+- fix(pdcli): make browse sidebar resizable
+- feat(pdcli): organize desktop navigation and browse files
+- feat(pdcli): add isolated GNOME desktop shell
+- feat(drive-sdk): port recently accessed APIs and invitation state fix
+- fix(ci): release existing version tags
+
 ## 0.3.2 - 2026-09-22
 
 - change readme

@@ -412,6 +412,12 @@ pub struct OwnedByDto {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct LinkDto {
+    /// Origin flags are optional for older servers and cached API fixtures.
+    #[serde(rename = "ThirdParty")]
+    pub third_party: Option<bool>,
+    #[serde(rename = "Sdk")]
+    pub sdk: Option<bool>,
+
     #[serde(rename = "LinkID")]
     pub id: LinkId,
 

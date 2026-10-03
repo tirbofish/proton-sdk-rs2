@@ -39,7 +39,7 @@ impl NodeOperations {
         let share_response = client.api().shares().get_my_files_share().await?;
         let (volume_dto, share_dto, link_details) = share_response.deconstruct();
 
-        let (share, share_key) = crate::share_ops::ShareCrypto::decrypt_share(
+        let (share, share_key) = crate::share_ops::ShareCrypto::decrypt_share_with_creation_time(
             client,
             share_dto.id.clone(),
             &share_dto.key,
@@ -50,6 +50,7 @@ impl NodeOperations {
                 .as_ref(),
             &share_dto.creator_email_address,
             &share_dto.address_id,
+            share_dto.creation_time,
         )
         .await?;
 
@@ -70,10 +71,8 @@ impl NodeOperations {
             .set_share_key(share_dto.id.clone(), share_key.clone())
             .await?;
 
-        let metadata_result = DtoToMetadataConverter::convert_dto_to_node_metadata(
-            client.account().clone(),
-            client.cache().entities().as_ref(),
-            client.cache().secrets().as_ref(),
+        let metadata_result = DtoToMetadataConverter::convert_dto_to_node_metadata_with_client(
+            client,
             volume_dto.id.clone(),
             link_details,
             Some(&share_key),

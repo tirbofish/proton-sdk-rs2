@@ -60,6 +60,10 @@ impl FileDownloader {
                 download_state.revision_dto.revision.size
             );
 
+            let metric_item = crate::telemetry::MetricItem::from_revision(
+                &revision_uid.node_uid,
+                &download_state.revision_dto.revision,
+            );
             let download_state = Arc::new(download_state);
             let reader = RevisionOperations::open_for_reading(
                 &client,
@@ -79,6 +83,21 @@ impl FileDownloader {
                 .await;
 
             if let Err(e) = &result {
+                if e.downcast_ref::<crate::node::download::FileContentsDecryptionException>()
+                    .is_some()
+                {
+                    client
+                        .integrity_reporter()
+                        .report(
+                            &client,
+                            &metric_item,
+                            "content",
+                            Some(&e.to_string()),
+                            false,
+                            None,
+                        )
+                        .await;
+                }
                 client
                     .telemetry()
                     .record_metric("downloadError".into(), Some(e.to_string().into_bytes()))
@@ -100,7 +119,6 @@ impl FileDownloader {
         use crate::api::attr::ExtendedAttributes;
         use crate::author::Author;
         use crate::node::authorship::AuthorshipClaim;
-        use crate::node::crypto::NodeCrypto;
         use crate::node::file::FileOperations;
 
         let secrets =
@@ -119,6 +137,8 @@ impl FileDownloader {
             .into_iter()
             .find(|r| r.id == self.revision_uid.revision_id)
             .ok_or_else(|| anyhow::anyhow!("revision not found"))?;
+        let metric_item =
+            crate::telemetry::MetricItem::from_revision(&self.revision_uid.node_uid, &dto);
         let xattr_msg = dto
             .extended_attributes
             .ok_or_else(|| anyhow::anyhow!("revision has no claimed block sizes"))?;
@@ -127,9 +147,20 @@ impl FileDownloader {
             author: Author::ANONYMOUS,
             key_retrieval_error_message: None,
         };
-        let (bytes, _, _) =
-            NodeCrypto::decrypt_message(&xattr_msg, None, [&secrets.base.key], &claim)
-                .map_err(|e| anyhow::anyhow!(e))?;
+        let (bytes, _, _) = self
+            .client
+            .integrity_reporter()
+            .decrypt_message(
+                &self.client,
+                &metric_item,
+                "nodeExtendedAttributes",
+                &xattr_msg,
+                None,
+                [&secrets.base.key],
+                &claim,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
         let xattr: ExtendedAttributes = serde_json::from_slice(&bytes)?;
         xattr
             .common

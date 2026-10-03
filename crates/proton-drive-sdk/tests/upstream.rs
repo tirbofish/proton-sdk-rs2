@@ -31,6 +31,15 @@ const UPSTREAM_TEST_FILES: &[&str] = &[
     "cli/src/commands/fileSystem/transferConflictResolver.test.ts",
     "cli/src/commands/fileSystem/transferQueue.test.ts",
     "cli/src/commands/fileSystem/transferSummary.test.ts",
+    "cli/src/commands/fileSystem/storageQuotaUpsell.test.ts",
+    "cli/src/commands/takeout/commandTakeoutRun.test.ts",
+    "cli/src/commands/takeout/exportFolderTree.test.ts",
+    "cli/src/commands/takeout/exportNode.test.ts",
+    "cli/src/commands/takeout/nameRegistry.test.ts",
+    "cli/src/commands/takeout/takeoutDevices.test.ts",
+    "cli/src/commands/takeout/takeoutMyFiles.test.ts",
+    "cli/src/commands/takeout/takeoutPhotos.test.ts",
+    "cli/src/commands/takeout/transferManifest.test.ts",
     "cli/src/credentials/parseCredentials.test.ts",
     "cli/src/credentials/passCredentialsStore.test.ts",
     "cli/src/events/lock.test.ts",
@@ -107,6 +116,7 @@ const UPSTREAM_TEST_FILES: &[&str] = &[
     "client/js/src/internal/sharingPublic/reporting.test.ts",
     "client/js/src/internal/sharingPublic/session/url.test.ts",
     "client/js/src/internal/sharingPublic/unauthApiService.test.ts",
+    "client/js/src/internal/telemetry.test.ts",
     "client/js/src/internal/upload/blockVerifier.test.ts",
     "client/js/src/internal/upload/chunkStreamReader.test.ts",
     "client/js/src/internal/upload/fileUploader.test.ts",
@@ -118,6 +128,9 @@ const UPSTREAM_TEST_FILES: &[&str] = &[
     "client/js/src/internal/upload/streamUploader.test.ts",
     "client/js/src/internal/upload/telemetry.test.ts",
     "client/js/src/internal/wait.test.ts",
+    "client/js/src/search/browser/searchService.test.ts",
+    "client/js/src/search/driveSdkClient.test.ts",
+    "client/js/src/search/memoryStorage.test.ts",
     "client/js/src/telemetry.test.ts",
     "incubating/account/js/src/apiClient.test.ts",
     "incubating/account/js/src/telemetryPreference.test.ts",
@@ -125,11 +138,36 @@ const UPSTREAM_TEST_FILES: &[&str] = &[
 
 #[test]
 fn catalog_lists_every_upstream_javascript_test_file() {
-    assert_eq!(UPSTREAM_TEST_FILES.len(), 106);
+    assert_eq!(UPSTREAM_TEST_FILES.len(), 119);
     let mut unique = UPSTREAM_TEST_FILES.to_vec();
     unique.sort();
     unique.dedup();
-    assert_eq!(unique.len(), 106);
+    assert_eq!(unique.len(), 119);
+}
+
+#[test]
+fn integrity_protobuf_context_uses_upstream_tags_and_ignores_reserved_fields() {
+    use prost::Message;
+    use proton_drive_sdk::protobuf::{
+        DecryptionErrorEventPayload, ItemCreator, ItemRecency, VerificationErrorEventPayload,
+    };
+
+    let decryption = DecryptionErrorEventPayload {
+        recency: ItemRecency::Before2024 as i32,
+        created_by: ItemCreator::ThirdPartyWithSdk as i32,
+        ..Default::default()
+    };
+    assert_eq!(decryption.encode_to_vec(), [0x30, 4, 0x38, 2]);
+    let verification = VerificationErrorEventPayload {
+        recency: ItemRecency::PastMonth as i32,
+        created_by: ItemCreator::FirstParty as i32,
+        ..Default::default()
+    };
+    assert_eq!(verification.encode_to_vec(), [0x38, 1, 0x40, 1]);
+    // Legacy volume_type and from_before_2024 tags must not become new context.
+    let legacy = DecryptionErrorEventPayload::decode(&[0x08, 2, 0x18, 1][..]).unwrap();
+    assert_eq!(legacy.recency, ItemRecency::Unspecified as i32);
+    assert_eq!(legacy.created_by, ItemCreator::Unspecified as i32);
 }
 
 #[tokio::test]

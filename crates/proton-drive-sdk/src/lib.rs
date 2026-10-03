@@ -52,9 +52,11 @@ pub mod node;
 pub mod pgp;
 pub mod photo;
 pub mod revision;
+pub mod search;
 pub mod share;
 pub mod share_ops;
 pub mod sharing;
+pub mod telemetry;
 pub mod utils;
 pub mod volume;
 pub mod volume_operations;
@@ -66,3 +68,6 @@ pub use futures; // re-export since streams are heavily used
 pub mod protobuf {
     include!(concat!(env!("OUT_DIR"), "/proton.drive.sdk.rs"));
 }
+
+#[cfg(test)]
+mod test_support;

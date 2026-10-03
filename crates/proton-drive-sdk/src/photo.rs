@@ -153,7 +153,7 @@ impl ProtonPhotosClient {
         let share_response = self.photos_api.get_root_share().await?;
         let (volume_dto, share_dto, link_details) = share_response.deconstruct();
 
-        let (share, share_key) = crate::share_ops::ShareCrypto::decrypt_share(
+        let (share, share_key) = crate::share_ops::ShareCrypto::decrypt_share_with_creation_time(
             &self.drive,
             share_dto.id.clone(),
             &share_dto.key,
@@ -164,6 +164,7 @@ impl ProtonPhotosClient {
                 .as_ref(),
             &share_dto.creator_email_address,
             &share_dto.address_id,
+            share_dto.creation_time,
         )
         .await?;
 
@@ -184,10 +185,8 @@ impl ProtonPhotosClient {
             .set_share_key(share_dto.id.clone(), share_key.clone())
             .await?;
 
-        let metadata_result = DtoToMetadataConverter::convert_dto_to_node_metadata(
-            self.drive.account().clone(),
-            self.drive.cache().entities().as_ref(),
-            self.drive.cache().secrets().as_ref(),
+        let metadata_result = DtoToMetadataConverter::convert_dto_to_node_metadata_with_client(
+            &self.drive,
             volume_dto.id.clone(),
             link_details,
             Some(&share_key),
@@ -801,10 +800,8 @@ impl ProtonPhotosClient {
 
             let node_uid = NodeUid::new(volume_id.clone(), link_details.link.id.clone());
 
-            let meta = DtoToMetadataConverter::convert_dto_to_node_metadata(
-                self.drive.account().clone(),
-                self.drive.cache().entities().as_ref(),
-                self.drive.cache().secrets().as_ref(),
+            let meta = DtoToMetadataConverter::convert_dto_to_node_metadata_with_client(
+                &self.drive,
                 volume_id.clone(),
                 link_details.clone(),
                 None,
@@ -1050,10 +1047,8 @@ impl ProtonPhotosClient {
                 .as_ref()
                 .and_then(|photo| photo.content_hash.clone())
                 .ok_or_else(|| anyhow::anyhow!("Photo {} has no content hash", uid))?;
-            let metadata = DtoToMetadataConverter::convert_dto_to_node_metadata(
-                self.drive.account().clone(),
-                self.drive.cache().entities().as_ref(),
-                self.drive.cache().secrets().as_ref(),
+            let metadata = DtoToMetadataConverter::convert_dto_to_node_metadata_with_client(
+                &self.drive,
                 uid.volume_id.clone(),
                 details,
                 None,
@@ -1273,10 +1268,8 @@ impl ProtonPhotosClient {
             .and_then(|p| p.content_hash)
             .ok_or_else(|| anyhow::anyhow!("Photo has no content hash"))?;
 
-        let meta = DtoToMetadataConverter::convert_dto_to_node_metadata(
-            self.drive.account().clone(),
-            self.drive.cache().entities().as_ref(),
-            self.drive.cache().secrets().as_ref(),
+        let meta = DtoToMetadataConverter::convert_dto_to_node_metadata_with_client(
+            &self.drive,
             volume_id.clone(),
             link_details,
             None,

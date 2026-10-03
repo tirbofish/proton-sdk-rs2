@@ -652,10 +652,8 @@ impl crate::utils::batch::BatchLoader<crate::links::LinkId, PotentialObject<Node
                 let vid = volume_id.clone();
                 let pk = parent_key.clone();
                 async move {
-                    DtoToMetadataConverter::convert_dto_to_node_metadata(
-                        c.account().clone(),
-                        c.cache().entities().as_ref(),
-                        c.cache().secrets().as_ref(),
+                    DtoToMetadataConverter::convert_dto_to_node_metadata_with_client(
+                        &c,
                         vid,
                         link_details,
                         pk.as_ref(),
@@ -799,10 +797,8 @@ impl crate::utils::batch::BatchLoader<crate::links::LinkId, PotentialObject<Node
                     let c = client.clone();
                     let vid = volume_id.clone();
                     async move {
-                        DtoToMetadataConverter::convert_dto_to_node_metadata(
-                            c.account().clone(),
-                            c.cache().entities().as_ref(),
-                            c.cache().secrets().as_ref(),
+                        DtoToMetadataConverter::convert_dto_to_node_metadata_with_client(
+                            &c,
                             vid,
                             link_details,
                             Some(&parent_key),
@@ -887,10 +883,8 @@ impl DtoToMetadataConverter {
             Self::resolve_parent_key(client, uid.volume_id.clone(), &link_details).await?
         };
 
-        let metadata = Self::convert_dto_to_node_metadata(
-            client.account().clone(),
-            client.cache().entities().as_ref(),
-            client.cache().secrets().as_ref(),
+        let metadata = Self::convert_dto_to_node_metadata_with_client(
+            client,
             uid.volume_id.clone(),
             link_details,
             parent_key.as_ref(),
@@ -969,6 +963,24 @@ impl DtoToMetadataConverter {
         Ok(None)
     }
 
+    pub async fn convert_dto_to_node_metadata_with_client(
+        client: &ProtonDriveClient,
+        volume_id: VolumeId,
+        link_details: crate::api::links::LinkDetailsDto,
+        parent_key: Option<&PgpPrivateKey>,
+    ) -> anyhow::Result<NodeMetadataResult> {
+        Self::convert_dto_to_node_metadata_inner(
+            client.account().clone(),
+            client.cache().entities().as_ref(),
+            client.cache().secrets().as_ref(),
+            volume_id,
+            link_details,
+            parent_key,
+            Some(client),
+        )
+        .await
+    }
+
     pub async fn convert_dto_to_node_metadata(
         account_client: std::sync::Arc<dyn crate::account::AccountClient>,
         _entity_cache: &dyn crate::cache::entity::DriveEntityCache,
@@ -977,12 +989,34 @@ impl DtoToMetadataConverter {
         link_details: crate::api::links::LinkDetailsDto,
         parent_key: Option<&PgpPrivateKey>,
     ) -> anyhow::Result<NodeMetadataResult> {
+        Self::convert_dto_to_node_metadata_inner(
+            account_client,
+            _entity_cache,
+            _secret_cache,
+            _volume_id,
+            link_details,
+            parent_key,
+            None,
+        )
+        .await
+    }
+
+    async fn convert_dto_to_node_metadata_inner(
+        account_client: std::sync::Arc<dyn crate::account::AccountClient>,
+        _entity_cache: &dyn crate::cache::entity::DriveEntityCache,
+        _secret_cache: &dyn crate::cache::secret::DriveSecretCache,
+        _volume_id: crate::volume::VolumeId,
+        link_details: crate::api::links::LinkDetailsDto,
+        parent_key: Option<&PgpPrivateKey>,
+        metric_client: Option<&ProtonDriveClient>,
+    ) -> anyhow::Result<NodeMetadataResult> {
         let link_dto = link_details.link.clone();
         let is_shared = link_details.sharing.is_some();
         let is_shared_by_url = link_details
             .sharing
             .as_ref()
             .is_some_and(|sharing| sharing.share_url_id.is_some());
+        let metric_item = crate::telemetry::MetricItem::from_link(_volume_id.clone(), &link_dto);
         let (direct_role, membership) = Self::build_membership_info(
             account_client.clone(),
             _entity_cache,
@@ -990,6 +1024,31 @@ impl DtoToMetadataConverter {
             link_details.membership.as_ref(),
         )
         .await?;
+        if let (Some(client), Some(membership), Some(dto)) = (
+            metric_client,
+            membership.as_ref(),
+            link_details.membership.as_ref(),
+        ) {
+            if let PotentialObject::Degraded(error) = &membership.shared_by {
+                let item = crate::telemetry::MetricItem {
+                    uid: metric_item.uid.clone(),
+                    creation_time: Some(dto.invite_time),
+                    third_party: None,
+                    sdk: None,
+                };
+                client
+                    .integrity_reporter()
+                    .report_unchecked(
+                        client,
+                        &item,
+                        "membershipInviter",
+                        Some(&error.message),
+                        true,
+                        None,
+                    )
+                    .await;
+            }
+        }
         let parent_key_result: Result<Vec<PgpPrivateKey>, String> = match parent_key {
             Some(k) => Ok(vec![k.clone()]),
             None => {
@@ -1066,6 +1125,7 @@ impl DtoToMetadataConverter {
             }
         };
 
+        let had_parent_key = parent_key_result.is_ok();
         match link_dto.r#type {
             crate::api::links::LinkType::Folder | crate::api::links::LinkType::Album => {
                 let folder_dto = link_details
@@ -1080,6 +1140,28 @@ impl DtoToMetadataConverter {
                     parent_key_result,
                 )
                 .await;
+
+                if let Some(client) = metric_client {
+                    let reporter = client.integrity_reporter();
+                    reporter
+                        .report_link(
+                            client,
+                            &metric_item,
+                            &decryption.link,
+                            had_parent_key,
+                            link_dto.name_signature_email_address.as_deref(),
+                        )
+                        .await;
+                    reporter
+                        .report_output(
+                            client,
+                            &metric_item,
+                            "nodeHashKey",
+                            &decryption.hash_key,
+                            link_dto.signature_email_address.as_deref(),
+                        )
+                        .await;
+                }
 
                 let uid = NodeUid::new(_volume_id.clone(), link_dto.id.clone());
                 let parent_uid = link_dto
@@ -1174,7 +1256,45 @@ impl DtoToMetadataConverter {
                 )
                 .await;
 
+                if let Some(client) = metric_client {
+                    let reporter = client.integrity_reporter();
+                    reporter
+                        .report_link(
+                            client,
+                            &metric_item,
+                            &decryption.link,
+                            had_parent_key,
+                            link_dto.name_signature_email_address.as_deref(),
+                        )
+                        .await;
+                    reporter
+                        .report_output(
+                            client,
+                            &metric_item,
+                            "nodeContentKey",
+                            &decryption.content_key,
+                            link_dto.signature_email_address.as_deref(),
+                        )
+                        .await;
+                }
+
                 let uid = NodeUid::new(_volume_id.clone(), link_dto.id.clone());
+                if let (Some(client), Some(revision), Ok(key)) = (
+                    metric_client,
+                    file_dto.active_revision.as_ref(),
+                    &decryption.link.node_key,
+                ) {
+                    client
+                        .integrity_reporter()
+                        .report_active_revision_attributes(
+                            client,
+                            &uid,
+                            revision,
+                            key,
+                            &decryption.content_authorship_claim,
+                        )
+                        .await;
+                }
                 let parent_uid = link_dto.parent_id.map(|id| NodeUid::new(_volume_id, id));
 
                 let name_err = decryption.link.name.as_ref().err().cloned();

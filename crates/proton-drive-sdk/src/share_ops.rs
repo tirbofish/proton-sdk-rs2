@@ -33,7 +33,7 @@ impl ShareOperations {
         let response = client.api().shares().get_share(share_id.clone()).await?;
 
         // Match C# logic: decrypt share key
-        let (share, key) = ShareCrypto::decrypt_share(
+        let (share, key) = ShareCrypto::decrypt_share_with_creation_time(
             client,
             response.id.clone(),
             &response.key,
@@ -44,6 +44,7 @@ impl ShareOperations {
                 .as_ref(),
             &response.creator_email_address,
             &response.address_id,
+            response.creation_time,
         )
         .await?;
 
@@ -71,6 +72,31 @@ impl ShareCrypto {
         creator_email: &str,
         address_id: &crate::account::AddressId,
     ) -> anyhow::Result<(Share, PgpPrivateKey)> {
+        Self::decrypt_share_with_creation_time(
+            client,
+            share_id,
+            encrypted_key,
+            encrypted_passphrase,
+            passphrase_signature,
+            invitee_signature,
+            creator_email,
+            address_id,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn decrypt_share_with_creation_time(
+        client: &ProtonDriveClient,
+        share_id: ShareId,
+        encrypted_key: &PgpArmoredPrivateKey,
+        encrypted_passphrase: &PgpArmoredMessage,
+        passphrase_signature: &PgpArmoredSignature,
+        invitee_signature: Option<&PgpArmoredSignature>,
+        creator_email: &str,
+        address_id: &crate::account::AddressId,
+        creation_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> anyhow::Result<(Share, PgpPrivateKey)> {
         let address_keys = client
             .account()
             .get_address_private_keys(&address_id)
@@ -91,19 +117,57 @@ impl ShareCrypto {
         )
         .await;
 
-        match crate::node::crypto::NodeCrypto::decrypt_message(
+        let metric_item = crate::telemetry::MetricItem {
+            uid: share_id.raw().clone(),
+            creation_time,
+            third_party: None,
+            sdk: None,
+        };
+        let decrypted = crate::node::crypto::NodeCrypto::decrypt_message(
             encrypted_passphrase,
             invitee_signature.or(Some(passphrase_signature)),
             &all_keys,
             &authorship_claim,
-        ) {
+        );
+        match &decrypted {
+            Err(error) => {
+                client
+                    .integrity_reporter()
+                    .report_unchecked(client, &metric_item, "shareKey", Some(error), false, None)
+                    .await
+            }
+            Ok((_, _, Some(_))) => {
+                client
+                    .integrity_reporter()
+                    .report_unchecked(client, &metric_item, "shareKey", None, true, None)
+                    .await
+            }
+            _ => {}
+        }
+        match decrypted {
             Ok((passphrase, _, _)) => {
                 // Unlock the share private key using the decrypted passphrase
                 let share_key = crate::node::crypto::NodeCrypto::unlock_key_with_passphrase(
                     encrypted_key,
                     &passphrase,
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to unlock share key: {:?}", e))?;
+                );
+                let share_key = match share_key {
+                    Ok(key) => key,
+                    Err(error) => {
+                        client
+                            .integrity_reporter()
+                            .report_unchecked(
+                                client,
+                                &metric_item,
+                                "shareKey",
+                                Some(&error.to_string()),
+                                false,
+                                None,
+                            )
+                            .await;
+                        anyhow::bail!("Failed to unlock share key: {:?}", error);
+                    }
+                };
 
                 let response = client.api().shares().get_share(share_id).await?;
 

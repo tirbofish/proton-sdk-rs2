@@ -912,6 +912,13 @@ pub enum ShareMembershipState {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ShareDto {
+    #[serde(
+        rename = "CreateTime",
+        default,
+        with = "crate::utils::serde::epoch_seconds_opt"
+    )]
+    pub creation_time: Option<DateTime<Utc>>,
+
     #[serde(rename = "ShareID")]
     pub id: ShareId,
 

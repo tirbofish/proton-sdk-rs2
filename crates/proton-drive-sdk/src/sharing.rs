@@ -1006,31 +1006,74 @@ impl SharingOperations {
             key_retrieval_error_message: None,
         };
         for bookmark in response.bookmarks {
+            let metric_item = crate::telemetry::MetricItem {
+                uid: bookmark.token.token.clone(),
+                creation_time: bookmark.create_time,
+                third_party: None,
+                sdk: None,
+            };
             let mut password = String::new();
             if let Some(encrypted) = &bookmark.encrypted_url_password {
-                if let Ok((bytes, _, _)) =
-                    NodeCrypto::decrypt_message(encrypted, None, &pgp_keys, &claim)
-                {
-                    password = String::from_utf8(bytes).unwrap_or_default();
+                match NodeCrypto::decrypt_message(encrypted, None, &pgp_keys, &claim) {
+                    Ok((bytes, _, _)) => password = String::from_utf8(bytes).unwrap_or_default(),
+                    Err(error) => {
+                        client
+                            .integrity_reporter()
+                            .report_unchecked(
+                                client,
+                                &metric_item,
+                                "shareUrlPassword",
+                                Some(&error),
+                                false,
+                                None,
+                            )
+                            .await
+                    }
                 }
             }
             let mut node_name = None;
             if let Some(name) = &bookmark.token.name {
-                if let Ok((passphrase, _, _)) = NodeCrypto::decrypt_message(
+                let share_key = NodeCrypto::decrypt_message(
                     &bookmark.token.share_passphrase,
                     None,
                     &pgp_keys,
                     &claim,
-                ) {
-                    if let Ok(share_key) = NodeCrypto::unlock_key_with_passphrase(
-                        &bookmark.token.share_key,
-                        &passphrase,
-                    ) {
-                        if let Ok((bytes, _, _)) =
-                            NodeCrypto::decrypt_message(name, None, [&share_key], &claim)
-                        {
-                            node_name = String::from_utf8(bytes).ok();
+                )
+                .and_then(|(passphrase, _, _)| {
+                    NodeCrypto::unlock_key_with_passphrase(&bookmark.token.share_key, &passphrase)
+                        .map_err(|error| error.to_string())
+                });
+                match share_key {
+                    Ok(share_key) => {
+                        match NodeCrypto::decrypt_message(name, None, [&share_key], &claim) {
+                            Ok((bytes, _, _)) => node_name = String::from_utf8(bytes).ok(),
+                            Err(error) => {
+                                client
+                                    .integrity_reporter()
+                                    .report_unchecked(
+                                        client,
+                                        &metric_item,
+                                        "nodeName",
+                                        Some(&error),
+                                        false,
+                                        None,
+                                    )
+                                    .await
+                            }
                         }
+                    }
+                    Err(error) => {
+                        client
+                            .integrity_reporter()
+                            .report_unchecked(
+                                client,
+                                &metric_item,
+                                "shareKey",
+                                Some(&error),
+                                false,
+                                None,
+                            )
+                            .await
                     }
                 }
             }

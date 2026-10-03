@@ -78,6 +78,8 @@ pub struct ProtonDriveClient {
     block_downloader: BlockDownloader,
     thumbnail_block_downloader: BlockDownloader,
     sdk_events: Arc<crate::events::SdkEvents>,
+    integrity_reporter: Arc<crate::telemetry::IntegrityReporter>,
+    search_service_provider: Option<Arc<dyn crate::search::SearchServiceProvider>>,
 }
 
 // initialisers
@@ -354,12 +356,55 @@ impl ProtonDriveClient {
             block_downloader,
             thumbnail_block_downloader,
             sdk_events: Arc::new(crate::events::SdkEvents::new()),
+            integrity_reporter: Arc::new(crate::telemetry::IntegrityReporter::default()),
+            search_service_provider: None,
         }
     }
 }
 
 // getters
 impl ProtonDriveClient {
+    /// Attach a runtime-specific experimental search provider.
+    pub fn with_search_service_provider(
+        mut self,
+        provider: Arc<dyn crate::search::SearchServiceProvider>,
+    ) -> Self {
+        self.search_service_provider = Some(provider);
+        self
+    }
+
+    /// Initialize experimental search using the My Files member address.
+    /// The provider owns the search engine and its storage lifecycle.
+    pub async fn init_search(
+        &self,
+    ) -> anyhow::Result<Arc<dyn crate::search::ProtonDriveSearchClient>> {
+        let provider = self
+            .search_service_provider
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Search service provider not available"))?;
+        let address_id = self.my_files_member_address_id().await?;
+        provider
+            .start(env!("CARGO_PKG_VERSION"), address_id.raw())
+            .await
+    }
+
+    pub(crate) fn integrity_reporter(&self) -> &crate::telemetry::IntegrityReporter {
+        &self.integrity_reporter
+    }
+
+    pub(crate) async fn my_files_member_address_id(
+        &self,
+    ) -> anyhow::Result<crate::account::AddressId> {
+        if let Some(share_id) = self.cache.entities().try_get_my_files_share_id().await? {
+            if let Some(share) = self.cache.entities().try_get_share(share_id).await? {
+                return Ok(share.membership_address_id);
+            }
+        }
+        let response = self.api.shares().get_my_files_share().await?;
+        response.base.to_result()?;
+        Ok(response.share.address_id)
+    }
+
     /// Returns the unique identifier assigned to this client instance.
     pub fn uid(&self) -> &str {
         &self.uid

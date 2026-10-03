@@ -12,6 +12,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ActiveRevisionDto {
+    /// Origin flags are optional for older servers and cached API fixtures.
+    #[serde(rename = "ThirdParty")]
+    pub third_party: Option<bool>,
+    #[serde(rename = "Sdk")]
+    pub sdk: Option<bool>,
+
     #[serde(rename = "RevisionID")]
     pub id: RevisionId,
 
@@ -36,6 +42,12 @@ pub struct ActiveRevisionDto {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct RevisionDto {
+    /// Origin flags are optional for older servers and cached API fixtures.
+    #[serde(rename = "ThirdParty")]
+    pub third_party: Option<bool>,
+    #[serde(rename = "Sdk")]
+    pub sdk: Option<bool>,
+
     #[serde(rename = "ID")]
     pub id: RevisionId,
 

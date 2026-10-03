@@ -45,3 +45,5 @@ pubring.gpg
 trustdb.gpg
 random_seed
 .gnupg/
+
+dist/

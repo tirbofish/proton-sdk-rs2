@@ -77,6 +77,14 @@ pub struct ProtonPhotosClient {
     photos_entities: Arc<DefaultPhotosEntityCache>,
 }
 
+/// Deleting an album failed because it holds photos that exist only in the album.
+#[derive(Debug, thiserror::Error)]
+#[error("Album contains photos not in the timeline: {}", message.as_deref().unwrap_or("delete them or save them to the timeline first"))]
+pub struct AlbumContainsPhotosNotInTimelineError {
+    pub photo_uids: Vec<NodeUid>,
+    pub message: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct PhotoSaveResult {
     pub uid: NodeUid,
@@ -762,8 +770,35 @@ impl ProtonPhotosClient {
 
     /// Permanently deletes an album. Photos in the timeline are kept; set `force` to also
     /// delete photos that exist only in the album and not in the timeline.
-    pub async fn delete_album(&self, album_uid: NodeUid, force: bool) -> anyhow::Result<()> {
+    ///
+    /// Without `force`, an album holding photos that are not in the timeline fails with
+    /// [`AlbumContainsPhotosNotInTimelineError`]. Set `save_to_timeline` to save those photos
+    /// to the timeline first and retry the deletion once.
+    pub async fn delete_album(
+        &self,
+        album_uid: NodeUid,
+        force: bool,
+        save_to_timeline: bool,
+    ) -> anyhow::Result<()> {
         let volume_id = album_uid.volume_id.clone();
+        let result = self
+            .photos_api
+            .delete_album(volume_id.clone(), album_uid.link_id.clone(), force)
+            .await;
+        let photo_uids = match result {
+            Err(error) if save_to_timeline => {
+                match error.downcast::<AlbumContainsPhotosNotInTimelineError>() {
+                    Ok(error) if !error.photo_uids.is_empty() => error.photo_uids,
+                    Ok(error) => return Err(error.into()),
+                    Err(error) => return Err(error),
+                }
+            }
+            result => return result,
+        };
+        for saved in self.save_to_timeline(photo_uids).await {
+            saved.result?;
+        }
+        // A photo added meanwhile is still reported as the typed error.
         self.photos_api
             .delete_album(volume_id, album_uid.link_id, force)
             .await

@@ -63,9 +63,9 @@ that the user can access the stored credentials. Use
 ## Compatibility reference
 
 The current upstream reference used for compatibility review is
-`ProtonDriveApps/sdk` commit `28ac9cdc258737375692d1751dd9c7edcfb96708`
-from 2 October 2026. The upstream JS changelog lists v0.22.1; that commit also
-carries the js/v0.22.2 tag for subsequent search packaging fixes. See
+`ProtonDriveApps/sdk` commit `8a44654aece1609f0f7218be51c205103945abd8`
+from 9 October 2026. The upstream JS changelog lists v0.22.2; that commit also
+carries the js/v0.23.0 tag, which has no changelog entry yet. See
 [the sync record](UPSTREAM_SYNC.md) for coverage and limitations. The Rust SDK
 port and pdcli are versioned independently from upstream; applications should
 pin the crate version or commit when reproducibility matters.

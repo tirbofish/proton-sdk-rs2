@@ -973,13 +973,15 @@ impl ProtonDriveClient {
     }
 
     /// Returns a unique variant of `name` that does not conflict with any existing child under `parent_uid`.
-    /// If `name` is already available it is returned unchanged.
+    /// If `name` is already available it is returned unchanged. Files and photos keep their
+    /// extension (`file (2).txt`); folders and albums get the index appended (`folder.name (2)`).
     pub async fn get_available_name(
         &self,
         parent_uid: NodeUid,
         name: String,
+        node_type: crate::node::NodeType,
     ) -> anyhow::Result<String> {
-        NodeOperations::get_available_name(self, parent_uid, name).await
+        NodeOperations::get_available_name(self, parent_uid, name, node_type).await
     }
 
     /// Moves multiple nodes to `new_parent_folder_uid`, re-encrypting their key material for the new parent.

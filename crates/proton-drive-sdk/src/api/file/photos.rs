@@ -698,6 +698,47 @@ impl DefaultPhotosApiClient {
     }
 }
 
+const ALBUM_CONTAINS_PHOTOS_NOT_IN_TIMELINE: u32 = 200_302;
+
+#[derive(Deserialize)]
+struct DeleteAlbumFailureResponse {
+    #[serde(flatten)]
+    base: ApiResponse,
+    #[serde(rename = "Details", default)]
+    details: Option<DeleteAlbumFailureDetails>,
+}
+
+#[derive(Deserialize)]
+struct DeleteAlbumFailureDetails {
+    #[serde(rename = "ChildLinkIDs", default)]
+    child_link_ids: Vec<LinkId>,
+}
+
+fn parse_delete_album_response(
+    volume_id: &VolumeId,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> anyhow::Result<()> {
+    match serde_json::from_str::<DeleteAlbumFailureResponse>(body) {
+        Ok(response) if response.base.code.0 == ALBUM_CONTAINS_PHOTOS_NOT_IN_TIMELINE => {
+            Err(crate::photo::AlbumContainsPhotosNotInTimelineError {
+                photo_uids: response
+                    .details
+                    .map(|details| details.child_link_ids)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|link_id| NodeUid::new(volume_id.clone(), link_id))
+                    .collect(),
+                message: response.base.error_message,
+            }
+            .into())
+        }
+        Ok(response) => response.base.to_result(),
+        Err(_) if status.is_success() => Ok(()),
+        Err(_) => anyhow::bail!("HTTP {status}: {body}"),
+    }
+}
+
 #[async_trait]
 impl PhotosApiClient for DefaultPhotosApiClient {
     async fn create_volume(
@@ -859,8 +900,10 @@ impl PhotosApiClient for DefaultPhotosApiClient {
             if force { 1 } else { 0 }
         ))?;
         let builder = self.add_auth_headers(self.client.delete(url)).await?;
-        builder.send().await?;
-        Ok(())
+        let response = builder.send().await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        parse_delete_album_response(&volume_id, status, &body)
     }
 
     async fn add_photos_to_album(
@@ -1145,6 +1188,39 @@ impl LinksApiClient for PhotosLinksApiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delete_album_maps_photos_not_in_timeline_to_typed_error() {
+        let volume_id = VolumeId::new("vol".into());
+        let error = parse_delete_album_response(
+            &volume_id,
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            r#"{"Code":200302,"Error":"only in album","Details":{"ChildLinkIDs":["a","b"]}}"#,
+        )
+        .unwrap_err()
+        .downcast::<crate::photo::AlbumContainsPhotosNotInTimelineError>()
+        .unwrap();
+        assert_eq!(
+            error.photo_uids,
+            vec![
+                NodeUid::new(volume_id.clone(), LinkId::new("a".into())),
+                NodeUid::new(volume_id.clone(), LinkId::new("b".into())),
+            ]
+        );
+
+        assert!(
+            parse_delete_album_response(&volume_id, reqwest::StatusCode::OK, r#"{"Code":1000}"#)
+                .is_ok()
+        );
+        assert!(
+            parse_delete_album_response(
+                &volume_id,
+                reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+                r#"{"Code":2501,"Error":"gone"}"#
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn transfer_response_preserves_missing_related_photos() {

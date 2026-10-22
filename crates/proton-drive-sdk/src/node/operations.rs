@@ -1,7 +1,7 @@
 use crate::client::ProtonDriveClient;
 use crate::node::{
     DegradedNode, DtoToMetadataConverter, Node, NodeAndSecrets, NodeMetadata, NodeMetadataResult,
-    NodeUid,
+    NodeType, NodeUid,
 };
 use crate::pgp::PgpPrivateKey;
 use crate::share_ops::ShareOperations;
@@ -12,6 +12,28 @@ use sha2::Sha256;
 use std::collections::HashMap;
 
 type HmacSha256 = Hmac<Sha256>;
+
+const AVAILABLE_NAME_BATCH_SIZE: usize = 10;
+const AVAILABLE_NAME_LIMIT: usize = 1000;
+
+/// Candidate names for one availability batch. Folders and albums have no extension, so the
+/// index is always appended at the end (`folder.name (2)`), while files keep it (`file (2).txt`).
+fn available_name_candidates(name: &str, node_type: NodeType, start_index: usize) -> Vec<String> {
+    let (stem, extension) = match node_type {
+        NodeType::File | NodeType::Photo => crate::utils::split_extension(name),
+        NodeType::Folder | NodeType::Album => (name, ""),
+    };
+    let mut names = Vec::with_capacity(AVAILABLE_NAME_BATCH_SIZE + 1);
+    if start_index == 1 {
+        names.push(name.to_string());
+    }
+    for index in start_index..start_index + AVAILABLE_NAME_BATCH_SIZE {
+        names.push(crate::utils::join_name_and_extension(
+            stem, index, extension,
+        ));
+    }
+    names
+}
 
 pub struct NodeOperations;
 
@@ -147,46 +169,46 @@ impl NodeOperations {
         client: &ProtonDriveClient,
         parent_uid: NodeUid,
         name: String,
+        node_type: NodeType,
     ) -> anyhow::Result<String> {
         let folder_secrets =
             crate::node::folder::FolderOperations::get_secrets(client, parent_uid.clone()).await?;
 
-        let mut candidate_names = vec![name.clone()];
-        for i in 1..20 {
-            if let Some(pos) = name.rfind('.') {
-                let (base, ext) = name.split_at(pos);
-                candidate_names.push(format!("{} ({}){}", base, i, ext));
-            } else {
-                candidate_names.push(format!("{} ({})", name, i));
+        let mut start_index = 1;
+        while start_index < AVAILABLE_NAME_LIMIT {
+            let candidate_names = available_name_candidates(&name, node_type, start_index);
+            let mut hashes = Vec::with_capacity(candidate_names.len());
+            for candidate in &candidate_names {
+                let mut hmac = HmacSha256::new_from_slice(&folder_secrets.hash_key)?;
+                hmac.update(candidate.as_bytes());
+                hashes.push(hex::encode(hmac.finalize().into_bytes()));
             }
+
+            let response = client
+                .api()
+                .links()
+                .get_available_names(
+                    parent_uid.volume_id.clone(),
+                    parent_uid.link_id.clone(),
+                    crate::api::node::NodeNameAvailabilityRequest {
+                        name_hash_digests: hashes.clone(),
+                        client_uid: vec![],
+                    },
+                )
+                .await?;
+            response.base.to_result()?;
+
+            if let Some(available_hash) = response.available_name_hash_digests.first() {
+                let index = hashes
+                    .iter()
+                    .position(|hash| hash == available_hash)
+                    .ok_or_else(|| anyhow::anyhow!("Backend returned unexpected hash"))?;
+                return Ok(candidate_names[index].clone());
+            }
+            start_index += AVAILABLE_NAME_BATCH_SIZE;
         }
 
-        let mut hashes = Vec::new();
-        for candidate in &candidate_names {
-            let mut hmac = HmacSha256::new_from_slice(&folder_secrets.hash_key)?;
-            hmac.update(candidate.as_bytes());
-            hashes.push(hex::encode(hmac.finalize().into_bytes()));
-        }
-
-        let response = client
-            .api()
-            .links()
-            .get_available_names(
-                parent_uid.volume_id.clone(),
-                parent_uid.link_id.clone(),
-                crate::api::node::NodeNameAvailabilityRequest {
-                    name_hash_digests: hashes,
-                    client_uid: vec![],
-                },
-            )
-            .await?;
-
-        if let Some(_available_hash) = response.available_name_hash_digests.first() {
-            let index = 0; // simplified
-            return Ok(candidate_names[index].clone());
-        }
-
-        anyhow::bail!("No available names found")
+        anyhow::bail!("Could not find an available name")
     }
 
     pub async fn move_multiple(
@@ -975,5 +997,28 @@ impl NodeOperations {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn available_name_candidates_keep_file_extensions_but_not_folder_dots() {
+        assert_eq!(
+            available_name_candidates("file.txt", NodeType::File, 1)[..3],
+            ["file.txt", "file (1).txt", "file (2).txt"]
+        );
+        assert_eq!(
+            available_name_candidates("folder.name", NodeType::Folder, 1)[..3],
+            ["folder.name", "folder.name (1)", "folder.name (2)"]
+        );
+        assert_eq!(
+            available_name_candidates("my.album", NodeType::Album, 11),
+            (11..21)
+                .map(|i| format!("my.album ({i})"))
+                .collect::<Vec<_>>()
+        );
     }
 }

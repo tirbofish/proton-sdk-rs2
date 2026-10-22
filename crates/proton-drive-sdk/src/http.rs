@@ -65,7 +65,7 @@ pub fn create_client_with_timeout(timeout_seconds: f64) -> ClientWithMiddleware 
         .build()
         .expect("failed to build HTTP client");
 
-    reqwest_middleware::ClientBuilder::new(client).build()
+    crate::server_time::client_with_server_time(client)
 }
 
 #[cfg(test)]

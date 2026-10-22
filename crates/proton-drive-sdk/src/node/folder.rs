@@ -28,12 +28,17 @@ impl FolderOperations {
         })
     }
 
-    pub async fn create(
+    /// Builds the encrypted creation request for a folder named `name` under `parent_uid`,
+    /// returning it with the new folder's secrets and its plaintext passphrase.
+    pub(crate) async fn prepare_creation(
         client: &ProtonDriveClient,
-        parent_uid: NodeUid,
-        name: String,
-        _last_modification_time: Option<std::time::SystemTime>,
-    ) -> anyhow::Result<FolderNode> {
+        parent_uid: &NodeUid,
+        name: &str,
+    ) -> anyhow::Result<(
+        crate::api::folder::FolderCreationRequest,
+        FolderSecrets,
+        String,
+    )> {
         let membership_address = client
             .account()
             .get_address_primary_private_key(&crate::account::AddressId::new(
@@ -74,7 +79,7 @@ impl FolderOperations {
 
         let (encrypted_name, name_hash_digest, _name_session_key) =
             NodeCrypto::encrypt_and_sign_name(
-                &name,
+                name,
                 &parent_secrets.hash_key,
                 &parent_key,
                 &PgpPrivateKey(membership_address.clone()),
@@ -105,6 +110,18 @@ impl FolderOperations {
                 .clone(),
             extended_attributes: None,
         };
+
+        Ok((request, folder_secrets, folder_passphrase))
+    }
+
+    pub async fn create(
+        client: &ProtonDriveClient,
+        parent_uid: NodeUid,
+        name: String,
+        _last_modification_time: Option<std::time::SystemTime>,
+    ) -> anyhow::Result<FolderNode> {
+        let (request, folder_secrets, _) =
+            Self::prepare_creation(client, &parent_uid, &name).await?;
 
         let response = client
             .api()

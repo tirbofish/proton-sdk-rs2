@@ -182,6 +182,13 @@ pub struct NodeMoveResult {
     pub result: anyhow::Result<()>,
 }
 
+/// Outcome of copying one node; `result` holds the UID of the new copy.
+#[derive(Debug)]
+pub struct NodeCopyResult {
+    pub uid: NodeUid,
+    pub result: anyhow::Result<NodeUid>,
+}
+
 pub const PROTON_DOC_MEDIA_TYPE: &str = "application/vnd.proton.doc";
 pub const PROTON_SHEET_MEDIA_TYPE: &str = "application/vnd.proton.sheet";
 

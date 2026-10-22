@@ -407,6 +407,7 @@ impl SharingOperations {
             .ok_or_else(|| anyhow::anyhow!("no address key to sign invitation accept"))?;
         let context = SignatureContext::new(SIGNING_MEMBER.to_string(), true);
         let signature = Signer::default()
+            .at_date(crate::server_time::check_now())
             .with_signing_key(&signing_key)
             .with_signature_context(context)
             .sign_detached(&session_key.key, DataEncoding::Unarmored)?;
@@ -913,9 +914,11 @@ impl SharingOperations {
             .build()?;
         let api_http = reqwest_middleware::ClientBuilder::new(http.clone())
             .with(middleware())
+            .with(crate::server_time::ServerTimeMiddleware)
             .build();
         let storage_http = reqwest_middleware::ClientBuilder::new(http)
             .with(middleware())
+            .with(crate::server_time::ServerTimeMiddleware)
             .build();
         let base_url = reqwest::Url::parse(parent.api_url())?
             .join(crate::client::ProtonDriveDefaults::DRIVE_BASE_ROUTE)?;
@@ -1104,7 +1107,9 @@ impl SharingOperations {
             .account()
             .get_address_primary_private_key(&AddressId::new(address.address_id.clone()))
             .await?;
-        let encryptor = Encryptor::default().with_encryption_key(signing_key.as_public_key());
+        let encryptor = Encryptor::default()
+            .at_date(crate::server_time::check_now())
+            .with_encryption_key(signing_key.as_public_key());
         let encrypted = encryptor.encrypt(password.as_bytes())?;
         let armored = String::from_utf8(encrypted.armor()?)?;
         let address_key_id = address
@@ -1399,11 +1404,13 @@ impl SharingOperations {
         let session_key = CryptoGenerator::generate_session_key();
         let sk = session_key.to_rpgp_sk()?;
         let encryptor = Encryptor::default()
+            .at_date(crate::server_time::check_now())
             .with_session_key(sk)
             .with_encryption_keys([secrets.key.0.as_public_key(), address_key.0.as_public_key()])
             .with_signing_key(&address_key.0);
         let encrypted_passphrase = encryptor.encrypt(passphrase.as_bytes())?;
         let passphrase_signature = Signer::default()
+            .at_date(crate::server_time::check_now())
             .with_signing_key(&address_key.0)
             .sign_detached(passphrase.as_bytes(), DataEncoding::Armored)?;
         let armored_key = share_key.to_armored_private_key(Some(passphrase.as_bytes()))?;
@@ -1559,6 +1566,7 @@ impl SharingOperations {
         );
         let context = SignatureContext::new(SIGNING_EXTERNAL.to_string(), true);
         let signature = Signer::default()
+            .at_date(crate::server_time::check_now())
             .with_signing_key(&ctx.address_key.0)
             .with_signature_context(context)
             .sign_detached(payload.as_bytes(), DataEncoding::Unarmored)?;
@@ -1662,9 +1670,12 @@ impl SharingOperations {
         let share_password_salt = STANDARD.encode(salt_bytes);
         let salted = proton_srp::mailbox_password_hash(password, &salt_bytes)?;
         let key_packet = Encryptor::default()
+            .at_date(crate::server_time::check_now())
             .with_passphrase(salted.as_bytes())
             .encrypt_session_key(&ctx.passphrase_session_key.to_rpgp_sk()?)?;
-        let encryptor = Encryptor::default().with_encryption_key(ctx.address_key.0.as_public_key());
+        let encryptor = Encryptor::default()
+            .at_date(crate::server_time::check_now())
+            .with_encryption_key(ctx.address_key.0.as_public_key());
         Ok(UpdateShareUrlRequest {
             permissions: ShareMemberPermissions::from_role(settings.role).bits(),
             flags: if settings.custom_password.is_some() {
@@ -1742,10 +1753,12 @@ fn encrypt_invitation(
 ) -> anyhow::Result<(String, String)> {
     let sk = session_key.to_rpgp_sk()?;
     let key_packet = Encryptor::default()
+        .at_date(crate::server_time::check_now())
         .with_encryption_key(invitee)
         .encrypt_session_key(&sk)?;
     let context = SignatureContext::new(SIGNING_INVITER.to_string(), true);
     let signature = Signer::default()
+        .at_date(crate::server_time::check_now())
         .with_signing_key(&inviter.0)
         .with_signature_context(context)
         .sign_detached(&key_packet, DataEncoding::Unarmored)?;

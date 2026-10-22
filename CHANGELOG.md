@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.0 - 2026-10-22
+
+- Bump all workspace crates from 0.4.0 to 0.5.0. `get_available_name` takes a node type, `delete_album` takes `save_to_timeline`, and the experimental search traits follow upstream's new interface.
+- feat(drive-sdk): sync upstream SDK v0.22.2
+- feat(drive-sdk): sync crypto time with the API
+- feat(drive-sdk): add node hierarchy, batch copy, and shared node loading
+- feat(drive-sdk): add the event scheduler and import folder preparation
+- feat(drive-sdk): expose upstream's experimental search interface
+
 ## 0.4.0 - 2026-10-04
 
 - Bump all workspace crates from 0.3.2 to 0.4.0. Protobuf integrity payloads now use recency and creator fields; downstream struct literals must be updated.

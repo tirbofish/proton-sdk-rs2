@@ -46,8 +46,9 @@ impl PgpPrivateKey {
 
     pub fn encrypt_session_key(&self, session_key: &PgpSessionKey) -> anyhow::Result<Vec<u8>> {
         let sk = session_key.to_rpgp_sk()?;
-        let encryptor =
-            proton_rpgp::Encryptor::default().with_encryption_key(self.0.as_public_key());
+        let encryptor = proton_rpgp::Encryptor::default()
+            .at_date(crate::server_time::check_now())
+            .with_encryption_key(self.0.as_public_key());
         Ok(encryptor.encrypt_session_key(&sk)?)
     }
 
@@ -57,6 +58,7 @@ impl PgpPrivateKey {
             .preferred_hash_algorithm(proton_rpgp::pgp::crypto::hash::HashAlgorithm::Sha256)
             .build_into_profile();
         let bytes = proton_rpgp::Signer::new(profile)
+            .at_date(crate::server_time::check_now())
             .with_signing_key(&self.0)
             .sign_detached(data, DataEncoding::Armored)?;
         Ok(PgpArmoredSignature(String::from_utf8(bytes)?))

@@ -565,6 +565,7 @@ impl RevisionWriter {
 
         for thumb in thumbnails {
             let encryptor = Encryptor::default()
+                .at_date(crate::server_time::check_now())
                 .with_session_key(sk.clone())
                 .with_signing_key(&self.draft.signing_key.0);
 
@@ -716,6 +717,7 @@ impl RevisionWriter {
         let xattr_json = serde_json::to_vec(&xattr)?;
 
         let xattr_encryptor = Encryptor::default()
+            .at_date(crate::server_time::check_now())
             .with_encryption_key(self.draft.file_key.0.as_public_key())
             .with_signing_key(&self.draft.signing_key.0);
         let xattr_result = xattr_encryptor.encrypt(&xattr_json)?;

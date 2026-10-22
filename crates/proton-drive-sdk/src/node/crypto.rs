@@ -62,6 +62,7 @@ impl NodeCrypto {
         let data = name.as_bytes();
 
         let encryptor = Encryptor::default()
+            .at_date(crate::server_time::check_now())
             .with_session_key(sk)
             .with_encryption_key(parent_key.0.as_public_key())
             .with_signing_key(&signing_key.0);
@@ -88,6 +89,7 @@ impl NodeCrypto {
         let name_hash_digest = hmac.finalize().into_bytes().to_vec();
 
         let encryptor = Encryptor::default()
+            .at_date(crate::server_time::check_now())
             .with_session_key(sk)
             .with_encryption_key(parent_key.0.as_public_key())
             .with_signing_key(&signing_key.0);
@@ -114,6 +116,7 @@ impl NodeCrypto {
         let sk = session_key.to_rpgp_sk()?;
 
         let encryptor = Encryptor::default()
+            .at_date(crate::server_time::check_now())
             .with_session_key(sk)
             .with_encryption_key(parent_key.0.as_public_key())
             .with_signing_key(&signing_key.0);
@@ -121,6 +124,7 @@ impl NodeCrypto {
         let result = encryptor.encrypt(passphrase)?;
 
         let signature_bytes = Signer::default()
+            .at_date(crate::server_time::check_now())
             .with_signing_key(&signing_key.0)
             .sign_detached(passphrase, DataEncoding::Armored)?;
 
@@ -159,6 +163,7 @@ impl NodeCrypto {
         let sk = session_key.to_rpgp_sk()?;
 
         let encryptor = Encryptor::default()
+            .at_date(crate::server_time::check_now())
             .with_session_key(sk)
             .with_encryption_key(new_parent_key.0.as_public_key())
             .with_signing_key(&signing_key.0);
@@ -179,6 +184,7 @@ impl NodeCrypto {
         let sk = session_key.to_rpgp_sk()?;
 
         let encryptor = Encryptor::default()
+            .at_date(crate::server_time::check_now())
             .with_session_key(sk)
             .with_encryption_key(node_key.0.as_public_key())
             .with_signing_key(&signing_key.0);

@@ -10,8 +10,59 @@ use crate::node::authorship::AuthorshipClaim;
 use crate::node::crypto::NodeCrypto;
 use crate::node::folder::FolderSecrets;
 use crate::node::{NodeSecrets, NodeUid};
-use crate::pgp::{PgpArmoredMessage, PgpPrivateKey};
+use crate::pgp::{PgpArmoredMessage, PgpArmoredPrivateKey, PgpArmoredSignature, PgpPrivateKey};
 use crate::utils::PotentialObject;
+use base64::{Engine, engine::general_purpose::STANDARD};
+
+const MAX_NODE_NAME_LENGTH: usize = 255;
+
+/// Encrypted material for an import folder that has not been created yet.
+#[derive(Debug, Clone)]
+pub struct ImportFolderCryptoMaterial {
+    pub encrypted_name: PgpArmoredMessage,
+    /// Hex-encoded name hash in the parent folder.
+    pub hash: String,
+    pub armored_key: PgpArmoredPrivateKey,
+    pub armored_node_passphrase: PgpArmoredMessage,
+    pub armored_node_passphrase_signature: PgpArmoredSignature,
+    pub armored_hash_key: PgpArmoredMessage,
+    pub signature_email: String,
+    pub base64_passphrase: String,
+    pub armored_extended_attributes: Option<PgpArmoredMessage>,
+}
+
+fn validate_node_name(name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!name.is_empty(), "Name must not be empty");
+    // Upstream counts UTF-16 code units.
+    anyhow::ensure!(
+        name.encode_utf16().count() <= MAX_NODE_NAME_LENGTH,
+        "Name must be {MAX_NODE_NAME_LENGTH} characters long at most"
+    );
+    Ok(())
+}
+
+/// Generates the crypto material for a new folder named `name` under `parent_uid`,
+/// without creating it, so an importer can create it later.
+pub async fn prepare_import_folder_crypto_material(
+    client: &crate::client::ProtonDriveClient,
+    parent_uid: &NodeUid,
+    name: &str,
+) -> anyhow::Result<ImportFolderCryptoMaterial> {
+    validate_node_name(name)?;
+    let (request, _, passphrase) =
+        crate::node::folder::FolderOperations::prepare_creation(client, parent_uid, name).await?;
+    Ok(ImportFolderCryptoMaterial {
+        encrypted_name: request.base.name,
+        hash: hex::encode(&request.base.name_hash_digest),
+        armored_key: request.base.key,
+        armored_node_passphrase: request.base.passphrase,
+        armored_node_passphrase_signature: request.base.passphrase_signature,
+        armored_hash_key: request.hash_key,
+        signature_email: request.signature_email_address,
+        base64_passphrase: STANDARD.encode(passphrase.as_bytes()),
+        armored_extended_attributes: request.extended_attributes,
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct ImportFolder {
@@ -57,6 +108,15 @@ pub async fn seed_import_folder_crypto_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_folder_names_follow_upstream_validation() {
+        assert!(validate_node_name("").is_err());
+        assert!(validate_node_name(&"a".repeat(255)).is_ok());
+        assert!(validate_node_name(&"a".repeat(256)).is_err());
+        // One emoji is two UTF-16 code units.
+        assert!(validate_node_name(&"😀".repeat(128)).is_err());
+    }
     use crate::cache::secret::DefaultDriveSecretCache;
     use proton_sdk_rs2::cache::InMemoryCacheRepository;
     use std::sync::Arc;

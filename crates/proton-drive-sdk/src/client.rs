@@ -80,6 +80,17 @@ pub struct ProtonDriveClient {
     sdk_events: Arc<crate::events::SdkEvents>,
     integrity_reporter: Arc<crate::telemetry::IntegrityReporter>,
     search_service_provider: Option<Arc<dyn crate::search::SearchServiceProvider>>,
+    /// The search client, started once and shared by clones of this client.
+    search_client: Arc<tokio::sync::Mutex<Option<Arc<dyn crate::search::ProtonDriveSearchClient>>>>,
+    /// Authenticated Drive API access for search; absent for clients built from components.
+    raw_api: Option<RawApi>,
+}
+
+#[derive(Clone)]
+struct RawApi {
+    http: reqwest_middleware::ClientWithMiddleware,
+    base_url: reqwest::Url,
+    token_credential: Option<TokenCredential>,
 }
 
 // initialisers
@@ -183,8 +194,8 @@ impl ProtonDriveClient {
                 .join(ProtonDriveDefaults::DRIVE_BASE_ROUTE)?;
 
         Self::from_http_clients(
-            reqwest_middleware::ClientBuilder::new(default_api_http_client).build(),
-            reqwest_middleware::ClientBuilder::new(storage_api_http_client).build(),
+            crate::server_time::client_with_server_time(default_api_http_client),
+            crate::server_time::client_with_server_time(storage_api_http_client),
             default_api_base_address,
             storage_api_base_address,
             Arc::new(AccountClientAdapter::new(session)) as Arc<dyn AccountClient>,
@@ -221,7 +232,12 @@ impl ProtonDriveClient {
             token_credential.clone(),
         );
 
-        Ok(Self::from_components_with_api_url(
+        let raw_api = RawApi {
+            http: default_api_http_client.clone(),
+            base_url: default_api_base_url.clone(),
+            token_credential: token_credential.clone(),
+        };
+        let mut client = Self::from_components_with_api_url(
             account_client,
             api,
             cache,
@@ -235,7 +251,9 @@ impl ProtonDriveClient {
             uid,
             None,
             api_url,
-        ))
+        );
+        client.raw_api = Some(raw_api);
+        Ok(client)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -273,8 +291,8 @@ impl ProtonDriveClient {
             reqwest::Url::parse(&api_base_url)?.join(ProtonDriveDefaults::DRIVE_BASE_ROUTE)?;
 
         Self::from_http_clients(
-            reqwest_middleware::ClientBuilder::new(default_api_http_client).build(),
-            reqwest_middleware::ClientBuilder::new(storage_api_http_client).build(),
+            crate::server_time::client_with_server_time(default_api_http_client),
+            crate::server_time::client_with_server_time(storage_api_http_client),
             base_address.clone(),
             base_address,
             account_client,
@@ -358,6 +376,8 @@ impl ProtonDriveClient {
             sdk_events: Arc::new(crate::events::SdkEvents::new()),
             integrity_reporter: Arc::new(crate::telemetry::IntegrityReporter::default()),
             search_service_provider: None,
+            search_client: Default::default(),
+            raw_api: None,
         }
     }
 }
@@ -370,22 +390,67 @@ impl ProtonDriveClient {
         provider: Arc<dyn crate::search::SearchServiceProvider>,
     ) -> Self {
         self.search_service_provider = Some(provider);
+        self.search_client = Default::default();
         self
     }
 
     /// Initialize experimental search using the My Files member address.
     /// The provider owns the search engine and its storage lifecycle.
+    ///
+    /// Started once per client: later calls return the same search client, and so
+    /// the same index. A failed start is retried on the next call.
     pub async fn init_search(
         &self,
     ) -> anyhow::Result<Arc<dyn crate::search::ProtonDriveSearchClient>> {
+        let mut search_client = self.search_client.lock().await;
+        if let Some(client) = search_client.as_ref() {
+            return Ok(client.clone());
+        }
         let provider = self
             .search_service_provider
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("Search service provider not available"))?;
         let address_id = self.my_files_member_address_id().await?;
-        provider
-            .start(env!("CARGO_PKG_VERSION"), address_id.raw())
-            .await
+        let capabilities = Arc::new(crate::search::ClientSearchCapabilities {
+            client: self.clone(),
+        });
+        let client = provider
+            .start(env!("CARGO_PKG_VERSION"), address_id.raw(), capabilities)
+            .await?;
+        *search_client = Some(client.clone());
+        Ok(client)
+    }
+
+    /// Calls the Drive API with a path relative to its base URL, for the search module.
+    pub(crate) async fn raw_api_request(
+        &self,
+        method: crate::search::SearchApiMethod,
+        path: &str,
+        json: Option<serde_json::Value>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let raw = self
+            .raw_api
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Drive API access not available for this client"))?;
+        let url = raw.base_url.join(path.trim_start_matches('/'))?;
+        let mut builder = match method {
+            crate::search::SearchApiMethod::Get => raw.http.get(url),
+            crate::search::SearchApiMethod::Post => raw.http.post(url),
+            crate::search::SearchApiMethod::Put => raw.http.put(url),
+        };
+        if let Some(json) = json {
+            builder = builder.json(&json);
+        }
+        if let Some(credential) = &raw.token_credential {
+            let (access_token, _): (String, String) = credential.get_tokens().await?;
+            builder = builder
+                .header("Authorization", format!("Bearer {access_token}"))
+                .header("x-pm-uid", credential.session_id().raw());
+        }
+        let response = builder.send().await?;
+        let status = response.status();
+        let body = response.text().await?;
+        crate::search::parse_search_api_response(status, &body)
     }
 
     pub(crate) fn integrity_reporter(&self) -> &crate::telemetry::IntegrityReporter {
@@ -629,6 +694,47 @@ impl ProtonDriveClient {
         // enumerate_nodes now uses FuturesUnordered internally for parallelism.
         let results = NodeOperations::enumerate_nodes(self, node_uids).await?;
         Ok(futures::stream::iter(results.into_iter().map(Ok)))
+    }
+
+    /// Experimental: generates the crypto material for an import folder in My Files without
+    /// creating it. The name defaults to `drive-import-<ISO 8601 time>`.
+    pub async fn prepare_import_folder(
+        &self,
+        folder_name: Option<String>,
+    ) -> anyhow::Result<crate::easy_switch::ImportFolderCryptoMaterial> {
+        let name = folder_name.unwrap_or_else(|| {
+            format!(
+                "drive-import-{}",
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            )
+        });
+        let root = self.get_my_files_folder().await?;
+        crate::easy_switch::prepare_import_folder_crypto_material(self, &root.base.uid, &name).await
+    }
+
+    /// Returns the node and its ancestors, ordered from the root down to the node itself.
+    pub async fn get_node_hierarchy(
+        &self,
+        node_uid: NodeUid,
+    ) -> anyhow::Result<Vec<PotentialObject<Node, DegradedNode>>> {
+        let mut hierarchy = Vec::new();
+        let mut next = Some(node_uid);
+        while let Some(uid) = next {
+            if hierarchy
+                .iter()
+                .any(|node: &PotentialObject<Node, DegradedNode>| node_uid_of(node) == &uid)
+            {
+                anyhow::bail!("Node hierarchy loop detected: {uid}");
+            }
+            let node = self.get_node(uid).await?;
+            next = match &node {
+                PotentialObject::Node(node) => node.base().parent_uid.clone(),
+                PotentialObject::Degraded(node) => node.parent_uid().cloned(),
+            };
+            hierarchy.push(node);
+        }
+        hierarchy.reverse();
+        Ok(hierarchy)
     }
 
     /// Creates a new folder under `parent_id` with the given `name`.
@@ -1042,6 +1148,24 @@ impl ProtonDriveClient {
         NodeOperations::copy_single(self, uid, new_parent_folder_uid, new_name).await
     }
 
+    /// Copies nodes one by one into `new_parent_folder_uid`, each optionally under a new name.
+    /// A failed copy is reported in its result and does not stop the remaining copies.
+    pub async fn copy_nodes(
+        &self,
+        nodes: Vec<(NodeUid, Option<String>)>,
+        new_parent_folder_uid: NodeUid,
+    ) -> Vec<crate::node::NodeCopyResult> {
+        let mut results = Vec::with_capacity(nodes.len());
+        for (uid, new_name) in nodes {
+            let result = self
+                .copy_node(uid.clone(), new_parent_folder_uid.clone(), new_name)
+                .await
+                .map(|link_id| NodeUid::new(new_parent_folder_uid.volume_id.clone(), link_id));
+            results.push(crate::node::NodeCopyResult { uid, result });
+        }
+        results
+    }
+
     /// Renames a node, optionally updating its `new_media_type` MIME type.
     pub async fn rename_node(
         &self,
@@ -1129,6 +1253,24 @@ impl ProtonDriveClient {
             .events()
             .get_volume_events(volume_id, event_id)
             .await
+    }
+
+    /// Creates an [`EventScheduler`](crate::event_scheduler::EventScheduler) that calls
+    /// `callback` with each scope's tree event scope ID when it is due for polling.
+    /// The user's own volume is always polled in the foreground.
+    pub async fn get_event_scheduler<F, Fut>(
+        &self,
+        callback: F,
+    ) -> anyhow::Result<crate::event_scheduler::EventScheduler>
+    where
+        F: Fn(String) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let own_volume_id = self.get_my_files_folder().await?.base.uid.volume_id;
+        Ok(crate::event_scheduler::EventScheduler::new(
+            own_volume_id.raw(),
+            callback,
+        ))
     }
 
     /// Returns the latest known global core event-ID.
@@ -1235,6 +1377,24 @@ impl ProtonDriveClient {
             crate::api::share::ShareTargetType::DRIVE,
         )
         .await
+    }
+
+    /// Nodes shared by the user. Prefer [`Self::enumerate_shared_node_uids`] and load
+    /// nodes on demand, as upstream deprecates this in favour of the UID variant.
+    pub async fn enumerate_shared_nodes(
+        &self,
+    ) -> anyhow::Result<Vec<PotentialObject<Node, DegradedNode>>> {
+        let uids = self.enumerate_shared_node_uids().await?;
+        NodeOperations::enumerate_nodes(self, uids).await
+    }
+
+    /// Nodes shared with the user. Prefer [`Self::enumerate_shared_with_me_node_uids`] and
+    /// load nodes on demand, as upstream deprecates this in favour of the UID variant.
+    pub async fn enumerate_shared_nodes_with_me(
+        &self,
+    ) -> anyhow::Result<Vec<PotentialObject<Node, DegradedNode>>> {
+        let uids = self.enumerate_shared_with_me_node_uids().await?;
+        NodeOperations::enumerate_nodes(self, uids).await
     }
 
     /// Leaves a node that was shared with the current user.
@@ -1410,6 +1570,13 @@ fn retain_first_move_error(first_error: &mut Option<anyhow::Error>, result: Node
     }
 }
 
+fn node_uid_of(node: &PotentialObject<Node, DegradedNode>) -> &NodeUid {
+    match node {
+        PotentialObject::Node(node) => node.uid(),
+        PotentialObject::Degraded(node) => node.uid(),
+    }
+}
+
 #[cfg(test)]
 mod move_result_tests {
     use super::*;
@@ -1439,5 +1606,73 @@ mod move_result_tests {
             },
         );
         assert_eq!(error.unwrap().to_string(), "first");
+    }
+}
+
+#[cfg(test)]
+mod hierarchy_tests {
+    use super::*;
+    use crate::node::folder::FolderSecrets;
+    use crate::node::{NodeBase, NodeSecrets};
+
+    async fn cache_folder(client: &ProtonDriveClient, uid: &str, parent: Option<&str>) {
+        let uid = NodeUid::from_parts("volume", uid);
+        let node = Node::Folder(FolderNode {
+            base: NodeBase {
+                uid: uid.clone(),
+                parent_uid: parent.map(|parent| NodeUid::from_parts("volume", parent)),
+                ..NodeBase::default()
+            },
+        });
+        client
+            .cache()
+            .entities()
+            .set_node(uid.clone(), PotentialObject::Node(node), None, vec![])
+            .await
+            .unwrap();
+        let secrets = FolderSecrets {
+            base: NodeSecrets {
+                key: crate::crypto::CryptoGenerator::generate_private_key().unwrap(),
+                passphrase_session_key: crate::crypto::CryptoGenerator::generate_session_key(),
+                passphrase_pgp_session_key: None,
+                name_session_key: crate::crypto::CryptoGenerator::generate_session_key(),
+                passphrase_for_anonymous_move: None,
+            },
+            hash_key: vec![],
+        };
+        client
+            .cache()
+            .secrets()
+            .set_folder_secrets(uid, PotentialObject::Node(secrets))
+            .await
+            .unwrap();
+    }
+
+    fn uids(hierarchy: &[PotentialObject<Node, DegradedNode>]) -> Vec<String> {
+        hierarchy
+            .iter()
+            .map(|node| node_uid_of(node).link_id.raw().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn node_hierarchy_lists_ancestors_from_the_root_and_detects_loops() {
+        let (client, _) = crate::test_support::client().await;
+        cache_folder(&client, "root", None).await;
+        cache_folder(&client, "photos", Some("root")).await;
+        cache_folder(&client, "2026", Some("photos")).await;
+        let hierarchy = client
+            .get_node_hierarchy(NodeUid::from_parts("volume", "2026"))
+            .await
+            .unwrap();
+        assert_eq!(uids(&hierarchy), ["root", "photos", "2026"]);
+
+        cache_folder(&client, "a", Some("b")).await;
+        cache_folder(&client, "b", Some("a")).await;
+        let error = client
+            .get_node_hierarchy(NodeUid::from_parts("volume", "a"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("loop detected"));
     }
 }

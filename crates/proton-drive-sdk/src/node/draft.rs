@@ -118,6 +118,7 @@ impl RevisionDraftProvider for NewFileDraftProvider {
             },
             media_type: self.media_type.clone(),
             content_key_packet: Encryptor::default()
+                .at_date(crate::server_time::check_now())
                 .with_encryption_key(node_key.0.as_public_key())
                 .encrypt_session_key(&content_key.to_rpgp_sk()?)?,
             // Official SDK signs the content key with the node key, not the address key.

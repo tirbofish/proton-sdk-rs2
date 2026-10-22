@@ -24,6 +24,7 @@ impl CryptoGenerator {
     /// Generates a new PGP private key. Mirrors `PgpPrivateKey.Generate(...)`.
     pub fn generate_private_key() -> anyhow::Result<PgpPrivateKey> {
         KeyGenerator::default()
+            .at_date(crate::server_time::now())
             .with_key_type(KeyGenerationType::ECC)
             .with_user_id("Drive key", "no-reply@proton.me")
             .generate()

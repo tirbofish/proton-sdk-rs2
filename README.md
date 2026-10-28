@@ -2,7 +2,9 @@
 
 `proton-sdk-rs2` is a community Rust port of the Proton Drive SDK. It is not
 an official Proton product. The `pdcli` binary is a Linux FUSE client and
-desktop utility built on top of the SDK.
+desktop utility built on top of the SDK. `pdcli` is the command-line client;
+`pdcli-gui` is the companion **pdcli Desktop** app, launched with `pdcli gui`.
+Install both executables together.
 
 This software can modify remote files and is still evolving. Keep an
 independent backup of important data and review sync/conflict output before

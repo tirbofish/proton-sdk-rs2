@@ -4,8 +4,8 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "pdcli",
     version,
-    about = "Proton Drive client",
-    after_help = "On WSL, pdcli defaults to `mount`. Use `pdcli gui` for the window."
+    about = "Unofficial Proton Drive command-line client",
+    after_help = "Open pdcli Desktop with `pdcli gui` (launches the companion pdcli-gui executable). On WSL, pdcli defaults to `mount`."
 )]
 pub struct Cli {
     /// Skip network calls and use the local cache only
@@ -16,7 +16,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_tray: bool,
 
-    /// Open the graphical app
+    /// Open pdcli Desktop (the companion pdcli-gui app)
     #[arg(long)]
     pub gui: bool,
 
@@ -32,7 +32,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Open the graphical app
+    /// Open pdcli Desktop (the companion pdcli-gui app)
     Gui {
         /// Initial page: files, photos, computers, status, account, settings, about (mount opens Status)
         #[arg(long)]
@@ -110,6 +110,9 @@ pub enum Command {
     /// Run the background daemon
     #[command(hide = true)]
     Daemon,
+    /// Show the tray icon for an already running daemon
+    #[command(hide = true)]
+    Tray,
 }
 
 #[derive(Subcommand)]
@@ -121,10 +124,45 @@ pub enum BrowseCommand {
     Url { node: String },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum PhotoDuplicateStrategy {
+    /// Reuse the existing photo without uploading
+    Skip,
+    /// Fail without uploading if the content already exists
+    Error,
+    /// Upload another copy using an available filename
+    KeepBoth,
+}
+
 #[derive(Subcommand)]
 pub enum PhotosCommand {
-    /// Import one local image into the Photos timeline (leave the source intact)
-    Import { path: std::path::PathBuf },
+    /// Import an image or recursively import a folder (leave sources intact)
+    Import {
+        path: std::path::PathBuf,
+        /// How to handle matching content, including renamed copies
+        #[arg(long, value_enum, default_value = "skip")]
+        duplicate_strategy: PhotoDuplicateStrategy,
+        /// Include video files when recursively importing a folder
+        #[arg(long)]
+        include_videos: bool,
+    },
+    /// Scan the entire timeline for exact content duplicates and report JSON
+    Duplicates {
+        /// Count and list UIDs without decrypting duplicate names and sizes
+        #[arg(long)]
+        count_only: bool,
+    },
+    /// Keep one copy per duplicate group and move extras to Photos trash
+    Dedupe {
+        /// Preview kept and extra UIDs without changing the library
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Move selected photo UIDs to Photos trash (also affects album membership)
+    Trash {
+        #[arg(required = true, num_args = 1..)]
+        uids: Vec<String>,
+    },
     /// Export only Photos to DEST/Photos, resuming from a manifest
     Export { destination: std::path::PathBuf },
     /// Fetch one timeline page (up to 500 entries)

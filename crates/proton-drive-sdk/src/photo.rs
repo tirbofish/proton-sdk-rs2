@@ -509,6 +509,50 @@ impl ProtonPhotosClient {
         Ok((entries, next_cursor))
     }
 
+    /// Fetch timeline content fingerprints without fetching or decrypting node metadata.
+    /// Fingerprints are HMAC-SHA256 of the plaintext SHA-1 using the timeline root key.
+    /// Missing or malformed fingerprints are returned as `None`.
+    pub async fn get_timeline_hash_page(
+        &self,
+        volume_id: &VolumeId,
+        cursor: Option<&LinkId>,
+    ) -> anyhow::Result<(Vec<(NodeUid, Option<Vec<u8>>)>, Option<LinkId>)> {
+        let response = self
+            .photos_api
+            .get_timeline_photos(TimelinePhotoListRequest {
+                volume_id: volume_id.clone(),
+                previous_page_last_link_id: cursor.cloned(),
+            })
+            .await?;
+        let next = if response.photos.len() < 500 {
+            None
+        } else {
+            response.photos.last().map(|photo| photo.id.clone())
+        };
+        Ok((
+            response
+                .photos
+                .into_iter()
+                .map(|photo| {
+                    let hash = photo
+                        .content_hash
+                        .and_then(|hash| hex::decode(hash).ok())
+                        .filter(|hash| hash.len() == 32);
+                    (NodeUid::new(volume_id.clone(), photo.id), hash)
+                })
+                .collect(),
+            next,
+        ))
+    }
+
+    /// Compute the timeline fingerprint for a local plaintext SHA-1 digest.
+    pub async fn photo_content_fingerprint(&self, sha1: &[u8]) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(sha1.len() == 20, "invalid photo SHA-1 digest length");
+        let root = self.get_photos_root_folder().await?;
+        let key = self.get_root_hash_key(&root.base.uid).await?;
+        Self::hash_for_folder(&key, hex::encode(sha1).as_bytes())
+    }
+
     /// Access the underlying [`ProtonDriveClient`] for operations not yet
     /// surfaced by [`ProtonPhotosClient`] (e.g. block-level upload/download).
     pub fn drive(&self) -> &ProtonDriveClient {
@@ -1490,6 +1534,17 @@ impl ProtonPhotosClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeline_fingerprint_matches_photo_upload_content_hash() {
+        let fingerprint =
+            ProtonPhotosClient::hash_for_folder(b"key", hex::encode([0x12; 20]).as_bytes())
+                .unwrap();
+        assert_eq!(
+            hex::encode(fingerprint),
+            "79307225958a82ffbb477cac2080d60b3fd359722ccd4f957f6a33751794111f"
+        );
+    }
 
     #[test]
     fn album_anchor_requires_progress_when_more_pages_exist() {

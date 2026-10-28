@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
-Name=pdcli Drive
-Comment=Unofficial Proton Drive client
+Name=pdcli Desktop
+Comment=Unofficial Proton Drive desktop app
 Exec=pdcli gui
 Icon=folder-remote
 Categories=Network;

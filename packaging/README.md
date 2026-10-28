@@ -1,7 +1,9 @@
 # pdcli packages
 
 The package recipes expect a tagged source tree and build the `pdcli` and
-`pdcli-gui` binaries with Cargo. They install both binaries, a GNOME desktop
+`pdcli-gui` binaries with Cargo. `pdcli` is the command-line client;
+`pdcli-gui` is the companion app displayed as **pdcli Desktop**, launched with
+`pdcli gui`. They install both binaries, a GNOME desktop
 launcher, and a systemd **user** unit at
 `/usr/lib/systemd/user/pdcli.service`; package installation does not enable or
 start that unit automatically.

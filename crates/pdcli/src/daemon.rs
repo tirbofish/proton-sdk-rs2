@@ -149,6 +149,16 @@ pub fn request_quit() -> anyhow::Result<()> {
 
 pub fn ensure_running(force_offline: bool, enable_tray: bool) -> anyhow::Result<()> {
     if is_running() {
+        // The daemon may have been started without a tray (the systemd unit
+        // uses `--no-tray`); show one attached to it. It exits if a tray exists.
+        if enable_tray {
+            std::process::Command::new(std::env::current_exe()?)
+                .arg("tray")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+        }
         return Ok(());
     }
 
@@ -189,10 +199,11 @@ pub async fn run(force_offline: bool, enable_tray: bool) -> anyhow::Result<()> {
         anyhow::bail!("pdcli daemon is already running");
     }
 
+    // An attached `pdcli tray` from an earlier daemon may still own the icon.
+    let tray_lock = enable_tray.then(lock_tray).flatten();
+    let enable_tray = tray_lock.is_some();
     let tray_handle = if enable_tray {
-        let icon_path = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/icon.png"));
-        let create_tray = tray::init(&icon_path);
-        create_tray()
+        tray::init(&tray_icon_path())()
     } else {
         None
     };
@@ -322,6 +333,110 @@ async fn write_client_response(stream: &mut tokio::net::UnixStream, body: &[u8])
     }
 }
 
+fn tray_icon_path() -> PathBuf {
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/icon.png"))
+}
+
+/// Takes the per-user tray lock so only one process shows the icon. The lock is
+/// released when the returned file is dropped or the process exits.
+fn lock_tray() -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let path = socket_path().ok()?.with_file_name("pdcli-tray.lock");
+    let file = std::fs::File::create(path).ok()?;
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    locked.then_some(file)
+}
+
+/// Refuses daemons run by another user or from another executable, so the tray
+/// never forwards actions to a process that merely bound our socket path.
+#[cfg(target_os = "linux")]
+fn verify_daemon_peer() -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+    let stream = UnixStream::connect(socket_path()?)?;
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    anyhow::ensure!(rc == 0, std::io::Error::last_os_error());
+    anyhow::ensure!(
+        cred.uid == unsafe { libc::geteuid() },
+        "pdcli daemon belongs to another user"
+    );
+    let daemon = std::fs::read_link(format!("/proc/{}/exe", cred.pid))?;
+    let ours = std::env::current_exe()?;
+    anyhow::ensure!(
+        same_executable(&daemon, &ours),
+        "pdcli daemon runs {}, not {}",
+        daemon.display(),
+        ours.display()
+    );
+    Ok(())
+}
+
+// ponytail: other platforms rely on the per-user socket directory alone.
+#[cfg(not(target_os = "linux"))]
+fn verify_daemon_peer() -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// Compares `/proc/<pid>/exe` targets; a rebuilt or upgraded binary keeps its
+/// path but gains a ` (deleted)` suffix.
+fn same_executable(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let strip = |p: &std::path::Path| {
+        let p = p.to_string_lossy();
+        p.strip_suffix(" (deleted)").unwrap_or(&p).to_owned()
+    };
+    strip(a) == strip(b)
+}
+
+/// Shows the tray icon for a daemon started elsewhere and forwards its menu
+/// actions over the daemon socket. Exits when the daemon stops.
+pub fn attach_tray() -> anyhow::Result<()> {
+    let Some(_lock) = lock_tray() else {
+        return Ok(());
+    };
+    verify_daemon_peer()?;
+    let _tray = tray::init(&tray_icon_path())();
+    while let Some(status) = status() {
+        tray::update_state(
+            None,
+            match status {
+                DaemonStatus::Online => tray::TrayState::Online,
+                DaemonStatus::Offline => tray::TrayState::Offline,
+                DaemonStatus::Paused => tray::TrayState::Paused,
+            },
+        );
+        for action in tray::poll_events() {
+            let result = match action {
+                tray::TrayAction::OpenFolder => open_folder(),
+                tray::TrayAction::ShowHideWindow => Ok(launch_gui(None)),
+                tray::TrayAction::Account => Ok(launch_gui(Some("account"))),
+                tray::TrayAction::Settings => Ok(launch_gui(Some("settings"))),
+                tray::TrayAction::ToggleSyncPause => request_toggle_pause().map(drop),
+                tray::TrayAction::RetrySyncNow => request_retry_sync_now(),
+                tray::TrayAction::SignOut => {
+                    let result = request_quit();
+                    credentials::remove();
+                    result
+                }
+                tray::TrayAction::Quit => request_quit(),
+            };
+            if let Err(error) = result {
+                tracing::error!(%error, ?action, "tray action failed");
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    Ok(())
+}
+
 fn spawn_tray_action_forwarder() -> mpsc::UnboundedReceiver<tray::TrayAction> {
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
@@ -427,16 +542,43 @@ pub(crate) async fn restore_session(force_offline: bool) -> anyhow::Result<Proto
         },
     );
 
+    let mut expired = session.token_credential.subscribe_refresh_token_expired();
     if !force_offline {
-        session.ensure_authenticated().await?;
+        if let Err(error) = session.ensure_authenticated().await {
+            if expired.try_recv().is_ok() {
+                forget_rejected_credentials(&session.token_credential).await;
+                anyhow::bail!("session expired and was signed out; run `pdcli login`");
+            }
+            return Err(error);
+        }
     }
 
     if let Ok(cred) = session.to_stored_credentials_with_latest_tokens().await {
         credentials::save(&cred).ok();
     }
     credentials::save_session_tokens_on_refresh(&session);
+    let token_credential = session.token_credential.clone();
+    tokio::spawn(async move {
+        if expired.recv().await.is_ok() {
+            forget_rejected_credentials(&token_credential).await;
+        }
+    });
 
     Ok(session)
+}
+
+/// Signs out after Proton rejects the refresh token, unless another process already
+/// stored a newer token pair.
+async fn forget_rejected_credentials(
+    token_credential: &proton_drive_sdk::proton_sdk_rs2::auth::TokenCredential,
+) {
+    let Ok((_, rejected)) = token_credential.get_tokens().await else {
+        return;
+    };
+    if credentials::load().is_some_and(|stored| stored.refresh_token() == rejected) {
+        tracing::warn!("refresh token rejected; removing stored credentials");
+        credentials::remove();
+    }
 }
 
 fn load_recent_events() -> Vec<crate::db::SyncEvent> {
@@ -448,4 +590,17 @@ fn load_recent_events() -> Vec<crate::db::SyncEvent> {
     FuseDb::open(&db_path)
         .map(|db| db.recent_sync_events(20))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_executable;
+    use std::path::Path;
+
+    #[test]
+    fn tray_attach_accepts_rebuilt_daemon_binary_but_not_another_path() {
+        let ours = Path::new("/usr/bin/pdcli");
+        assert!(same_executable(Path::new("/usr/bin/pdcli (deleted)"), ours));
+        assert!(!same_executable(Path::new("/tmp/pdcli"), ours));
+    }
 }

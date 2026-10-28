@@ -175,6 +175,7 @@ impl TokenCredential {
         let session_id = self.session_id.clone();
         let current_access = current_access_token.clone();
         let current_refresh = current_refresh_token.clone();
+        let refresh_token_expired_tx = self.state.refresh_token_expired_tx.clone();
 
         let (access_token, refresh_token) = selected_tokens_task
             .get_or_init(|| async move {
@@ -192,13 +193,27 @@ impl TokenCredential {
 
                 match result {
                     Ok(tokens) => tokens,
-                    Err(_) => (current_access, current_refresh),
+                    Err(error) => {
+                        log::warn!("session refresh failed: {error:#}");
+                        // ponytail: matches the response body text; switch to a typed API error
+                        // if one is added for auth endpoints.
+                        let invalid = format!(
+                            "\"Code\":{}",
+                            crate::api::ResponseCode::InvalidRefreshToken as i64
+                        );
+                        if format!("{error:#}").contains(&invalid) {
+                            let _ = refresh_token_expired_tx.send(());
+                        }
+                        (current_access, current_refresh)
+                    }
                 }
             })
             .await
             .clone();
 
-        if tokens_task_replaced {
+        // A failed refresh yields the old pair; broadcasting it would let listeners overwrite
+        // a newer pair persisted by another process.
+        if tokens_task_replaced && refresh_token != current_refresh_token {
             self.trigger_tokens_refreshed(access_token.clone(), refresh_token);
         }
 
@@ -485,8 +500,8 @@ impl AuthenticationApiClient for DefaultAuthenticationApiClient {
             .header("content-type", "application/json")
             .body(serde_json::to_vec(&request)?)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        let response = Self::error_for_status_with_body(response).await?;
 
         crate::utils::decode_json::<RefreshSessionResponse>(response).await
     }
@@ -536,5 +551,84 @@ impl AuthenticationApiClient for DefaultAuthenticationApiClient {
         Ok(Some(
             crate::utils::decode_json::<SessionForkStatusResponse>(response).await?,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct RejectingRefreshClient;
+
+    #[async_trait::async_trait]
+    impl AuthenticationApiClient for RejectingRefreshClient {
+        async fn initiate_session(&self, _: String) -> anyhow::Result<SesisonInitiationResponse> {
+            unimplemented!()
+        }
+        async fn authenticate(
+            &self,
+            _: SesisonInitiationResponse,
+            _: proton_crypto::srp::ClientProof,
+            _: String,
+        ) -> anyhow::Result<AuthenticationResponse> {
+            unimplemented!()
+        }
+        async fn validate_second_factor(&self, _: String) -> anyhow::Result<ScopesResponse> {
+            unimplemented!()
+        }
+        async fn end_session(&self) -> anyhow::Result<ApiResponse> {
+            unimplemented!()
+        }
+        async fn end_session_with_token(
+            &self,
+            _: SessionId,
+            _: String,
+        ) -> anyhow::Result<ApiResponse> {
+            unimplemented!()
+        }
+        async fn refresh_session(
+            &self,
+            _: SessionId,
+            _: String,
+            _: String,
+        ) -> anyhow::Result<RefreshSessionResponse> {
+            anyhow::bail!(r#"HTTP 400: {{"Code":10013,"Error":"Invalid refresh token"}}"#)
+        }
+        async fn get_scopes(&self) -> anyhow::Result<ScopesResponse> {
+            unimplemented!()
+        }
+        async fn get_random_srp_modulus(&self) -> anyhow::Result<ModulusResponse> {
+            unimplemented!()
+        }
+        async fn init_session_fork(&self) -> anyhow::Result<SessionForkInitResponse> {
+            unimplemented!()
+        }
+        async fn poll_session_fork(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<Option<SessionForkStatusResponse>> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_refresh_signals_expiry_without_broadcasting_stale_tokens() {
+        let credential = TokenCredential::new(
+            Arc::new(RejectingRefreshClient),
+            SessionId::new("failed-refresh-session".into()),
+            "access".into(),
+            "refresh".into(),
+        );
+        let mut refreshed = credential.subscribe_tokens_refreshed();
+        let mut expired = credential.subscribe_refresh_token_expired();
+
+        let token = credential
+            .get_refreshed_access_token("access".into())
+            .await
+            .unwrap();
+
+        assert_eq!(token, "access");
+        assert!(refreshed.try_recv().is_err());
+        assert!(expired.try_recv().is_ok());
     }
 }

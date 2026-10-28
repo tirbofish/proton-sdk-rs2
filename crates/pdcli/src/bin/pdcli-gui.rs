@@ -26,6 +26,12 @@ mod desktop {
     };
 
     #[derive(Parser)]
+    #[command(
+        name = "pdcli-gui",
+        version,
+        about = "pdcli Desktop — unofficial Proton Drive desktop app",
+        after_help = "Launch with `pdcli gui`. Use `pdcli --help` for command-line operations. Both executables must be installed together."
+    )]
     struct Options {
         #[arg(long, value_parser = ["status", "files", "photos", "computers", "mount", "about", "account", "settings"])]
         page: Option<String>,
@@ -61,6 +67,7 @@ mod desktop {
 
     #[derive(Deserialize)]
     struct Status {
+        signed_in: bool,
         daemon: String,
         mountpoint: String,
         mounted: bool,
@@ -603,7 +610,7 @@ mod desktop {
         let (tx, rx) = mpsc::channel::<Event>();
         let window = adw::ApplicationWindow::builder()
             .application(app)
-            .title("pdcli")
+            .title("pdcli Desktop")
             .default_width(920)
             .default_height(660)
             .build();
@@ -1845,7 +1852,7 @@ mod desktop {
 
         let about = page("About");
         about.append(&gtk4::Label::new(Some(&format!(
-            "pdcli {} — unofficial Proton Drive client for Linux",
+            "pdcli Desktop {} — unofficial Proton Drive desktop app for Linux",
             env!("CARGO_PKG_VERSION")
         ))));
         about.append(&gtk4::Label::new(Some(
@@ -2162,6 +2169,16 @@ mod desktop {
                             Ok(text) => {
                                 if action == "Status" {
                                     match serde_json::from_str::<Status>(&text) {
+                                        Ok(status) if !status.signed_in => {
+                                            // The CLI removes credentials whose refresh token
+                                            // Proton rejected; finish signing out here.
+                                            if authenticated.replace(false) {
+                                                notifications.add_toast(adw::Toast::new(
+                                                    "Session expired. Sign in again.",
+                                                ));
+                                                command(&tx, "Sign out", vec!["logout".into()]);
+                                            }
+                                        }
                                         Ok(status) => {
                                             while let Some(child) = transfer_list.first_child() {
                                                 transfer_list.remove(&child);
@@ -2662,5 +2679,5 @@ fn main() {
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!("The pdcli GTK4 desktop app is available on Linux only.");
+    eprintln!("pdcli Desktop (pdcli-gui) is available on Linux only.");
 }

@@ -108,6 +108,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         }
         Some(Command::Browse { command }) => browser::run_cli(flags.force_offline, command).await,
         Some(Command::Photos { command }) => photos::run_cli(flags.force_offline, command).await,
+        Some(Command::Tray) => daemon::attach_tray(),
         Some(Command::Daemon) => run_daemon(flags.force_offline, !flags.no_tray).await,
         None if cli.daemon => run_daemon(flags.force_offline, !flags.no_tray).await,
         None if cli.cli => cmd_mount(flags.force_offline, flags.no_tray).await,

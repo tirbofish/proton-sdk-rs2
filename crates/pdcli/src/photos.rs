@@ -1,11 +1,12 @@
-use std::collections::HashMap;
-use std::io::Write;
+use std::collections::{HashMap, HashSet};
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 
 use anyhow::Context;
 use futures::StreamExt;
 use proton_drive_sdk::api::file::photos::AlbumInfo;
 use proton_drive_sdk::links::LinkId;
+use proton_drive_sdk::node::NodeType;
 use proton_drive_sdk::node::file::FileThumbnail;
 use proton_drive_sdk::node::file::FileUploadMetadata;
 use proton_drive_sdk::node::photo::PhotosFileUploadMetadata;
@@ -19,7 +20,11 @@ use serde::Serialize;
 use sha1::{Digest, Sha1};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-use crate::{daemon, flags::PhotosCommand, takeout};
+use crate::{
+    daemon,
+    flags::{PhotoDuplicateStrategy, PhotosCommand},
+    takeout,
+};
 
 const MAX_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
 
@@ -190,7 +195,390 @@ fn thumbnail_bytes(uid: &NodeUid, item: FileThumbnail) -> anyhow::Result<Vec<u8>
     Ok(bytes)
 }
 
-async fn import_photo(photos: &ProtonPhotosClient, path: &Path) -> anyhow::Result<()> {
+#[derive(Serialize)]
+struct DuplicatePhoto {
+    uid: String,
+    name: Option<String>,
+    size: Option<i64>,
+}
+
+#[derive(Default)]
+struct PhotoIndex {
+    scanned: usize,
+    unchecked: Vec<String>,
+    extra_copies: usize,
+    by_hash: HashMap<Vec<u8>, Vec<DuplicatePhoto>>,
+}
+
+impl PhotoIndex {
+    fn add_hash(&mut self, uid: &NodeUid, hash: Option<Vec<u8>>) {
+        self.scanned += 1;
+        if let Some(hash) = hash.filter(|hash| hash.len() == 32) {
+            let group = self.by_hash.entry(hash).or_default();
+            self.extra_copies += usize::from(!group.is_empty());
+            group.push(DuplicatePhoto {
+                uid: uid.raw(),
+                name: None,
+                size: None,
+            });
+        } else {
+            self.unchecked.push(uid.raw());
+        }
+    }
+
+    fn duplicate_uids(&self) -> anyhow::Result<Vec<NodeUid>> {
+        self.by_hash
+            .values()
+            .filter(|group| group.len() > 1)
+            .flatten()
+            .map(|photo| NodeUid::parse(&photo.uid).map_err(anyhow::Error::msg))
+            .collect()
+    }
+
+    fn removal_plan(&self) -> (Vec<String>, Vec<String>) {
+        let mut groups: Vec<Vec<_>> = self
+            .by_hash
+            .values()
+            .filter(|group| group.len() > 1)
+            .map(|group| {
+                let mut uids: Vec<_> = group.iter().map(|photo| photo.uid.clone()).collect();
+                uids.sort();
+                uids
+            })
+            .collect();
+        groups.sort_by(|a, b| a[0].cmp(&b[0]));
+        let kept = groups.iter().map(|group| group[0].clone()).collect();
+        let extras = groups
+            .into_iter()
+            .flat_map(|group| group.into_iter().skip(1))
+            .collect();
+        (kept, extras)
+    }
+
+    fn report(self) -> serde_json::Value {
+        let mut groups: Vec<_> = self
+            .by_hash
+            .into_values()
+            .filter(|items| items.len() > 1)
+            .collect();
+        for group in &mut groups {
+            group.sort_by(|a, b| a.uid.cmp(&b.uid));
+        }
+        groups.sort_by(|a, b| a[0].uid.cmp(&b[0].uid));
+        let extra_copies: usize = groups.iter().map(|items| items.len() - 1).sum();
+        serde_json::json!({
+            "scope": "photos_timeline",
+            "comparison": "timeline_content_hmac_sha256",
+            "scanned_photos": self.scanned,
+            "unchecked_photos": self.unchecked,
+            "duplicate_groups": groups.len(),
+            "extra_copies": extra_copies,
+            "groups": groups,
+            "actions": [
+                "Keep all copies; this report changes nothing.",
+                "Review names, UIDs, favorites and album membership before choosing copies to remove.",
+                "Automatically keep one per group and trash extras: pdcli photos dedupe. Preview with --dry-run.",
+                "Move selected copies to trash: pdcli photos trash VOLUME~LINK [VOLUME~LINK ...]. Restore through Proton Drive if needed.",
+                "Prevent future copies: pdcli photos import PATH --duplicate-strategy skip."
+            ]
+        })
+    }
+}
+
+struct ScanProgress {
+    visible: bool,
+}
+
+impl ScanProgress {
+    fn new() -> Self {
+        let progress = Self {
+            visible: std::io::stderr().is_terminal(),
+        };
+        progress.discovering(0);
+        progress
+    }
+
+    fn draw(&self, message: &str) {
+        if self.visible {
+            let mut stderr = std::io::stderr().lock();
+            let _ = write!(stderr, "\r\x1b[2K{message}");
+            let _ = stderr.flush();
+        }
+    }
+
+    fn discovering(&self, discovered: usize) {
+        self.draw(&format!(
+            "Loading photo timeline… {discovered} photos found"
+        ));
+    }
+
+    fn checking(&self, checked: usize, total: usize, extra_copies: usize) {
+        let filled = if total == 0 { 30 } else { checked * 30 / total };
+        let percentage = if total == 0 {
+            100
+        } else {
+            checked * 100 / total
+        };
+        self.draw(&format!(
+            "[{}{}] {percentage:3}% — {checked}/{total} duplicate details loaded, {extra_copies} extra copies",
+            "=".repeat(filled), " ".repeat(30 - filled)
+        ));
+    }
+}
+
+impl Drop for ScanProgress {
+    fn drop(&mut self) {
+        if self.visible {
+            let _ = writeln!(std::io::stderr().lock());
+        }
+    }
+}
+
+async fn scan_photo_library(photos: &ProtonPhotosClient) -> anyhow::Result<PhotoIndex> {
+    let progress = ScanProgress::new();
+    let volume = photos.get_photos_volume_id().await?;
+    let mut index = PhotoIndex::default();
+    let mut cursor = None;
+    let mut seen_cursors = HashSet::new();
+    let mut seen_uids = HashSet::new();
+    loop {
+        let (entries, next) = photos
+            .get_timeline_hash_page(&volume, cursor.as_ref())
+            .await?;
+        for (uid, hash) in entries {
+            if seen_uids.insert(uid.clone()) {
+                index.add_hash(&uid, hash);
+            }
+        }
+        progress.draw(&format!(
+            "[{}>{}] Scanning photo hashes… {} checked, {} extra copies",
+            "=".repeat((index.scanned / 500) % 29),
+            " ".repeat(29 - (index.scanned / 500) % 29),
+            index.scanned,
+            index.extra_copies
+        ));
+        let Some(next) = next else { break };
+        anyhow::ensure!(
+            seen_cursors.insert(next.raw().to_owned()),
+            "Photos timeline cursor did not advance"
+        );
+        cursor = Some(next);
+    }
+    Ok(index)
+}
+
+async fn duplicate_report(
+    photos: &ProtonPhotosClient,
+    count_only: bool,
+) -> anyhow::Result<serde_json::Value> {
+    let mut index = scan_photo_library(photos).await?;
+    if count_only {
+        return Ok(index.report());
+    }
+    let uids = index.duplicate_uids()?;
+    let progress = ScanProgress::new();
+    progress.checking(0, uids.len(), index.extra_copies);
+    // Unique photos need no node metadata. Bound concurrent duplicate-only fetches.
+    let mut batches = futures::stream::iter(uids.chunks(50).map(|batch| async move {
+        let nodes = photos.enumerate_nodes(batch.to_vec()).await?;
+        Ok::<_, anyhow::Error>((batch.len(), nodes))
+    }))
+    .buffer_unordered(4);
+    let mut checked = 0;
+    let mut metadata = HashMap::new();
+    while let Some(result) = batches.next().await {
+        let (count, nodes) = result?;
+        metadata.extend(nodes_by_uid(nodes));
+        checked += count;
+        progress.checking(checked, uids.len(), index.extra_copies);
+    }
+    for group in index.by_hash.values_mut().filter(|group| group.len() > 1) {
+        for item in group {
+            let uid = NodeUid::parse(&item.uid).map_err(anyhow::Error::msg)?;
+            let (name, _, size) = file_metadata(&uid, &metadata);
+            item.name = name;
+            item.size = size;
+        }
+    }
+    Ok(index.report())
+}
+
+async fn dedupe_photos(photos: &ProtonPhotosClient, dry_run: bool) -> anyhow::Result<()> {
+    let index = scan_photo_library(photos).await?;
+    let (kept, extras) = index.removal_plan();
+    let mut report = serde_json::json!({
+        "dry_run": dry_run,
+        "scope": "photos_timeline",
+        "scanned_photos": index.scanned,
+        "unchecked_photos": index.unchecked,
+        "duplicate_groups": kept.len(),
+        "extra_copies": extras.len(),
+        "keeper_rule": "lowest_uid_per_group",
+        "kept_uids": kept,
+        "extra_uids": extras,
+        "trashed_uids": [],
+        "errors": [],
+    });
+    if dry_run || extras.is_empty() {
+        println!("{report}");
+        return Ok(());
+    }
+    let uids = extras
+        .iter()
+        .map(|uid| NodeUid::parse(uid).map_err(anyhow::Error::msg))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let progress = ScanProgress::new();
+    let mut trashed = Vec::new();
+    let mut errors = Vec::new();
+    let mut checked = 0;
+    for batch in uids.chunks(50) {
+        match photos.trash_nodes(batch.to_vec()).await {
+            Ok(results) => {
+                for uid in batch {
+                    let error = match results.get(uid) {
+                        Some(Ok(())) => {
+                            trashed.push(uid.raw());
+                            continue;
+                        }
+                        Some(Err(error)) => error.to_string(),
+                        None => "server returned no result".to_owned(),
+                    };
+                    errors.push(serde_json::json!({"uid": uid.raw(), "error": error}));
+                }
+            }
+            Err(error) => {
+                // Stop after an uncertain batch; never automatically retry a write.
+                errors.push(serde_json::json!({"uids": batch.iter().map(NodeUid::raw).collect::<Vec<_>>(), "error": error.to_string(), "result_unknown": true}));
+                break;
+            }
+        }
+        checked += batch.len();
+        progress.draw(&format!(
+            "Moving duplicate copies to trash… {checked}/{} processed",
+            uids.len()
+        ));
+    }
+    let failed = !errors.is_empty();
+    report["trashed_uids"] = serde_json::to_value(trashed)?;
+    report["errors"] = serde_json::to_value(errors)?;
+    println!("{report}");
+    anyhow::ensure!(
+        !failed,
+        "some duplicate copies could not be confirmed trashed; see errors in the report"
+    );
+    Ok(())
+}
+
+fn skip_duplicate(
+    strategy: PhotoDuplicateStrategy,
+    matches: &[DuplicatePhoto],
+) -> anyhow::Result<bool> {
+    if matches.is_empty() {
+        return Ok(false);
+    }
+    match strategy {
+        PhotoDuplicateStrategy::Skip => Ok(true),
+        PhotoDuplicateStrategy::Error => anyhow::bail!(
+            "photo content already exists as {} ({} matching copies); use --duplicate-strategy skip or keep-both",
+            matches[0].uid,
+            matches.len()
+        ),
+        PhotoDuplicateStrategy::KeepBoth => Ok(false),
+    }
+}
+
+fn supported_photo(path: &Path, include_videos: bool) -> bool {
+    let mime = mime_guess::from_path(path)
+        .first_or_octet_stream()
+        .to_string();
+    mime.starts_with("image/") || (include_videos && mime.starts_with("video/"))
+}
+
+async fn local_photo_paths(
+    path: &Path,
+    include_videos: bool,
+) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    let metadata = tokio::fs::symlink_metadata(path)
+        .await
+        .context("read import source")?;
+    if metadata.is_file() {
+        return Ok(vec![path.to_owned()]);
+    }
+    anyhow::ensure!(
+        metadata.is_dir(),
+        "import source is not a file or directory"
+    );
+    let mut directories = vec![path.to_owned()];
+    let mut paths = Vec::new();
+    while let Some(directory) = directories.pop() {
+        let mut entries = tokio::fs::read_dir(&directory).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let kind = entry.file_type().await?;
+            if kind.is_dir() {
+                directories.push(entry.path());
+            } else if kind.is_file() && supported_photo(&entry.path(), include_videos) {
+                paths.push(entry.path());
+            }
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+async fn import_photos(
+    photos: &ProtonPhotosClient,
+    path: &Path,
+    strategy: PhotoDuplicateStrategy,
+    include_videos: bool,
+) -> anyhow::Result<()> {
+    let paths = local_photo_paths(path, include_videos).await?;
+    anyhow::ensure!(
+        !paths.is_empty(),
+        "no supported photos found in {}",
+        path.display()
+    );
+    let mut index = scan_photo_library(photos).await?;
+    anyhow::ensure!(
+        index.unchecked.is_empty(),
+        "could not check {} photos for duplicates; run pdcli photos duplicates for details",
+        index.unchecked.len()
+    );
+    let progress = ScanProgress::new();
+    let mut uploaded = 0;
+    let mut skipped = 0;
+    for (number, source) in paths.iter().enumerate() {
+        progress.draw(&format!(
+            "Importing {}/{}: {}",
+            number + 1,
+            paths.len(),
+            source.display()
+        ));
+        match import_photo(photos, source, strategy, &mut index, include_videos).await {
+            Ok(true) => uploaded += 1,
+            Ok(false) => skipped += 1,
+            Err(error) => {
+                println!(
+                    "{}",
+                    serde_json::json!({"action": "failed", "path": source, "error": format!("{error:#}"), "uploaded": uploaded, "skipped": skipped, "remaining": paths.len() - number - 1})
+                );
+                return Err(error.context(format!("import {}", source.display())));
+            }
+        }
+    }
+    println!(
+        "{}",
+        serde_json::json!({"action": "summary", "total": paths.len(), "uploaded": uploaded, "skipped": skipped})
+    );
+    Ok(())
+}
+
+async fn import_photo(
+    photos: &ProtonPhotosClient,
+    path: &Path,
+    strategy: PhotoDuplicateStrategy,
+    index: &mut PhotoIndex,
+    include_videos: bool,
+) -> anyhow::Result<bool> {
     let mut file = tokio::fs::File::open(path)
         .await
         .context("open local photo")?;
@@ -212,33 +600,39 @@ async fn import_photo(photos: &ProtonPhotosClient, path: &Path) -> anyhow::Resul
         .first_or_octet_stream()
         .to_string();
     anyhow::ensure!(
-        media_type.starts_with("image/"),
-        "not a recognized image file: {}",
+        supported_photo(path, include_videos),
+        "not a recognized photo file: {}",
         path.display()
     );
 
     let digest = hash_photo(&mut file).await?;
-    let sha1_hex = digest
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    if let Some(uid) = photos
-        .find_photo_duplicates(&name, &sha1_hex)
-        .await?
-        .first()
-    {
+    let fingerprint = photos.photo_content_fingerprint(&digest).await?;
+    let matches = index
+        .by_hash
+        .get(&fingerprint)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if skip_duplicate(strategy, matches)? {
         println!(
             "{}",
-            serde_json::json!({"uid": uid.raw(), "duplicate": true})
+            serde_json::json!({
+                "uid": matches[0].uid, "duplicate": true, "action": "skipped", "path": path,
+                "matching_uids": matches.iter().map(|item| &item.uid).collect::<Vec<_>>()
+            })
         );
-        return Ok(());
+        return Ok(false);
     }
+    let duplicate = !matches.is_empty();
     let root = photos.get_photos_root_folder().await?;
+    let name = photos
+        .drive()
+        .get_available_name(root.base.uid.clone(), name, NodeType::Photo)
+        .await?;
     let modified = metadata.modified().ok().map(chrono::DateTime::from);
     let mut uploader = photos
         .get_file_uploader(
             root.base.uid,
-            name,
+            name.clone(),
             media_type,
             size,
             PhotosFileUploadMetadata {
@@ -259,9 +653,10 @@ async fn import_photo(photos: &ProtonPhotosClient, path: &Path) -> anyhow::Resul
         .await?;
     println!(
         "{}",
-        serde_json::json!({"uid": uid.raw(), "duplicate": false})
+        serde_json::json!({"uid": uid.raw(), "duplicate": duplicate, "action": "uploaded", "name": name, "path": path})
     );
-    Ok(())
+    index.add_hash(&uid, Some(fingerprint));
+    Ok(true)
 }
 
 async fn hash_photo(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> anyhow::Result<Vec<u8>> {
@@ -278,13 +673,24 @@ async fn hash_photo(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> anyhow:
 }
 
 pub async fn run_cli(force_offline: bool, command: PhotosCommand) -> anyhow::Result<()> {
-    if let PhotosCommand::Import { path } = command {
+    if let PhotosCommand::Import {
+        path,
+        duplicate_strategy,
+        include_videos,
+    } = command
+    {
         anyhow::ensure!(
             !force_offline,
             "Photos import requires a network connection"
         );
         let session = daemon::restore_session(force_offline).await?;
-        return import_photo(&ProtonPhotosClient::new(&session, None)?, &path).await;
+        return import_photos(
+            &ProtonPhotosClient::new(&session, None)?,
+            &path,
+            duplicate_strategy,
+            include_videos,
+        )
+        .await;
     }
     if let PhotosCommand::Export { destination } = command {
         anyhow::ensure!(
@@ -301,6 +707,44 @@ pub async fn run_cli(force_offline: bool, command: PhotosCommand) -> anyhow::Res
     let photos = ProtonPhotosClient::new(&session, None)?;
     match command {
         PhotosCommand::Import { .. } | PhotosCommand::Export { .. } => unreachable!(),
+        PhotosCommand::Duplicates { count_only } => {
+            println!("{}", duplicate_report(&photos, count_only).await?);
+        }
+        PhotosCommand::Dedupe { dry_run } => {
+            dedupe_photos(&photos, dry_run).await?;
+        }
+        PhotosCommand::Trash { uids } => {
+            let volume = photos.get_photos_volume_id().await?;
+            let uids = uids
+                .iter()
+                .map(|uid| photo_uid(uid, &volume))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            // Validate the entire selection before changing any remote node.
+            for uid in &uids {
+                anyhow::ensure!(
+                    matches!(
+                        photos.get_node(uid.clone()).await?,
+                        PotentialObject::Node(Node::Photo(_))
+                    ),
+                    "node {uid} is not a readable photo"
+                );
+            }
+            let results = photos.trash_nodes(uids.clone()).await?;
+            let mut failed = false;
+            for uid in uids {
+                let error = match results.get(&uid) {
+                    Some(Ok(())) => None,
+                    Some(Err(error)) => Some(error.to_string()),
+                    None => Some("server returned no result".to_owned()),
+                };
+                failed |= error.is_some();
+                println!(
+                    "{}",
+                    serde_json::json!({"uid": uid.raw(), "trashed": error.is_none(), "error": error})
+                );
+            }
+            anyhow::ensure!(!failed, "some photos could not be moved to trash");
+        }
         PhotosCommand::Timeline { cursor } => {
             anyhow::ensure!(
                 cursor.as_ref().is_none_or(|id| !id.is_empty()),
@@ -435,6 +879,198 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
     use clap::Parser;
+
+    #[tokio::test]
+    async fn folder_import_recurses_and_excludes_sidecars_and_videos_by_default() {
+        let root =
+            std::env::temp_dir().join(format!("pdcli-photo-import-{}", rand::random::<u64>()));
+        tokio::fs::create_dir_all(root.join("nested"))
+            .await
+            .unwrap();
+        for name in [
+            "one.jpg",
+            "nested/two.heic",
+            "nested/clip.mp4",
+            "nested/metadata.aae",
+        ] {
+            tokio::fs::write(root.join(name), b"test").await.unwrap();
+        }
+        assert_eq!(local_photo_paths(&root, false).await.unwrap().len(), 2);
+        assert_eq!(local_photo_paths(&root, true).await.unwrap().len(), 3);
+        assert!(supported_photo(Path::new("photo.JPG"), false));
+        assert!(!supported_photo(Path::new("clip.mp4"), false));
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[test]
+    fn dedupe_plan_keeps_one_copy_per_group_and_leaves_unique_and_unknown_photos_alone() {
+        let mut index = PhotoIndex::default();
+        for (uid, hash) in [
+            ("c", Some(vec![1; 32])),
+            ("a", Some(vec![1; 32])),
+            ("b", Some(vec![1; 32])),
+            ("unique", Some(vec![2; 32])),
+            ("unknown", None),
+        ] {
+            index.add_hash(&NodeUid::from_parts("v", uid), hash);
+        }
+        assert_eq!(
+            index.removal_plan(),
+            (
+                vec!["v~a".to_owned()],
+                vec!["v~b".to_owned(), "v~c".to_owned()]
+            )
+        );
+        assert_eq!(PhotoIndex::default().removal_plan(), (vec![], vec![]));
+        for args in [
+            vec!["pdcli", "photos", "dedupe"],
+            vec!["pdcli", "photos", "dedupe", "--dry-run"],
+        ] {
+            assert!(crate::flags::Cli::try_parse_from(args).is_ok());
+        }
+    }
+
+    #[test]
+    fn large_library_fetches_metadata_only_for_duplicate_groups() {
+        let start = std::time::Instant::now();
+        let mut index = PhotoIndex::default();
+        for number in 0u64..100_000 {
+            let mut hash = vec![0; 32];
+            hash[..8].copy_from_slice(&number.to_le_bytes());
+            index.add_hash(
+                &NodeUid::from_parts("v", &format!("photo-{number}")),
+                Some(hash),
+            );
+        }
+        assert!(index.duplicate_uids().unwrap().is_empty());
+        for number in 0u64..20 {
+            let mut hash = vec![0; 32];
+            hash[..8].copy_from_slice(&number.to_le_bytes());
+            index.add_hash(
+                &NodeUid::from_parts("v", &format!("copy-{number}")),
+                Some(hash),
+            );
+        }
+        index.add_hash(&NodeUid::from_parts("v", "invalid"), Some(vec![1; 20]));
+        assert_eq!(index.duplicate_uids().unwrap().len(), 40);
+        assert_eq!(index.extra_copies, 20);
+        assert_eq!(index.unchecked, ["v~invalid"]);
+        let report = index.report();
+        assert_eq!(report["duplicate_groups"], 20);
+        assert_eq!(report["extra_copies"], 20);
+        eprintln!(
+            "100,020 photo hashes grouped and reported in {:?}; 40 metadata candidates instead of 100,020",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn import_duplicate_strategies_skip_fail_or_keep_existing_content() {
+        let matches = vec![DuplicatePhoto {
+            uid: "volume~original".into(),
+            name: Some("original.jpg".into()),
+            size: Some(42),
+        }];
+        assert!(skip_duplicate(PhotoDuplicateStrategy::Skip, &matches).unwrap());
+        assert!(skip_duplicate(PhotoDuplicateStrategy::Error, &matches).is_err());
+        assert!(!skip_duplicate(PhotoDuplicateStrategy::KeepBoth, &matches).unwrap());
+        for strategy in [
+            PhotoDuplicateStrategy::Skip,
+            PhotoDuplicateStrategy::Error,
+            PhotoDuplicateStrategy::KeepBoth,
+        ] {
+            assert!(!skip_duplicate(strategy, &[]).unwrap());
+        }
+    }
+
+    #[test]
+    fn duplicate_report_counts_extra_copies_regardless_of_names_and_reports_unknowns() {
+        let mut index = PhotoIndex::default();
+        index.scanned = 4;
+        index.by_hash.insert(
+            vec![1; 20],
+            vec![
+                DuplicatePhoto {
+                    uid: "v~b".into(),
+                    name: Some("renamed.jpg".into()),
+                    size: Some(42),
+                },
+                DuplicatePhoto {
+                    uid: "v~a".into(),
+                    name: Some("original.jpg".into()),
+                    size: Some(42),
+                },
+                DuplicatePhoto {
+                    uid: "v~c".into(),
+                    name: Some("third.jpg".into()),
+                    size: Some(42),
+                },
+            ],
+        );
+        index.by_hash.insert(
+            vec![2; 20],
+            vec![DuplicatePhoto {
+                uid: "v~d".into(),
+                name: Some("original.jpg".into()),
+                size: Some(42),
+            }],
+        );
+        index.add_hash(&NodeUid::from_parts("v", "missing"), None);
+        let report = index.report();
+        assert_eq!(report["duplicate_groups"], 1);
+        assert_eq!(report["extra_copies"], 2);
+        assert_eq!(report["groups"][0][0]["uid"], "v~a");
+        assert_eq!(report["unchecked_photos"], serde_json::json!(["v~missing"]));
+        assert_eq!(PhotoIndex::default().report()["extra_copies"], 0);
+    }
+
+    #[test]
+    fn photos_duplicate_commands_parse_strategies_and_require_trash_selection() {
+        let cli =
+            crate::flags::Cli::try_parse_from(["pdcli", "photos", "import", "photo.jpg"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(crate::flags::Command::Photos {
+                command: PhotosCommand::Import {
+                    duplicate_strategy: PhotoDuplicateStrategy::Skip,
+                    ..
+                }
+            })
+        ));
+        for strategy in ["skip", "error", "keep-both"] {
+            assert!(
+                crate::flags::Cli::try_parse_from([
+                    "pdcli",
+                    "photos",
+                    "import",
+                    "photo.jpg",
+                    "--duplicate-strategy",
+                    strategy
+                ])
+                .is_ok()
+            );
+        }
+        assert!(
+            crate::flags::Cli::try_parse_from([
+                "pdcli",
+                "photos",
+                "import",
+                "photo.jpg",
+                "--duplicate-strategy",
+                "replace"
+            ])
+            .is_err()
+        );
+        assert!(crate::flags::Cli::try_parse_from(["pdcli", "photos", "duplicates"]).is_ok());
+        assert!(
+            crate::flags::Cli::try_parse_from(["pdcli", "photos", "duplicates", "--count-only"])
+                .is_ok()
+        );
+        assert!(crate::flags::Cli::try_parse_from(["pdcli", "photos", "trash"]).is_err());
+        assert!(
+            crate::flags::Cli::try_parse_from(["pdcli", "photos", "trash", "v~a", "v~b"]).is_ok()
+        );
+    }
 
     #[test]
     fn timeline_json_preserves_cursor_metadata_and_nulls() {

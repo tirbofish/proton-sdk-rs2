@@ -164,8 +164,129 @@ pub fn force_unmount() {
 #[allow(dead_code)]
 struct OpenFile {
     ino: u64,
-    file: std::fs::File,
+    content: Content,
     writable: bool,
+}
+
+enum Content {
+    /// The cached copy on disk.
+    Local(std::fs::File),
+    /// Read-only and fetched block by block from Proton Drive.
+    Stream(Arc<StreamingFile>),
+}
+
+/// Files at least this large open read-only without a full download; reads
+/// fetch only the 4 MiB blocks they touch, so video players can seek at once.
+const STREAM_MIN_SIZE: u64 = 16 * 1024 * 1024;
+/// Decrypted blocks kept per streaming file.
+const STREAM_CACHED_BLOCKS: usize = 6;
+
+struct StreamingFile {
+    reader: proton_drive_sdk::node::file::download::BlockReader,
+    /// Most recently used last.
+    blocks: Mutex<std::collections::VecDeque<(usize, Arc<Vec<u8>>)>>,
+    /// Blocks being fetched, so readahead and reads do not download twice.
+    fetching: Mutex<HashSet<usize>>,
+}
+
+impl StreamingFile {
+    fn cached(&self, index: usize) -> Option<Arc<Vec<u8>>> {
+        let mut blocks = self.blocks.lock().unwrap();
+        let position = blocks.iter().position(|(cached, _)| *cached == index)?;
+        let entry = blocks.remove(position).expect("position is in range");
+        let data = entry.1.clone();
+        blocks.push_back(entry);
+        Some(data)
+    }
+
+    fn remember(&self, index: usize, data: Arc<Vec<u8>>) {
+        let mut blocks = self.blocks.lock().unwrap();
+        if blocks.iter().any(|(cached, _)| *cached == index) {
+            return;
+        }
+        if blocks.len() == STREAM_CACHED_BLOCKS {
+            blocks.pop_front();
+        }
+        blocks.push_back((index, data));
+    }
+
+    /// Fetches a block on the runtime, waiting for one already in flight.
+    fn block(
+        self: &Arc<Self>,
+        index: usize,
+        rt: &tokio::runtime::Handle,
+    ) -> anyhow::Result<Arc<Vec<u8>>> {
+        loop {
+            if let Some(data) = self.cached(index) {
+                return Ok(data);
+            }
+            if self.fetching.lock().unwrap().insert(index) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let file = self.clone();
+        rt.spawn(async move {
+            let _ = tx.send(file.fetch(index).await);
+        });
+        rx.recv()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("block download task dropped")))
+    }
+
+    async fn fetch(self: Arc<Self>, index: usize) -> anyhow::Result<Arc<Vec<u8>>> {
+        let result = self.reader.read_block(index).await.map(Arc::new);
+        if let Ok(data) = &result {
+            self.remember(index, data.clone());
+        }
+        self.fetching.lock().unwrap().remove(&index);
+        result
+    }
+
+    /// Starts downloading the next block so sequential playback does not wait.
+    fn read_ahead(self: &Arc<Self>, index: usize, rt: &tokio::runtime::Handle) {
+        if index >= self.reader.block_count()
+            || self.cached(index).is_some()
+            || !self.fetching.lock().unwrap().insert(index)
+        {
+            return;
+        }
+        let file = self.clone();
+        rt.spawn(async move {
+            if let Err(error) = file.fetch(index).await {
+                tracing::debug!(%error, index, "read-ahead block failed");
+            }
+        });
+    }
+
+    fn read(
+        self: &Arc<Self>,
+        offset: u64,
+        size: u32,
+        rt: &tokio::runtime::Handle,
+    ) -> anyhow::Result<Vec<u8>> {
+        let end = offset.saturating_add(size.into()).min(self.reader.len());
+        let mut out = Vec::with_capacity(end.saturating_sub(offset) as usize);
+        let mut position = offset;
+        let mut last_block = None;
+        while position < end {
+            let index = self
+                .reader
+                .block_at(position)
+                .expect("position is before the end");
+            let data = self.block(index, rt)?;
+            let start = (position - self.reader.block_start(index)) as usize;
+            let take = ((end - position) as usize).min(data.len().saturating_sub(start));
+            anyhow::ensure!(take > 0, "block {index} is shorter than its claimed size");
+            out.extend_from_slice(&data[start..start + take]);
+            position += take as u64;
+            last_block = Some(index);
+        }
+        if let Some(index) = last_block {
+            self.read_ahead(index + 1, rt);
+        }
+        Ok(out)
+    }
 }
 
 // ── The FUSE filesystem ──────────────────────────────────────────────
@@ -679,6 +800,40 @@ impl ProtonDriveFs {
         Ok(())
     }
 
+    /// `None` when the file cannot be read by block (e.g. older uploads without
+    /// claimed block sizes); the caller then downloads it whole.
+    fn open_stream(&self, row: &InodeRow) -> Option<Arc<StreamingFile>> {
+        let revision_uid = RevisionUid::try_parse(row.revision_uid.as_deref()?)?;
+        let drive = self.drive.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.rt.spawn(async move {
+            let result = async {
+                drive
+                    .get_file_downloader(revision_uid)
+                    .await?
+                    .open_block_reader()
+                    .await
+            }
+            .await;
+            let _ = tx.send(result);
+        });
+        match rx.recv() {
+            Ok(Ok(reader)) => {
+                tracing::info!(ino = row.ino, name = %row.name, "streaming file without a full download");
+                Some(Arc::new(StreamingFile {
+                    reader,
+                    blocks: Mutex::new(std::collections::VecDeque::new()),
+                    fetching: Mutex::new(HashSet::new()),
+                }))
+            }
+            Ok(Err(error)) => {
+                tracing::info!(%error, name = %row.name, "cannot stream; downloading whole file");
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
     fn alloc_fh(&self) -> u64 {
         self.next_fh.fetch_add(1, Ordering::Relaxed)
     }
@@ -1170,7 +1325,7 @@ impl Filesystem for ProtonDriveFs {
                         fh,
                         Mutex::new(OpenFile {
                             ino: ino_u64,
-                            file,
+                            content: Content::Local(file),
                             writable: false,
                         }),
                     );
@@ -1192,6 +1347,27 @@ impl Filesystem for ProtonDriveFs {
                 "blocked thumbnailer from triggering download"
             );
             reply.error(Errno::EACCES);
+            return;
+        }
+
+        let read_only = matches!(flags.acc_mode(), OpenAccMode::O_RDONLY);
+        if read_only
+            && !is_cached
+            && !row.dirty
+            && row.size >= STREAM_MIN_SIZE
+            && is_online()
+            && let Some(stream) = self.open_stream(&row)
+        {
+            let fh = self.alloc_fh();
+            self.open_files.write().unwrap().insert(
+                fh,
+                Mutex::new(OpenFile {
+                    ino: ino_u64,
+                    content: Content::Stream(stream),
+                    writable: false,
+                }),
+            );
+            reply.opened(FileHandle(fh), FopenFlags::empty());
             return;
         }
 
@@ -1247,7 +1423,7 @@ impl Filesystem for ProtonDriveFs {
             fh,
             Mutex::new(OpenFile {
                 ino: ino_u64,
-                file,
+                content: Content::Local(file),
                 writable,
             }),
         );
@@ -1277,8 +1453,29 @@ impl Filesystem for ProtonDriveFs {
         };
 
         let of = entry.lock().unwrap();
+        let file = match &of.content {
+            Content::Local(file) => file,
+            Content::Stream(stream) => {
+                // Release the table locks before waiting on the network.
+                let stream = stream.clone();
+                drop(of);
+                drop(files);
+                match stream.read(offset, size, &self.rt) {
+                    Ok(data) => reply.data(&data),
+                    Err(error) => {
+                        tracing::warn!(%error, "streamed read failed");
+                        reply.error(if is_online() {
+                            Errno::EIO
+                        } else {
+                            Errno::EHOSTUNREACH
+                        });
+                    }
+                }
+                return;
+            }
+        };
         let mut buf = vec![0u8; size as usize];
-        match of.file.read_at(&mut buf, offset) {
+        match file.read_at(&mut buf, offset) {
             Ok(n) => {
                 buf.truncate(n);
                 reply.data(&buf);
@@ -1314,7 +1511,11 @@ impl Filesystem for ProtonDriveFs {
         };
 
         let of = entry.lock().unwrap();
-        match of.file.write_at(data, offset) {
+        let Content::Local(file) = &of.content else {
+            reply.error(Errno::EBADF);
+            return;
+        };
+        match file.write_at(data, offset) {
             Ok(n) => {
                 // Update size in DB.
                 let new_end = offset + n as u64;
@@ -1346,7 +1547,9 @@ impl Filesystem for ProtonDriveFs {
         let files = self.open_files.read().unwrap();
         if let Some(entry) = files.get(&fh_u64) {
             let of = entry.lock().unwrap();
-            let _ = of.file.sync_all();
+            if let Content::Local(file) = &of.content {
+                let _ = file.sync_all();
+            }
         }
         reply.ok();
     }
@@ -1464,7 +1667,7 @@ impl Filesystem for ProtonDriveFs {
             fh,
             Mutex::new(OpenFile {
                 ino: new_ino,
-                file,
+                content: Content::Local(file),
                 writable,
             }),
         );
@@ -2699,5 +2902,80 @@ fn reconcile_cached_file_sizes(db: &FuseDb) {
             }
         }
         let _ = db.update_size_only(ino, metadata.len());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Live check against a real account: `PDCLI_STREAM_TEST_UID=<file uid>
+    /// cargo test -p pdcli streamed_reads -- --ignored`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a signed-in account and PDCLI_STREAM_TEST_UID"]
+    async fn streamed_reads_match_a_full_download() {
+        let uid = NodeUid::parse(&std::env::var("PDCLI_STREAM_TEST_UID").unwrap()).unwrap();
+        let session = crate::daemon::restore_session(false).await.unwrap();
+        let drive = ProtonDriveClient::new(&session, None).unwrap();
+        let Node::File(file) = drive.get_node(uid).await.unwrap().result().unwrap() else {
+            panic!("not a file");
+        };
+        let revision = file.active_revision.uid.clone();
+
+        let mut full = Vec::new();
+        let downloader = drive.get_file_downloader(revision.clone()).await.unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        struct Sink(std::sync::mpsc::Sender<Vec<u8>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let _ = self.0.send(buf.to_vec());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        downloader
+            .download_to_stream(Box::new(Sink(tx)), Box::new(|_, _| {}))
+            .completion
+            .await
+            .unwrap()
+            .unwrap();
+        while let Ok(chunk) = rx.try_recv() {
+            full.extend(chunk);
+        }
+
+        let reader = drive
+            .get_file_downloader(revision)
+            .await
+            .unwrap()
+            .open_block_reader()
+            .await
+            .unwrap();
+        assert_eq!(reader.len(), full.len() as u64);
+        let stream = Arc::new(StreamingFile {
+            reader,
+            blocks: Mutex::new(std::collections::VecDeque::new()),
+            fetching: Mutex::new(HashSet::new()),
+        });
+        let rt = tokio::runtime::Handle::current();
+        let len = full.len() as u64;
+        // Start, a span across a block boundary, the tail, and past the end.
+        for (offset, size) in [
+            (0, 131_072),
+            (4 * 1024 * 1024 - 1000, 131_072),
+            (len - 5000, 131_072),
+            (len + 10, 4096),
+        ] {
+            let stream = stream.clone();
+            let rt = rt.clone();
+            let data = tokio::task::spawn_blocking(move || stream.read(offset, size, &rt))
+                .await
+                .unwrap()
+                .unwrap();
+            let start = offset.min(len) as usize;
+            let end = (offset + size as u64).min(len) as usize;
+            assert_eq!(data, full[start..end], "read at {offset}");
+        }
     }
 }

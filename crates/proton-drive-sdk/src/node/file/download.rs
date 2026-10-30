@@ -212,6 +212,34 @@ impl FileDownloader {
         Ok(written)
     }
 
+    /// Opens the revision for reading individual blocks on demand. Needs claimed
+    /// block sizes to map byte offsets to blocks, so it fails on older files
+    /// that omit them; callers can fall back to a full download.
+    pub async fn open_block_reader(&self) -> anyhow::Result<BlockReader> {
+        let sizes = self
+            .claimed_block_sizes()
+            .await?
+            .into_iter()
+            .map(|size| u64::try_from(size).map_err(|_| anyhow::anyhow!("negative block size")))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let state = Arc::new(
+            RevisionOperations::create_download_state(
+                &self.client,
+                self.revision_uid.clone(),
+                Box::new(|_| {}),
+            )
+            .await?,
+        );
+        anyhow::ensure!(
+            state.revision_dto.blocks.len() == sizes.len(),
+            "revision lists {} blocks but claims {} block sizes",
+            state.revision_dto.blocks.len(),
+            sizes.len()
+        );
+        let reader = RevisionOperations::open_for_reading(&self.client, state, Box::new(|_| {}));
+        Ok(BlockReader::new(reader, sizes))
+    }
+
     /// Creates a cursor for on-demand range reads, suitable for media playback.
     pub async fn get_seekable_stream(&self) -> anyhow::Result<SeekableFileStream<'_>> {
         let length =
@@ -230,6 +258,63 @@ impl FileDownloader {
             length,
         })
     }
+}
+
+/// Random access to a revision's plaintext, one block at a time.
+pub struct BlockReader {
+    reader: crate::node::download::RevisionReader,
+    /// Plaintext offset where each block starts, plus the total length at the end.
+    starts: Vec<u64>,
+}
+
+impl BlockReader {
+    fn new(reader: crate::node::download::RevisionReader, sizes: Vec<u64>) -> Self {
+        let mut starts = Vec::with_capacity(sizes.len() + 1);
+        let mut offset = 0;
+        starts.push(offset);
+        for size in sizes {
+            offset += size;
+            starts.push(offset);
+        }
+        Self { reader, starts }
+    }
+
+    pub fn len(&self) -> u64 {
+        *self.starts.last().expect("starts always has the total")
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn block_count(&self) -> usize {
+        self.starts.len() - 1
+    }
+
+    /// Zero-based block index holding `offset`, or `None` past the end.
+    pub fn block_at(&self, offset: u64) -> Option<usize> {
+        block_index_at(&self.starts, offset)
+    }
+
+    /// Plaintext offset where a zero-based block starts.
+    pub fn block_start(&self, index: usize) -> u64 {
+        self.starts[index]
+    }
+
+    /// Downloads and decrypts one zero-based block.
+    pub async fn read_block(&self, index: usize) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(index < self.block_count(), "block {index} out of range");
+        self.reader.download_block_at(index as i32 + 1).await
+    }
+}
+
+fn block_index_at(starts: &[u64], offset: u64) -> Option<usize> {
+    let total = *starts.last()?;
+    if offset >= total {
+        return None;
+    }
+    // The last start not after `offset`.
+    Some(starts.partition_point(|start| *start <= offset) - 1)
 }
 
 pub struct SeekableFileStream<'a> {
@@ -286,5 +371,21 @@ impl Drop for FileDownloader {
                 .block_listing_semaphore()
                 .release(remaining as usize);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::block_index_at;
+
+    #[test]
+    fn offsets_map_to_the_block_that_holds_them() {
+        let starts = [0, 4, 8, 10];
+        assert_eq!(block_index_at(&starts, 0), Some(0));
+        assert_eq!(block_index_at(&starts, 3), Some(0));
+        assert_eq!(block_index_at(&starts, 4), Some(1));
+        assert_eq!(block_index_at(&starts, 9), Some(2));
+        assert_eq!(block_index_at(&starts, 10), None);
+        assert_eq!(block_index_at(&[0], 0), None);
     }
 }

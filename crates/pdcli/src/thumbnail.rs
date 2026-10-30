@@ -119,6 +119,9 @@ impl Default for ThumbnailConfig {
                 "glycin".into(),
                 "gst-thumbnailer".into(),
                 "ffmpegthumbnailer".into(),
+                // Content indexers
+                "localsearch".into(),
+                "baloo".into(),
             ],
         }
     }
@@ -131,8 +134,11 @@ impl ThumbnailConfig {
 
         if config_path.exists() {
             match std::fs::read_to_string(&config_path) {
-                Ok(contents) => match toml::from_str(&contents) {
-                    Ok(config) => return config,
+                Ok(contents) => match toml::from_str::<Self>(&contents) {
+                    Ok(mut config) => {
+                        config.add_default_blocks();
+                        return config;
+                    }
                     Err(e) => {
                         tracing::warn!("failed to parse thumbnail config: {}, using defaults", e);
                     }
@@ -154,6 +160,22 @@ impl ThumbnailConfig {
         Self::default()
     }
 
+    /// A config file written by an older version keeps its block lists, so
+    /// thumbnailers and indexers added to the defaults since still apply.
+    fn add_default_blocks(&mut self) {
+        let defaults = Self::default();
+        for (current, default) in [
+            (&mut self.blocked_exes, defaults.blocked_exes),
+            (&mut self.blocked_names, defaults.blocked_names),
+        ] {
+            for pattern in default {
+                if !current.contains(&pattern) {
+                    current.push(pattern);
+                }
+            }
+        }
+    }
+
     fn save(&self) -> anyhow::Result<()> {
         let config_path = Self::config_path();
         if let Some(parent) = config_path.parent() {
@@ -166,6 +188,8 @@ impl ThumbnailConfig {
              # Controls which processes may trigger file downloads.\n\
              # Allowed processes can read uncached file content.\n\
              # Blocked processes get EACCES for uncached files (no download).\n\
+             # Thumbnailers (anything named *thumbnail*) are always blocked, and\n\
+             # entries missing from the blocked lists are restored on load.\n\
              # Patterns are matched with contains() against the exe path or process name.\n\n\
              {contents}"
         );
@@ -199,8 +223,16 @@ impl ThumbnailConfig {
             let exe = std::fs::read_link(format!("/proc/{current}/exe"))
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
+            let cmdline = std::fs::read(format!("/proc/{current}/cmdline")).unwrap_or_default();
+            // KIO runs every protocol in the same `kioworker` binary; its first
+            // argument names the plugin, e.g. `.../kf6/kio/thumbnail.so`.
+            let worker_plugin = cmdline
+                .split(|byte| *byte == 0)
+                .nth(1)
+                .map(String::from_utf8_lossy)
+                .unwrap_or_default();
 
-            if let Some(blocked) = self.classify(&exe, &comm) {
+            if let Some(blocked) = self.classify(&exe, &comm, &worker_plugin) {
                 if blocked {
                     tracing::debug!(pid, matched_pid = current, exe = %exe, comm = %comm,
                         "blocking thumbnailer process tree");
@@ -216,8 +248,18 @@ impl ThumbnailConfig {
     }
 
     /// `Some(false)` means explicitly allowed, `Some(true)` explicitly blocked.
-    fn classify(&self, exe: &str, comm: &str) -> Option<bool> {
+    fn classify(&self, exe: &str, comm: &str, worker_plugin: &str) -> Option<bool> {
         let exe = exe.to_lowercase();
+        let comm = comm.to_lowercase();
+        // Checked before the allow lists: `totem-video-thumbnailer` and
+        // `evince-thumbnailer` would otherwise match the `totem`/`evince` viewers.
+        let kio_worker = exe.contains("kioworker") || exe.contains("kioslave");
+        if exe.contains("thumbnail")
+            || comm.contains("thumbnail")
+            || (kio_worker && worker_plugin.to_lowercase().contains("thumbnail"))
+        {
+            return Some(true);
+        }
         if self
             .allowed_exes
             .iter()
@@ -233,7 +275,6 @@ impl ThumbnailConfig {
             return Some(true);
         }
 
-        let comm = comm.to_lowercase();
         if self
             .allowed_names
             .iter()
@@ -270,19 +311,81 @@ mod tests {
     fn classifies_nautilus_and_thumbnail_helpers_as_blocked() {
         let config = ThumbnailConfig::default();
 
-        assert_eq!(config.classify("/usr/bin/nautilus", "nautilus"), Some(true));
         assert_eq!(
-            config.classify("/usr/libexec/gnome-desktop-thumbnailer", "gnome-desktop-"),
+            config.classify("/usr/bin/nautilus", "nautilus", ""),
             Some(true)
         );
-        assert_eq!(config.classify("/usr/bin/glycin", "glycin"), Some(true));
+        assert_eq!(
+            config.classify(
+                "/usr/libexec/gnome-desktop-thumbnailer",
+                "gnome-desktop-",
+                ""
+            ),
+            Some(true)
+        );
+        assert_eq!(config.classify("/usr/bin/glycin", "glycin", ""), Some(true));
+    }
+
+    #[test]
+    fn viewer_thumbnailers_kio_thumbnail_workers_and_indexers_are_blocked() {
+        let config = ThumbnailConfig::default();
+
+        assert_eq!(
+            config.classify("/usr/bin/totem-video-thumbnailer", "totem-video-thu", ""),
+            Some(true)
+        );
+        assert_eq!(
+            config.classify("/usr/bin/evince-thumbnailer", "evince-thumbn", ""),
+            Some(true)
+        );
+        assert_eq!(
+            config.classify(
+                "/usr/lib/kf6/kioworker",
+                "kioworker",
+                "/usr/lib/qt6/plugins/kf6/kio/thumbnail.so"
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            config.classify(
+                "/usr/lib/kf6/kioworker",
+                "kioworker",
+                "/usr/lib/qt6/plugins/kf6/kio/file.so"
+            ),
+            None
+        );
+        assert_eq!(
+            config.classify("/usr/bin/baloo_file_extractor", "baloo_file_extr", ""),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn saved_configs_gain_new_default_blocks() {
+        let mut config = ThumbnailConfig {
+            allowed_exes: vec![],
+            blocked_exes: vec!["/nautilus".into()],
+            allowed_names: vec![],
+            blocked_names: vec![],
+        };
+        config.add_default_blocks();
+
+        assert_eq!(
+            config
+                .blocked_exes
+                .iter()
+                .filter(|p| *p == "/nautilus")
+                .count(),
+            1
+        );
+        assert!(config.blocked_names.iter().any(|p| p == "baloo"));
     }
 
     #[test]
     fn allowed_viewers_take_precedence_and_unknowns_are_unclassified() {
         let config = ThumbnailConfig::default();
 
-        assert_eq!(config.classify("/usr/bin/loupe", "loupe"), Some(false));
-        assert_eq!(config.classify("/usr/bin/cat", "cat"), None);
+        assert_eq!(config.classify("/usr/bin/loupe", "loupe", ""), Some(false));
+        assert_eq!(config.classify("/usr/bin/cat", "cat", ""), None);
     }
 }

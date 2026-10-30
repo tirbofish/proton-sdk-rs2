@@ -541,7 +541,7 @@ pub struct NameHashDigestUnavailabilityDto {
     pub link_id: LinkId,
 
     #[serde(rename = "ClientUID")]
-    pub client_uid: String,
+    pub client_uid: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]

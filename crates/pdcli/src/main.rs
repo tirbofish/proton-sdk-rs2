@@ -15,14 +15,19 @@ mod db;
 mod flags;
 mod fs;
 mod job_control;
+mod media_preview;
+mod offline;
 mod pdignore;
+mod photo_cache;
 mod photos;
 mod quoted;
 mod service;
 mod share;
+mod shortcuts;
 mod takeout;
 mod thumbnail;
 mod transfer;
+mod transfer_progress;
 mod tray;
 mod version;
 
@@ -42,6 +47,8 @@ async fn async_main() {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "pdcli=info".into()),
         )
+        // Logs go to stderr so stdout stays clean for JSON and other command output.
+        .with_writer(std::io::stderr)
         .init();
     job_control::install();
 
@@ -103,11 +110,15 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             takeout::run_cli(flags.force_offline, destination).await
         }
         Some(Command::Service { command }) => cmd_service(command),
+        Some(Command::Storage { json }) => cmd_storage(flags.force_offline, json).await,
         Some(Command::Computers { json, command }) => {
             computers::run_cli(flags.force_offline, command, json).await
         }
         Some(Command::Browse { command }) => browser::run_cli(flags.force_offline, command).await,
         Some(Command::Photos { command }) => photos::run_cli(flags.force_offline, command).await,
+        Some(Command::Offline { command }) => offline::run_cli(flags.force_offline, command).await,
+        Some(Command::OpenDocument { path }) => shortcuts::open(&path),
+        Some(Command::Integrate) => shortcuts::install(),
         Some(Command::Tray) => daemon::attach_tray(),
         Some(Command::Daemon) => run_daemon(flags.force_offline, !flags.no_tray).await,
         None if cli.daemon => run_daemon(flags.force_offline, !flags.no_tray).await,
@@ -342,6 +353,31 @@ fn cmd_service(command: ServiceCommand) -> anyhow::Result<()> {
             println!("systemd user units reloaded");
         }
         ServiceCommand::Status => println!("{}", service::status()?),
+        ServiceCommand::IsEnabled => println!(
+            "{}",
+            if service::is_enabled()? {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
+    }
+    Ok(())
+}
+
+async fn cmd_storage(force_offline: bool, json: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !force_offline,
+        "Storage usage requires a network connection"
+    );
+    let session = daemon::restore_session(force_offline).await?;
+    let (used, max) = proton_drive_sdk::client::ProtonDriveClient::new(&session, None)?
+        .get_user_storage_info()
+        .await?;
+    if json {
+        println!("{}", serde_json::json!({ "used": used, "max": max }));
+    } else {
+        println!("used: {used} bytes\nmax: {max} bytes");
     }
     Ok(())
 }

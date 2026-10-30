@@ -547,10 +547,21 @@ impl ProtonPhotosClient {
 
     /// Compute the timeline fingerprint for a local plaintext SHA-1 digest.
     pub async fn photo_content_fingerprint(&self, sha1: &[u8]) -> anyhow::Result<Vec<u8>> {
-        anyhow::ensure!(sha1.len() == 20, "invalid photo SHA-1 digest length");
+        let key = self.photo_fingerprint_key().await?;
+        Self::photo_content_fingerprint_with_key(&key, sha1)
+    }
+
+    /// Fetches the key behind [`Self::photo_content_fingerprint`], so callers that
+    /// fingerprint many photos can do it locally with
+    /// [`Self::photo_content_fingerprint_with_key`].
+    pub async fn photo_fingerprint_key(&self) -> anyhow::Result<Vec<u8>> {
         let root = self.get_photos_root_folder().await?;
-        let key = self.get_root_hash_key(&root.base.uid).await?;
-        Self::hash_for_folder(&key, hex::encode(sha1).as_bytes())
+        self.get_root_hash_key(&root.base.uid).await
+    }
+
+    pub fn photo_content_fingerprint_with_key(key: &[u8], sha1: &[u8]) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(sha1.len() == 20, "invalid photo SHA-1 digest length");
+        Self::hash_for_folder(key, hex::encode(sha1).as_bytes())
     }
 
     /// Access the underlying [`ProtonDriveClient`] for operations not yet

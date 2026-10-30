@@ -140,13 +140,12 @@ impl StorageApiClient for DefaultStorageApiClient {
                     });
                 }
                 Err(e) => {
-                    // retry on network errors
-                    if e.is_connect() || e.is_timeout() {
-                        last_err = Some(anyhow::anyhow!(
-                            "network error on attempt {}: {}",
-                            attempt + 1,
-                            e
-                        ));
+                    // Retry on network errors, including connections dropped mid-request.
+                    if e.is_connect() || e.is_timeout() || e.is_request() || e.is_body() {
+                        last_err = Some(
+                            anyhow::Error::new(e)
+                                .context(format!("network error on attempt {}", attempt + 1)),
+                        );
                         continue;
                     }
                     return Err(e.into());

@@ -1,10 +1,14 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::io::{IsTerminal, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use proton_drive_sdk::api::file::photos::AlbumInfo;
+use proton_drive_sdk::error::{is_transient_error, retry_backoff_delay};
 use proton_drive_sdk::links::LinkId;
 use proton_drive_sdk::node::NodeType;
 use proton_drive_sdk::node::file::FileThumbnail;
@@ -23,10 +27,15 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use crate::{
     daemon,
     flags::{PhotoDuplicateStrategy, PhotosCommand},
+    media_preview,
+    photo_cache::{LocalFile, UploadedPhotoCache},
     takeout,
+    transfer_progress::{Labels, Outcome, Stage, TransferProgress},
 };
 
 const MAX_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
+/// Attempts per photo when uploads fail on network or service errors (about four minutes of backoff).
+const IMPORT_ATTEMPTS: u32 = 10;
 
 #[derive(Serialize)]
 struct Photo {
@@ -195,7 +204,7 @@ fn thumbnail_bytes(uid: &NodeUid, item: FileThumbnail) -> anyhow::Result<Vec<u8>
     Ok(bytes)
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct DuplicatePhoto {
     uid: String,
     name: Option<String>,
@@ -336,6 +345,20 @@ impl Drop for ScanProgress {
 
 async fn scan_photo_library(photos: &ProtonPhotosClient) -> anyhow::Result<PhotoIndex> {
     let progress = ScanProgress::new();
+    scan_photo_library_with(photos, |scanned, extra_copies| {
+        progress.draw(&format!(
+            "[{}>{}] Scanning photo hashes… {scanned} checked, {extra_copies} extra copies",
+            "=".repeat((scanned / 500) % 29),
+            " ".repeat(29 - (scanned / 500) % 29),
+        ))
+    })
+    .await
+}
+
+async fn scan_photo_library_with(
+    photos: &ProtonPhotosClient,
+    on_page: impl Fn(usize, usize),
+) -> anyhow::Result<PhotoIndex> {
     let volume = photos.get_photos_volume_id().await?;
     let mut index = PhotoIndex::default();
     let mut cursor = None;
@@ -350,13 +373,7 @@ async fn scan_photo_library(photos: &ProtonPhotosClient) -> anyhow::Result<Photo
                 index.add_hash(&uid, hash);
             }
         }
-        progress.draw(&format!(
-            "[{}>{}] Scanning photo hashes… {} checked, {} extra copies",
-            "=".repeat((index.scanned / 500) % 29),
-            " ".repeat(29 - (index.scanned / 500) % 29),
-            index.scanned,
-            index.extra_copies
-        ));
+        on_page(index.scanned, index.extra_copies);
         let Some(next) = next else { break };
         anyhow::ensure!(
             seen_cursors.insert(next.raw().to_owned()),
@@ -487,6 +504,12 @@ fn skip_duplicate(
     }
 }
 
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 fn supported_photo(path: &Path, include_videos: bool) -> bool {
     let mime = mime_guess::from_path(path)
         .first_or_octet_stream()
@@ -494,15 +517,17 @@ fn supported_photo(path: &Path, include_videos: bool) -> bool {
     mime.starts_with("image/") || (include_videos && mime.starts_with("video/"))
 }
 
+/// Lists photos with their sizes, smallest first, so a few large videos cannot hold up
+/// the many small photos queued behind them.
 async fn local_photo_paths(
     path: &Path,
     include_videos: bool,
-) -> anyhow::Result<Vec<std::path::PathBuf>> {
+) -> anyhow::Result<Vec<(std::path::PathBuf, u64)>> {
     let metadata = tokio::fs::symlink_metadata(path)
         .await
         .context("read import source")?;
     if metadata.is_file() {
-        return Ok(vec![path.to_owned()]);
+        return Ok(vec![(path.to_owned(), metadata.len())]);
     }
     anyhow::ensure!(
         metadata.is_dir(),
@@ -517,12 +542,123 @@ async fn local_photo_paths(
             if kind.is_dir() {
                 directories.push(entry.path());
             } else if kind.is_file() && supported_photo(&entry.path(), include_videos) {
-                paths.push(entry.path());
+                paths.push((entry.path(), entry.metadata().await?.len()));
             }
         }
     }
-    paths.sort();
+    paths.sort_by(|(a_path, a_size), (b_path, b_size)| (a_size, a_path).cmp(&(b_size, b_path)));
     Ok(paths)
+}
+
+/// Serializes imports that share a key while letting different keys run concurrently.
+struct KeyedLocks<K>(Mutex<HashMap<K, Arc<tokio::sync::Mutex<()>>>>);
+
+impl<K: Eq + Hash> KeyedLocks<K> {
+    fn new() -> Self {
+        Self(Mutex::new(HashMap::new()))
+    }
+
+    async fn lock(&self, key: K) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = self.0.lock().unwrap().entry(key).or_default().clone();
+        lock.lock_owned().await
+    }
+}
+
+/// Shared state for concurrent imports into one Photos library.
+/// The Photos root and the key for content fingerprints, fetched once per import.
+struct Library {
+    root: NodeUid,
+    fingerprint_key: Vec<u8>,
+}
+
+struct ImportState {
+    // Scopes the local record of imported files to one account's library.
+    volume: VolumeId,
+    library: tokio::sync::OnceCell<Library>,
+    // Scanned on the first photo the upload cache cannot vouch for.
+    index: tokio::sync::OnceCell<Mutex<PhotoIndex>>,
+    uploaded: Option<Mutex<UploadedPhotoCache>>,
+    // Same-named uploads would race for the same available name.
+    names: KeyedLocks<String>,
+    // Same-content uploads must see each other to apply the duplicate strategy.
+    contents: KeyedLocks<Vec<u8>>,
+    progress: Arc<TransferProgress>,
+}
+
+impl ImportState {
+    async fn library(&self, photos: &ProtonPhotosClient) -> anyhow::Result<&Library> {
+        self.library
+            .get_or_try_init(|| async {
+                Ok(Library {
+                    root: photos.get_photos_root_folder().await?.base.uid,
+                    fingerprint_key: photos.photo_fingerprint_key().await?,
+                })
+            })
+            .await
+    }
+
+    async fn index(&self, photos: &ProtonPhotosClient) -> anyhow::Result<&Mutex<PhotoIndex>> {
+        self.index
+            .get_or_try_init(|| async {
+                let index = scan_photo_library_with(photos, |scanned, _| {
+                    self.progress.status(Some(format!(
+                        "scanning library for duplicates: {scanned} checked"
+                    )))
+                })
+                .await;
+                self.progress.status(None);
+                let index = index?;
+                anyhow::ensure!(
+                    index.unchecked.is_empty(),
+                    "could not check {} photos for duplicates; run pdcli photos duplicates for details",
+                    index.unchecked.len()
+                );
+                Ok(Mutex::new(index))
+            })
+            .await
+    }
+
+    fn cached_upload(&self, fingerprint: &[u8]) -> Option<String> {
+        let cache = self.uploaded.as_ref()?.lock().unwrap();
+        cache
+            .get(fingerprint)
+            .inspect_err(|error| tracing::warn!("photo upload cache lookup failed: {error:#}"))
+            .ok()
+            .flatten()
+    }
+
+    /// Returns the library UID for a local file already imported and unchanged since.
+    fn imported_file(&self, file: &LocalFile) -> Option<String> {
+        let cache = self.uploaded.as_ref()?.lock().unwrap();
+        cache
+            .get_file(self.volume.raw(), file)
+            .inspect_err(|error| tracing::warn!("photo upload cache lookup failed: {error:#}"))
+            .ok()
+            .flatten()
+    }
+
+    fn remember_upload(&self, file: Option<&LocalFile>, fingerprint: &[u8], uid: &str) {
+        let Some(cache) = &self.uploaded else { return };
+        let cache = cache.lock().unwrap();
+        let result = match file {
+            Some(file) => cache.insert_file(self.volume.raw(), file, fingerprint, uid),
+            None => cache.insert(fingerprint, uid),
+        };
+        if let Err(error) = result {
+            tracing::warn!("photo upload cache write failed: {error:#}");
+        }
+    }
+}
+
+fn open_upload_cache(ttl_days: u32) -> Option<Mutex<UploadedPhotoCache>> {
+    if ttl_days == 0 {
+        return None;
+    }
+    let ttl = std::time::Duration::from_secs(u64::from(ttl_days) * 24 * 60 * 60);
+    UploadedPhotoCache::open_default(ttl)
+        .inspect_err(|error| tracing::warn!("photo upload cache unavailable: {error:#}"))
+        .ok()
+        .map(Mutex::new)
 }
 
 async fn import_photos(
@@ -530,6 +666,8 @@ async fn import_photos(
     path: &Path,
     strategy: PhotoDuplicateStrategy,
     include_videos: bool,
+    jobs: usize,
+    cache_ttl_days: u32,
 ) -> anyhow::Result<()> {
     let paths = local_photo_paths(path, include_videos).await?;
     anyhow::ensure!(
@@ -537,48 +675,121 @@ async fn import_photos(
         "no supported photos found in {}",
         path.display()
     );
-    let mut index = scan_photo_library(photos).await?;
-    anyhow::ensure!(
-        index.unchecked.is_empty(),
-        "could not check {} photos for duplicates; run pdcli photos duplicates for details",
-        index.unchecked.len()
-    );
-    let progress = ScanProgress::new();
+    let total_bytes = paths.iter().map(|(_, size)| size).sum();
+    let progress = Arc::new(TransferProgress::new(Labels {
+        verb: "Importing",
+        noun: "photos",
+        done: "uploaded",
+    }));
+    progress.set_totals(paths.len(), total_bytes);
+    let state = ImportState {
+        volume: photos.get_photos_volume_id().await?,
+        library: tokio::sync::OnceCell::new(),
+        index: tokio::sync::OnceCell::new(),
+        uploaded: open_upload_cache(cache_ttl_days),
+        names: KeyedLocks::new(),
+        contents: KeyedLocks::new(),
+        progress: progress.clone(),
+    };
+    let state = &state;
+    let mut pending = paths.iter().enumerate();
+    let mut running = FuturesUnordered::new();
+    let mut finished = 0;
     let mut uploaded = 0;
     let mut skipped = 0;
-    for (number, source) in paths.iter().enumerate() {
-        progress.draw(&format!(
-            "Importing {}/{}: {}",
-            number + 1,
-            paths.len(),
-            source.display()
-        ));
-        match import_photo(photos, source, strategy, &mut index, include_videos).await {
-            Ok(true) => uploaded += 1,
-            Ok(false) => skipped += 1,
+    let mut failed = Vec::new();
+    let mut failure = None;
+    progress.drive(async { loop {
+        // Stop starting new uploads after a permanent failure, but let in-flight ones finish.
+        while failure.is_none() && running.len() < jobs {
+            let Some((id, (source, size))) = pending.next() else {
+                break;
+            };
+            progress.start(id, file_name(source), *size);
+            running.push(async move {
+                let result =
+                    import_photo_with_retries(photos, id, source, strategy, state, include_videos)
+                        .await;
+                (id, source, result)
+            });
+        }
+        let Some((id, source, result)) = running.next().await else {
+            break;
+        };
+        finished += 1;
+        match result {
+            Ok(true) => {
+                uploaded += 1;
+                progress.finish(id, Outcome::Transferred);
+            }
+            Ok(false) => {
+                skipped += 1;
+                progress.finish(id, Outcome::Skipped);
+            }
             Err(error) => {
-                println!(
-                    "{}",
-                    serde_json::json!({"action": "failed", "path": source, "error": format!("{error:#}"), "uploaded": uploaded, "skipped": skipped, "remaining": paths.len() - number - 1})
+                progress.finish(id, Outcome::Failed);
+                progress.event(
+                    serde_json::json!({"action": "failed", "path": source, "error": format!("{error:#}"), "uploaded": uploaded, "skipped": skipped, "remaining": paths.len() - finished}),
                 );
-                return Err(error.context(format!("import {}", source.display())));
+                if is_transient_error(&error) {
+                    // Out of retries on a network problem; the rest of the import can still succeed.
+                    failed.push(source);
+                } else {
+                    failure.get_or_insert(error.context(format!("import {}", source.display())));
+                }
             }
         }
+    }})
+    .await;
+    if let Some(error) = failure {
+        return Err(error);
     }
-    println!(
-        "{}",
-        serde_json::json!({"action": "summary", "total": paths.len(), "uploaded": uploaded, "skipped": skipped})
+    progress.event(
+        serde_json::json!({"action": "summary", "total": paths.len(), "uploaded": uploaded, "skipped": skipped, "failed": failed.len(), "failed_paths": failed}),
+    );
+    anyhow::ensure!(
+        failed.is_empty(),
+        "{} photos failed after {IMPORT_ATTEMPTS} attempts; rerun the import to retry them",
+        failed.len()
     );
     Ok(())
 }
 
-async fn import_photo(
+async fn import_photo_with_retries(
     photos: &ProtonPhotosClient,
+    id: usize,
     path: &Path,
     strategy: PhotoDuplicateStrategy,
-    index: &mut PhotoIndex,
+    state: &ImportState,
     include_videos: bool,
 ) -> anyhow::Result<bool> {
+    let mut attempt = 1;
+    loop {
+        match import_photo(photos, id, path, strategy, state, include_videos).await {
+            Err(error) if attempt < IMPORT_ATTEMPTS && is_transient_error(&error) => {
+                // Start at a few seconds so a dropped connection has time to recover.
+                let delay = retry_backoff_delay(attempt + 3);
+                state.progress.stage(id, Stage::Retrying { attempt });
+                state.progress.event(
+                    serde_json::json!({"action": "retrying", "path": path, "attempt": attempt, "error": format!("{error:#}"), "delay_ms": delay.as_millis()}),
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+async fn import_photo(
+    photos: &ProtonPhotosClient,
+    id: usize,
+    path: &Path,
+    strategy: PhotoDuplicateStrategy,
+    state: &ImportState,
+    include_videos: bool,
+) -> anyhow::Result<bool> {
+    state.progress.stage(id, Stage::Hashing);
     let mut file = tokio::fs::File::open(path)
         .await
         .context("open local photo")?;
@@ -596,6 +807,19 @@ async fn import_photo(
         .filter(|name| !name.is_empty())
         .context("photo name must be valid UTF-8")?
         .to_owned();
+    let local_file = LocalFile::new(path, &metadata);
+    // An unchanged file imported before needs neither reading nor the server.
+    if matches!(strategy, PhotoDuplicateStrategy::Skip)
+        && let Some(uid) = local_file
+            .as_ref()
+            .and_then(|file| state.imported_file(file))
+    {
+        state.progress.event(
+            serde_json::json!({"uid": uid, "duplicate": true, "action": "skipped", "cached": true, "path": path}),
+        );
+        return Ok(false);
+    }
+    let _name_guard = state.names.lock(name.clone()).await;
     let media_type = mime_guess::from_path(path)
         .first_or_octet_stream()
         .to_string();
@@ -606,32 +830,50 @@ async fn import_photo(
     );
 
     let digest = hash_photo(&mut file).await?;
-    let fingerprint = photos.photo_content_fingerprint(&digest).await?;
-    let matches = index
-        .by_hash
-        .get(&fingerprint)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    if skip_duplicate(strategy, matches)? {
-        println!(
-            "{}",
-            serde_json::json!({
-                "uid": matches[0].uid, "duplicate": true, "action": "skipped", "path": path,
-                "matching_uids": matches.iter().map(|item| &item.uid).collect::<Vec<_>>()
-            })
+    state.progress.stage(id, Stage::Checking);
+    let library = state.library(photos).await?;
+    let fingerprint =
+        ProtonPhotosClient::photo_content_fingerprint_with_key(&library.fingerprint_key, &digest)?;
+    let _content_guard = state.contents.lock(fingerprint.clone()).await;
+    if matches!(strategy, PhotoDuplicateStrategy::Skip)
+        && let Some(uid) = state.cached_upload(&fingerprint)
+    {
+        state.remember_upload(local_file.as_ref(), &fingerprint, &uid);
+        state.progress.event(
+            serde_json::json!({"uid": uid, "duplicate": true, "action": "skipped", "cached": true, "path": path}),
         );
         return Ok(false);
     }
+    let index = state.index(photos).await?;
+    let matches = index
+        .lock()
+        .unwrap()
+        .by_hash
+        .get(&fingerprint)
+        .cloned()
+        .unwrap_or_default();
+    if skip_duplicate(strategy, &matches)? {
+        state.remember_upload(local_file.as_ref(), &fingerprint, &matches[0].uid);
+        state.progress.event(serde_json::json!({
+            "uid": matches[0].uid, "duplicate": true, "action": "skipped", "path": path,
+            "matching_uids": matches.iter().map(|item| &item.uid).collect::<Vec<_>>()
+        }));
+        return Ok(false);
+    }
     let duplicate = !matches.is_empty();
-    let root = photos.get_photos_root_folder().await?;
     let name = photos
         .drive()
-        .get_available_name(root.base.uid.clone(), name, NodeType::Photo)
+        .get_available_name(library.root.clone(), name, NodeType::Photo)
         .await?;
     let modified = metadata.modified().ok().map(chrono::DateTime::from);
+    // Without thumbnails and dimensions, Proton Photos shows a blank tile and plays
+    // videos without a picture.
+    let preview = media_preview::generate(path, &media_type, metadata.len()).await;
+    // The SDK admits uploads by block budget, so a large file can wait here.
+    state.progress.stage(id, Stage::Queued);
     let mut uploader = photos
         .get_file_uploader(
-            root.base.uid,
+            library.root.clone(),
             name.clone(),
             media_type,
             size,
@@ -647,15 +889,23 @@ async fn import_photo(
         )
         .await?;
     uploader.set_expected_sha1(digest.to_vec());
+    if let Some(media) = preview.media {
+        uploader.set_media_info(media);
+    }
     file.rewind().await?;
+    state.progress.stage(id, Stage::Uploading);
     let uid = uploader
-        .upload_from_stream(Box::new(file), vec![], Box::new(|_, _| {}))
+        .upload_from_stream(
+            Box::new(file),
+            preview.thumbnails,
+            state.progress.callback(id),
+        )
         .await?;
-    println!(
-        "{}",
-        serde_json::json!({"uid": uid.raw(), "duplicate": duplicate, "action": "uploaded", "name": name, "path": path})
+    state.progress.event(
+        serde_json::json!({"uid": uid.raw(), "duplicate": duplicate, "action": "uploaded", "name": name, "path": path}),
     );
-    index.add_hash(&uid, Some(fingerprint));
+    state.remember_upload(local_file.as_ref(), &fingerprint, &uid.raw());
+    index.lock().unwrap().add_hash(&uid, Some(fingerprint));
     Ok(true)
 }
 
@@ -677,6 +927,8 @@ pub async fn run_cli(force_offline: bool, command: PhotosCommand) -> anyhow::Res
         path,
         duplicate_strategy,
         include_videos,
+        jobs,
+        cache_ttl_days,
     } = command
     {
         anyhow::ensure!(
@@ -689,6 +941,8 @@ pub async fn run_cli(force_offline: bool, command: PhotosCommand) -> anyhow::Res
             &path,
             duplicate_strategy,
             include_videos,
+            usize::from(jobs),
+            cache_ttl_days,
         )
         .await;
     }
@@ -870,7 +1124,95 @@ pub async fn run_cli(force_offline: bool, command: PhotosCommand) -> anyhow::Res
             }
             std::io::stdout().lock().write_all(&bytes)?;
         }
+        PhotosCommand::Download { uid, destination } => {
+            let volume_id = photos.get_photos_volume_id().await?;
+            let uid = photo_uid(&uid, &volume_id)?;
+            // Written beside the destination first, so a failed download never
+            // leaves a truncated photo for a viewer to open.
+            let partial = destination.with_extension("pdcli-partial");
+            let file = std::fs::File::create(&partial)
+                .with_context(|| format!("create {}", partial.display()))?;
+            let download = async {
+                photos
+                    .get_file_downloader(uid.clone())
+                    .await?
+                    .download_to_stream(Box::new(file), Box::new(|_, _| {}))
+                    .completion
+                    .await??;
+                Ok::<_, anyhow::Error>(())
+            };
+            if let Err(error) = download.await {
+                let _ = std::fs::remove_file(&partial);
+                return Err(error);
+            }
+            std::fs::rename(&partial, &destination)?;
+            println!(
+                "{}",
+                serde_json::json!({ "uid": uid.raw(), "path": destination })
+            );
+        }
+        PhotosCommand::Thumbnails => {
+            let volume_id = photos.get_photos_volume_id().await?;
+            let uids = std::io::stdin()
+                .lines()
+                .map(|line| line.map_err(anyhow::Error::from))
+                .filter(|line| line.as_ref().map_or(true, |line| !line.trim().is_empty()))
+                .map(|line| photo_uid(line?.trim(), &volume_id))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            // Small batches let the caller show thumbnails while later ones download.
+            for batch in uids.chunks(THUMBNAIL_BATCH) {
+                let results = match photos
+                    .drive()
+                    .enumerate_thumbnails(batch.to_vec(), ThumbnailType::Thumbnail)
+                    .await
+                {
+                    Ok(stream) => stream.collect::<Vec<_>>().await,
+                    Err(error) => {
+                        for uid in batch {
+                            write_thumbnail(uid, Err(error.to_string()))?;
+                        }
+                        continue;
+                    }
+                };
+                for result in results {
+                    match result {
+                        Ok(item) => {
+                            let uid = item.file_uid.clone();
+                            write_thumbnail(
+                                &uid,
+                                thumbnail_bytes(&uid, item).map_err(|error| error.to_string()),
+                            )?;
+                        }
+                        Err(error) => tracing::warn!(%error, "thumbnail batch item failed"),
+                    }
+                }
+            }
+        }
     }
+    Ok(())
+}
+
+const THUMBNAIL_BATCH: usize = 24;
+
+/// Writes one framed result of `photos thumbnails`.
+fn write_thumbnail(uid: &NodeUid, result: Result<Vec<u8>, String>) -> anyhow::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    match result {
+        Ok(bytes) => {
+            writeln!(
+                stdout,
+                "{}",
+                serde_json::json!({ "uid": uid.raw(), "size": bytes.len() })
+            )?;
+            stdout.write_all(&bytes)?;
+        }
+        Err(error) => writeln!(
+            stdout,
+            "{}",
+            serde_json::json!({ "uid": uid.raw(), "error": error })
+        )?,
+    }
+    stdout.flush()?;
     Ok(())
 }
 
@@ -899,6 +1241,28 @@ mod tests {
         assert_eq!(local_photo_paths(&root, true).await.unwrap().len(), 3);
         assert!(supported_photo(Path::new("photo.JPG"), false));
         assert!(!supported_photo(Path::new("clip.mp4"), false));
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn folder_import_lists_smallest_photos_first() {
+        let root =
+            std::env::temp_dir().join(format!("pdcli-photo-order-{}", rand::random::<u64>()));
+        tokio::fs::create_dir_all(root.join("nested"))
+            .await
+            .unwrap();
+        for (name, size) in [("a.jpg", 30), ("nested/b.jpg", 10), ("c.jpg", 20)] {
+            tokio::fs::write(root.join(name), vec![0; size])
+                .await
+                .unwrap();
+        }
+        let sizes: Vec<u64> = local_photo_paths(&root, false)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, size)| size)
+            .collect();
+        assert_eq!(sizes, [10, 20, 30]);
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
@@ -1218,6 +1582,19 @@ mod tests {
             })
         ));
         assert!(crate::flags::Cli::try_parse_from(["pdcli", "photos", "import"]).is_err());
+        let cli =
+            crate::flags::Cli::try_parse_from(["pdcli", "photos", "import", "path", "-j", "8"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(crate::flags::Command::Photos {
+                command: PhotosCommand::Import { jobs: 8, .. }
+            })
+        ));
+        assert!(
+            crate::flags::Cli::try_parse_from(["pdcli", "photos", "import", "path", "--jobs", "0"])
+                .is_err()
+        );
         assert!(
             crate::flags::Cli::try_parse_from(["pdcli", "photos", "import", "one", "two"]).is_err()
         );

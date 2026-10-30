@@ -92,3 +92,18 @@ impl NodeNameAvailabilityResponse {
         self.base.is_success()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_availability_accepts_pending_drafts_without_client_uid() {
+        let response: NodeNameAvailabilityResponse = serde_json::from_str(
+            r#"{"Code":1000,"AvailableHashes":[],"PendingHashes":[{"Hash":"h","RevisionID":"r","LinkID":"l","ClientUID":null}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(response.unavailable_name_hash_digests[0].client_uid, None);
+    }
+}

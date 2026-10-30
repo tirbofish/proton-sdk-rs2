@@ -38,7 +38,8 @@ impl ThumbnailGenerator {
         size: u32,
         r#type: ThumbnailType,
     ) -> Option<Thumbnail> {
-        let thumb = img.thumbnail(size, size);
+        // JPEG has no alpha channel, so images with one would fail to encode.
+        let thumb = image::DynamicImage::ImageRgb8(img.thumbnail(size, size).to_rgb8());
         let mut buffer = Cursor::new(Vec::new());
         // Use JPEG for thumbnails to keep size small
         if thumb

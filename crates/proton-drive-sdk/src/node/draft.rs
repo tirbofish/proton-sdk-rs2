@@ -37,6 +37,9 @@ pub struct NewRevisionDraftProvider {
 #[async_trait]
 pub trait RevisionDraftProvider: Send + Sync {
     async fn get_draft(&self) -> anyhow::Result<RevisionDraft>;
+
+    /// Removes a draft that will not be committed, so a retry can reuse its name.
+    async fn delete_draft(&self, draft_uid: &RevisionUid) -> anyhow::Result<()>;
 }
 
 async fn membership_address_for(
@@ -160,6 +163,21 @@ impl RevisionDraftProvider for NewFileDraftProvider {
             block_verifier,
         })
     }
+
+    async fn delete_draft(&self, draft_uid: &RevisionUid) -> anyhow::Result<()> {
+        let node_uid = &draft_uid.node_uid;
+        let response = self
+            .client
+            .api()
+            .links()
+            .delete_multiple(node_uid.volume_id.clone(), vec![node_uid.link_id.clone()])
+            .await?;
+        response.base.to_result()?;
+        for pair in &response.responses {
+            pair.response.to_result()?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -207,5 +225,9 @@ impl RevisionDraftProvider for NewRevisionDraftProvider {
             membership_address,
             block_verifier,
         })
+    }
+
+    async fn delete_draft(&self, draft_uid: &RevisionUid) -> anyhow::Result<()> {
+        self.client.delete_revision(draft_uid.clone()).await
     }
 }

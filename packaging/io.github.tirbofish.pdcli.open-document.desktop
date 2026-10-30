@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Proton Docs (pdcli)
+Comment=Open Proton Docs and Sheets in the browser
+Exec=pdcli open-document %f
+Icon=application-vnd.proton.doc
+MimeType=application/vnd.proton.doc;application/vnd.proton.sheet;
+NoDisplay=true
+Categories=Office;

@@ -205,6 +205,22 @@ impl FuseDb {
         .unwrap_or_default()
     }
 
+    /// Names from the mount root down to `ino`, or `None` if the chain is broken.
+    pub fn path_components(&self, mut ino: u64) -> Option<Vec<String>> {
+        let mut names = Vec::new();
+        // Bounded so a corrupt parent cycle cannot loop forever.
+        for _ in 0..4096 {
+            if ino == 1 {
+                names.reverse();
+                return Some(names);
+            }
+            let row = self.get_inode(ino)?;
+            names.push(row.name);
+            ino = row.parent_ino;
+        }
+        None
+    }
+
     pub fn cached_file_inodes(&self) -> Vec<(u64, String)> {
         (|| -> rusqlite::Result<Vec<(u64, String)>> {
             let mut stmt = self.conn.prepare_cached(
@@ -781,7 +797,7 @@ fn sqlcipher_key_literal(key: &[u8]) -> String {
     )
 }
 
-fn apply_sqlcipher_key(conn: &Connection, key: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn apply_sqlcipher_key(conn: &Connection, key: &[u8]) -> anyhow::Result<()> {
     conn.execute_batch(&format!("PRAGMA key = \"{}\";", sqlcipher_key_literal(key)))?;
     Ok(())
 }
@@ -849,6 +865,24 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(sqlite_sidecar(path, "-wal"));
         let _ = std::fs::remove_file(sqlite_sidecar(path, "-shm"));
+    }
+
+    #[test]
+    fn path_components_walk_from_mount_root_to_file() {
+        let db = FuseDb::open_with_key(&temp_db(), &[3u8; 32]).unwrap();
+        let my_files = db.ensure_my_files_root().unwrap();
+        let folder = db
+            .insert_inode(my_files, "Docs", None, None, None, true, 0, "", None, 0)
+            .unwrap();
+        let file = db
+            .insert_inode(folder, "a.txt", None, None, None, false, 1, "", None, 0)
+            .unwrap();
+
+        assert_eq!(
+            db.path_components(file).unwrap(),
+            ["MyFiles", "Docs", "a.txt"]
+        );
+        assert_eq!(db.path_components(1).unwrap(), Vec::<String>::new());
     }
 
     #[test]

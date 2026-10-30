@@ -193,6 +193,36 @@ pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duratio
     value.parse::<u64>().ok().map(Duration::from_secs)
 }
 
+/// Returns whether an error came from a network or service condition that a later retry can clear.
+pub fn is_transient_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(error) = cause.downcast_ref::<reqwest_middleware::Error>() {
+            return error.is_connect()
+                || error.is_timeout()
+                || error.is_request()
+                || error.is_body();
+        }
+        if let Some(error) = cause.downcast_ref::<reqwest::Error>() {
+            return error.is_connect()
+                || error.is_timeout()
+                || error.is_request()
+                || error.is_body();
+        }
+        if let Some(error) = cause.downcast_ref::<HttpTransferError>() {
+            return error.is_retryable();
+        }
+        cause.is::<TooManyRequestsException>()
+            || matches!(
+                cause.downcast_ref::<ProtonDriveError>(),
+                Some(
+                    ProtonDriveError::Connection(_)
+                        | ProtonDriveError::RateLimited(_)
+                        | ProtonDriveError::Server(_)
+                )
+            )
+    })
+}
+
 /// C# RetryPolicy: `2^(attempt-2)` seconds plus up to 250ms jitter.
 pub fn retry_backoff_delay(attempt: u32) -> Duration {
     let exp = 2u64.saturating_pow(attempt.saturating_sub(1).min(6));
@@ -370,5 +400,28 @@ mod tests {
         assert!(!permanent.is_retryable());
         assert!(transient.is_retryable());
         assert!(expired.is_expired_target());
+    }
+
+    #[test]
+    fn transient_errors_are_found_through_context_and_permanent_ones_are_not() {
+        let busy = anyhow::Error::new(HttpTransferError::new(
+            reqwest::StatusCode::BAD_GATEWAY,
+            "busy",
+            None,
+        ))
+        .context("upload block");
+        let rate_limited = anyhow::Error::new(TooManyRequestsException { retry_after: None });
+        let offline = anyhow::Error::new(ProtonDriveError::Connection("offline".into()));
+        let rejected = anyhow::Error::new(HttpTransferError::new(
+            reqwest::StatusCode::FORBIDDEN,
+            "denied",
+            None,
+        ));
+
+        assert!(is_transient_error(&busy));
+        assert!(is_transient_error(&rate_limited));
+        assert!(is_transient_error(&offline));
+        assert!(!is_transient_error(&rejected));
+        assert!(!is_transient_error(&anyhow::anyhow!("checksum mismatch")));
     }
 }

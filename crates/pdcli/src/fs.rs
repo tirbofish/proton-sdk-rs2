@@ -13,7 +13,9 @@ use fuser::{
 };
 use proton_drive_sdk::client::ProtonDriveClient;
 use proton_drive_sdk::node::revision::RevisionUid;
-use proton_drive_sdk::node::{DegradedNode, Node, NodeUid};
+use proton_drive_sdk::node::{
+    DegradedNode, Node, NodeUid, is_proton_document, is_proton_sheet, node_web_url,
+};
 use proton_drive_sdk::proton_sdk_rs2::session::ProtonAPISession;
 use proton_drive_sdk::utils::PotentialObject;
 use sha2::{Digest, Sha256};
@@ -85,6 +87,55 @@ pub fn default_mountpoint() -> anyhow::Result<PathBuf> {
     Ok(dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("failed to resolve home directory"))?
         .join("ProtonDrive"))
+}
+
+/// Extended attribute reporting whether a file's content is on this machine:
+/// `getfattr -n user.pdcli.availability FILE` prints `offline` or `online-only`.
+/// Setting it to either value downloads the file or frees its local copy.
+pub const AVAILABILITY_XATTR: &str = "user.pdcli.availability";
+pub const AVAILABLE_OFFLINE: &str = "offline";
+pub const ONLINE_ONLY: &str = "online-only";
+
+/// Whether the file's content is in the local cache, so opening it needs no download.
+pub fn is_available_offline(row: &InodeRow) -> bool {
+    row.cached_path
+        .as_ref()
+        .is_some_and(|path| std::path::Path::new(path).exists())
+}
+
+/// Proton Docs and Sheets have no file content to download. The mount shows each
+/// as a small read-only shortcut whose JSON names the web editor URL; the
+/// `application/vnd.proton.doc`/`.sheet` MIME definitions match its first bytes,
+/// and `pdcli open-document` opens it.
+pub fn document_shortcut(row: &InodeRow) -> Option<Vec<u8>> {
+    let media_type = Some(row.media_type.as_str());
+    let kind = if is_proton_document(media_type) {
+        "doc"
+    } else if is_proton_sheet(media_type) {
+        "sheet"
+    } else {
+        return None;
+    };
+    let uid = NodeUid::from_parts(row.volume_id.clone()?, row.link_id.clone()?);
+    let url = node_web_url("", &uid, true, media_type);
+    // Fixed key order: the MIME magic matches the opening bytes.
+    Some(
+        format!(
+            "{{\"proton_drive_document\":{},\"url\":{},\"uid\":{}}}\n",
+            serde_json::Value::from(kind),
+            serde_json::Value::from(url),
+            serde_json::Value::from(uid.raw()),
+        )
+        .into_bytes(),
+    )
+}
+
+fn availability(row: &InodeRow) -> &'static str {
+    if is_available_offline(row) {
+        AVAILABLE_OFFLINE
+    } else {
+        ONLINE_ONLY
+    }
 }
 
 pub fn unmount_path(path: &std::path::Path) {
@@ -208,7 +259,13 @@ impl ProtonDriveFs {
         } else {
             FileType::RegularFile
         };
-        let perm = if row.is_dir { 0o755 } else { 0o644 };
+        let perm = if row.is_dir {
+            0o755
+        } else if document_shortcut(row).is_some() {
+            0o444
+        } else {
+            0o644
+        };
         let mtime = UNIX_EPOCH + Duration::from_secs(row.mtime.max(0) as u64);
         let ctime = UNIX_EPOCH + Duration::from_secs(row.ctime.max(0) as u64);
         let nlink = if row.is_dir { 2 } else { 1 };
@@ -237,6 +294,9 @@ impl ProtonDriveFs {
     fn attr_size(&self, row: &InodeRow) -> u64 {
         if row.is_dir {
             return 0;
+        }
+        if let Some(shortcut) = document_shortcut(row) {
+            return shortcut.len() as u64;
         }
 
         row.cached_path
@@ -579,6 +639,44 @@ impl ProtonDriveFs {
                 Err(Some(e.to_string()))
             }
         }
+    }
+
+    /// Drops the local copy of a file that is safely stored in Proton Drive.
+    /// Files with unsynced changes, never uploaded, or open are kept.
+    fn free_up_space(&self, row: &InodeRow) -> Result<(), Errno> {
+        let db = self.db.lock().unwrap();
+        if row.dirty || row.revision_uid.is_none() || db.has_pending_journal(row.ino) {
+            return Err(Errno::EBUSY);
+        }
+        let open = self
+            .open_files
+            .read()
+            .unwrap()
+            .values()
+            .any(|file| file.lock().unwrap().ino == row.ino);
+        if open {
+            return Err(Errno::EBUSY);
+        }
+        let revision_cache = row
+            .revision_uid
+            .as_deref()
+            .map(|revision| self.cache_path_for_revision(revision));
+        for path in row
+            .cached_path
+            .iter()
+            .map(PathBuf::from)
+            .chain(revision_cache)
+        {
+            if let Err(error) = std::fs::remove_file(&path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(error = %error, path = %path.display(), "failed to free cached file");
+                return Err(Errno::EIO);
+            }
+        }
+        db.set_cached_path(row.ino, None).map_err(|_| Errno::EIO)?;
+        tracing::info!(ino = row.ino, name = %row.name, "freed local copy; file is online-only");
+        Ok(())
     }
 
     fn alloc_fh(&self) -> u64 {
@@ -932,6 +1030,19 @@ impl Filesystem for ProtonDriveFs {
     ) {
         let ino_u64: u64 = ino.0;
 
+        if size.is_some() {
+            let shortcut = self
+                .db
+                .lock()
+                .unwrap()
+                .get_inode(ino_u64)
+                .is_some_and(|row| document_shortcut(&row).is_some());
+            if shortcut {
+                reply.error(Errno::EACCES);
+                return;
+            }
+        }
+
         // Handle truncation.
         if let Some(new_size) = size {
             let row_to_enqueue = {
@@ -1044,12 +1155,37 @@ impl Filesystem for ProtonDriveFs {
             return;
         }
 
+        if let Some(shortcut) = document_shortcut(&row) {
+            // Saving over the shortcut would replace the document with its JSON.
+            if !matches!(flags.acc_mode(), OpenAccMode::O_RDONLY) {
+                reply.error(Errno::EACCES);
+                return;
+            }
+            let path = self.cache_dir.join(format!("shortcut-{ino_u64}"));
+            let file = std::fs::write(&path, shortcut).and_then(|_| std::fs::File::open(&path));
+            match file {
+                Ok(file) => {
+                    let fh = self.alloc_fh();
+                    self.open_files.write().unwrap().insert(
+                        fh,
+                        Mutex::new(OpenFile {
+                            ino: ino_u64,
+                            file,
+                            writable: false,
+                        }),
+                    );
+                    reply.opened(FileHandle(fh), FopenFlags::empty());
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to write document shortcut");
+                    reply.error(Errno::EIO);
+                }
+            }
+            return;
+        }
+
         // Block thumbnailer processes from triggering downloads of uncached files.
-        let is_cached = row
-            .cached_path
-            .as_ref()
-            .map(|p| std::path::Path::new(p).exists())
-            .unwrap_or(false);
+        let is_cached = is_available_offline(&row);
         if !is_cached && self.thumb_config.is_blocked_process(req.pid()) {
             tracing::info!(
                 ino = ino_u64, pid = req.pid(), name = %row.name,
@@ -1605,6 +1741,89 @@ impl Filesystem for ProtonDriveFs {
         }
 
         reply.ok();
+    }
+
+    fn getxattr(
+        &self,
+        _req: &Request,
+        ino: fuser::INodeNo,
+        name: &OsStr,
+        size: u32,
+        reply: fuser::ReplyXattr,
+    ) {
+        if name != AVAILABILITY_XATTR {
+            reply.error(Errno::ENODATA);
+            return;
+        }
+        let Some(row) = self.db.lock().unwrap().get_inode(ino.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        if row.is_dir {
+            reply.error(Errno::ENODATA);
+            return;
+        }
+        reply_xattr(reply, size, availability(&row).as_bytes());
+    }
+
+    fn setxattr(
+        &self,
+        _req: &Request,
+        ino: fuser::INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        if name != AVAILABILITY_XATTR {
+            reply.error(Errno::ENOTSUP);
+            return;
+        }
+        let Some(row) = self.db.lock().unwrap().get_inode(ino.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        if row.is_dir {
+            // Folders hold no content; callers apply the value to each file.
+            reply.error(Errno::EISDIR);
+            return;
+        }
+        let result = match value {
+            // Docs and Sheets only exist online; there is nothing to keep or free.
+            _ if document_shortcut(&row).is_some() => {
+                if value == ONLINE_ONLY.as_bytes() {
+                    Ok(())
+                } else {
+                    Err(Errno::ENOTSUP)
+                }
+            }
+            value if value == AVAILABLE_OFFLINE.as_bytes() => match self.ensure_file_cached(&row) {
+                // Local-only files are already on this machine.
+                Ok(_) | Err(None) => Ok(()),
+                Err(Some(_)) if !is_online() => Err(Errno::EHOSTUNREACH),
+                Err(Some(_)) => Err(Errno::EIO),
+            },
+            value if value == ONLINE_ONLY.as_bytes() => self.free_up_space(&row),
+            _ => Err(Errno::EINVAL),
+        };
+        match result {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn listxattr(&self, _req: &Request, ino: fuser::INodeNo, size: u32, reply: fuser::ReplyXattr) {
+        let Some(row) = self.db.lock().unwrap().get_inode(ino.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let names = if row.is_dir {
+            Vec::new()
+        } else {
+            format!("{AVAILABILITY_XATTR}\0").into_bytes()
+        };
+        reply_xattr(reply, size, &names);
     }
 
     fn statfs(&self, _req: &Request, _ino: fuser::INodeNo, reply: ReplyStatfs) {
@@ -2385,6 +2604,9 @@ pub async fn spawn_fuse_session(
     std::fs::create_dir_all(&cache_dir)?;
     let db_path = config_dir.join("fuse.db");
     let mountpoint = default_mountpoint()?;
+    // A mount left by a crashed or killed daemon makes the mountpoint fail
+    // `stat` with ENOTCONN, so clear it before touching the directory.
+    unmount_path(&mountpoint);
     std::fs::create_dir_all(&mountpoint)?;
 
     let db = FuseDb::open(&db_path)?;
@@ -2424,9 +2646,6 @@ pub async fn spawn_fuse_session(
 
     tracing::info!(mount = %mountpoint.display(), "mounting FUSE filesystem");
 
-    // Clean up any stale mount from a previous crash.
-    unmount_path(&mountpoint);
-
     let mut config = Config::default();
     config.mount_options = vec![MountOption::FSName("proton-drive".into())];
     config.n_threads = Some(FUSE_REQUEST_THREADS);
@@ -2439,6 +2658,17 @@ pub async fn spawn_fuse_session(
     let _ = MOUNT_PATH.set(mountpoint);
     tracing::info!("FUSE filesystem mounted successfully");
     Ok(bg)
+}
+
+/// A zero `size` asks only for the value's length.
+fn reply_xattr(reply: fuser::ReplyXattr, size: u32, value: &[u8]) {
+    if size == 0 {
+        reply.size(value.len() as u32);
+    } else if value.len() > size as usize {
+        reply.error(Errno::ERANGE);
+    } else {
+        reply.data(value);
+    }
 }
 
 fn reconcile_cached_file_sizes(db: &FuseDb) {

@@ -196,7 +196,10 @@ pub fn ensure_running(force_offline: bool, enable_tray: bool) -> anyhow::Result<
 
 pub async fn run(force_offline: bool, enable_tray: bool) -> anyhow::Result<()> {
     if is_running() {
-        anyhow::bail!("pdcli daemon is already running");
+        // Exit cleanly so a systemd unit started after the GUI's own daemon
+        // does not enter a restart loop.
+        eprintln!("pdcli daemon is already running");
+        return Ok(());
     }
 
     // An attached `pdcli tray` from an earlier daemon may still own the icon.
@@ -232,7 +235,7 @@ pub async fn run(force_offline: bool, enable_tray: bool) -> anyhow::Result<()> {
 
     tracing::info!(socket = %path.display(), "pdcli daemon ready");
 
-    let mut tray_update_interval = tokio::time::interval(Duration::from_secs(1));
+    let mut tray_update_interval = tokio::time::interval(Duration::from_millis(500));
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
@@ -254,7 +257,7 @@ pub async fn run(force_offline: bool, enable_tray: bool) -> anyhow::Result<()> {
                 }
             }
             _ = tray_update_interval.tick(), if enable_tray => {
-                tray::update_state(tray_handle.as_ref(), daemon_tray_state());
+                tray::update(tray_handle.as_ref(), daemon_tray_state(), transfers.snapshot());
             }
         }
     }
@@ -405,18 +408,20 @@ pub fn attach_tray() -> anyhow::Result<()> {
     verify_daemon_peer()?;
     let _tray = tray::init(&tray_icon_path())();
     while let Some(status) = status() {
-        tray::update_state(
+        tray::update(
             None,
             match status {
                 DaemonStatus::Online => tray::TrayState::Online,
                 DaemonStatus::Offline => tray::TrayState::Offline,
                 DaemonStatus::Paused => tray::TrayState::Paused,
             },
+            active_transfers().unwrap_or_default(),
         );
         for action in tray::poll_events() {
             let result = match action {
                 tray::TrayAction::OpenFolder => open_folder(),
                 tray::TrayAction::ShowHideWindow => Ok(launch_gui(None)),
+                tray::TrayAction::ShowTransfers => Ok(launch_gui(Some("status"))),
                 tray::TrayAction::Account => Ok(launch_gui(Some("account"))),
                 tray::TrayAction::Settings => Ok(launch_gui(Some("settings"))),
                 tray::TrayAction::ToggleSyncPause => request_toggle_pause().map(drop),
@@ -472,6 +477,10 @@ fn handle_tray_action(action: tray::TrayAction) -> bool {
         }
         tray::TrayAction::ShowHideWindow => {
             launch_gui(None);
+            false
+        }
+        tray::TrayAction::ShowTransfers => {
+            launch_gui(Some("status"));
             false
         }
         tray::TrayAction::ToggleSyncPause => {

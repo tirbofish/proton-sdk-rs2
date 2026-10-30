@@ -118,6 +118,11 @@ impl FileUploader {
         self.expected_sha1 = Some(sha1);
     }
 
+    /// Sets the width, height and duration stored in the revision's extended attributes.
+    pub fn set_media_info(&mut self, media_info: crate::api::attr::MediaExtendedAttributes) {
+        self.media_info = Some(media_info);
+    }
+
     pub(crate) fn set_photos_metadata(
         &mut self,
         metadata: PhotosFileUploadMetadata,
@@ -189,8 +194,32 @@ impl FileUploader {
         on_progress: Box<dyn Fn(i64, i64) + Send + Sync>,
     ) -> anyhow::Result<crate::node::NodeUid> {
         let draft = self.revision_draft_provider.get_draft().await?;
-        let node_uid = draft.uid.node_uid.clone();
+        let draft_uid = draft.uid.clone();
+        let mut writer = match self
+            .write_draft(draft, content_stream, thumbnails, on_progress)
+            .await
+        {
+            Ok(writer) => writer,
+            Err(error) => {
+                // An abandoned draft keeps its name taken, so a retry would get a renamed copy.
+                if let Err(cleanup) = self.revision_draft_provider.delete_draft(&draft_uid).await {
+                    tracing::warn!(error = %error, cleanup = %cleanup, "failed to delete upload draft");
+                }
+                return Err(error);
+            }
+        };
+        // A failed commit may still have been applied, so its draft is never deleted.
+        writer.commit().await?;
+        Ok(draft_uid.node_uid)
+    }
 
+    async fn write_draft(
+        &self,
+        draft: crate::node::draft::RevisionDraft,
+        content_stream: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        thumbnails: Vec<crate::node::thumbnail::Thumbnail>,
+        on_progress: Box<dyn Fn(i64, i64) + Send + Sync>,
+    ) -> anyhow::Result<crate::node::revision::RevisionWriter> {
         let on_progress_arc: Arc<dyn Fn(i64, i64) + Send + Sync> = Arc::from(on_progress);
 
         let release_blocks_action = Box::new(|_| {});
@@ -217,8 +246,7 @@ impl FileUploader {
                 Some(self.state_tx.subscribe()),
             )
             .await?;
-        writer.commit().await?;
-        Ok(node_uid)
+        Ok(writer)
     }
 }
 

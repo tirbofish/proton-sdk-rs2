@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use proton_drive_sdk::client::ProtonDriveClient;
-use proton_drive_sdk::node::{DegradedNode, Node, NodeUid};
+use proton_drive_sdk::node::{
+    DegradedNode, Node, NodeUid, is_proton_document, is_proton_sheet, node_web_url,
+};
 use proton_drive_sdk::utils::PotentialObject;
 use serde::Serialize;
 
@@ -22,6 +24,11 @@ struct Item {
     size: Option<i64>,
     degraded: bool,
     error: Option<String>,
+    /// Whether the mount's cache holds the content; `None` for folders and
+    /// files the mount has not seen yet.
+    available_offline: Option<bool>,
+    /// Editor URL for Proton Docs and Sheets, which have no downloadable content.
+    web_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -39,6 +46,25 @@ fn item(node: PotentialObject<Node, DegradedNode>) -> Item {
                 Node::File(file) => ("file", file.active_revision.claimed_size),
                 Node::Photo(file) => ("photo", file.active_revision.claimed_size),
             };
+            let media_type = match &node {
+                Node::File(file) | Node::Photo(file) => Some(file.base.media_type.as_str()),
+                Node::Folder(_) | Node::Album(_) => None,
+            };
+            let (kind, size, web_url) = if is_proton_document(media_type) {
+                (
+                    "document",
+                    None,
+                    Some(node_web_url("", node.uid(), true, media_type)),
+                )
+            } else if is_proton_sheet(media_type) {
+                (
+                    "spreadsheet",
+                    None,
+                    Some(node_web_url("", node.uid(), true, media_type)),
+                )
+            } else {
+                (kind, size, None)
+            };
             Item {
                 uid: node.uid().raw(),
                 name: node.base().name.clone(),
@@ -46,6 +72,8 @@ fn item(node: PotentialObject<Node, DegradedNode>) -> Item {
                 size,
                 degraded: false,
                 error: None,
+                available_offline: None,
+                web_url,
             }
         }
         PotentialObject::Degraded(node) => {
@@ -75,8 +103,27 @@ fn item(node: PotentialObject<Node, DegradedNode>) -> Item {
                         .collect::<Vec<_>>()
                         .join("; "),
                 ),
+                available_offline: None,
+                web_url: None,
             }
         }
+    }
+}
+
+/// Best effort: without the mount's database (never mounted, or locked keyring)
+/// availability stays unknown.
+fn mark_offline_availability(items: &mut [Item]) {
+    let Ok(db) = crate::db::FuseDb::open_default() else {
+        return;
+    };
+    for item in items
+        .iter_mut()
+        .filter(|item| matches!(item.kind, "file" | "photo"))
+    {
+        item.available_offline = Some(
+            db.find_by_node_uid(&item.uid)
+                .is_some_and(|row| crate::fs::is_available_offline(&row)),
+        );
     }
 }
 
@@ -129,13 +176,15 @@ pub async fn run_cli(force_offline: bool, command: BrowseCommand) -> anyhow::Res
                     Some(folder.base.uid.link_id.clone()),
                 )
                 .await?;
+            let mut items: Vec<Item> = children.into_iter().map(item).collect();
+            mark_offline_availability(&mut items);
             let listing = Listing {
                 folder: Folder {
                     uid: folder.base.uid.raw(),
                     name: folder.base.name,
                     parent_uid: folder.base.parent_uid.map(|uid| uid.raw()),
                 },
-                items: children.into_iter().map(item).collect(),
+                items,
             };
             println!("{}", serde_json::to_string(&listing)?);
         }

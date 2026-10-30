@@ -1,14 +1,18 @@
 [Unit]
 Description=pdcli filesystem daemon (unofficial Proton Drive client)
-Wants=network-online.target
-After=network-online.target
+# The daemon reads its session from the desktop Secret Service, which is only
+# reliably available once the graphical session is up.
+PartOf=graphical-session.target
+After=graphical-session.target
+# Keep retrying while the keyring or network is still coming up after login.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/pdcli daemon --no-tray
 Restart=on-failure
-RestartSec=5
+RestartSec=15
 TimeoutStopSec=30
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target

@@ -35,6 +35,11 @@ install -Dpm0755 target/release/pdcli %{buildroot}%{_bindir}/pdcli
 install -Dpm0755 target/release/pdcli-gui %{buildroot}%{_bindir}/pdcli-gui
 install -Dpm0644 packaging/io.github.tirbofish.pdcli.desktop %{buildroot}%{_datadir}/applications/io.github.tirbofish.pdcli.desktop
 install -Dpm0644 packaging/systemd/pdcli.service %{buildroot}%{_prefix}/lib/systemd/user/pdcli.service
+install -Dpm0644 packaging/icons/hicolor/scalable/apps/io.github.tirbofish.pdcli.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/io.github.tirbofish.pdcli.svg
+install -Dpm0644 packaging/io.github.tirbofish.pdcli.open-document.desktop %{buildroot}%{_datadir}/applications/io.github.tirbofish.pdcli.open-document.desktop
+install -Dpm0644 packaging/mime/io.github.tirbofish.pdcli.xml %{buildroot}%{_datadir}/mime/packages/io.github.tirbofish.pdcli.xml
+install -Dpm0644 packaging/icons/hicolor/scalable/mimetypes/application-vnd.proton.doc.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/mimetypes/application-vnd.proton.doc.svg
+install -Dpm0644 packaging/icons/hicolor/scalable/mimetypes/application-vnd.proton.sheet.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/mimetypes/application-vnd.proton.sheet.svg
 
 %files
 %license LICENSE.md
@@ -42,6 +47,11 @@ install -Dpm0644 packaging/systemd/pdcli.service %{buildroot}%{_prefix}/lib/syst
 %{_bindir}/pdcli
 %{_bindir}/pdcli-gui
 %{_datadir}/applications/io.github.tirbofish.pdcli.desktop
+%{_datadir}/icons/hicolor/scalable/apps/io.github.tirbofish.pdcli.svg
+%{_datadir}/applications/io.github.tirbofish.pdcli.open-document.desktop
+%{_datadir}/mime/packages/io.github.tirbofish.pdcli.xml
+%{_datadir}/icons/hicolor/scalable/mimetypes/application-vnd.proton.doc.svg
+%{_datadir}/icons/hicolor/scalable/mimetypes/application-vnd.proton.sheet.svg
 %{_prefix}/lib/systemd/user/pdcli.service
 
 %changelog

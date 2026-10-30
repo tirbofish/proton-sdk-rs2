@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use proton_drive_sdk::api::devices::DeviceType;
@@ -12,7 +13,14 @@ use proton_drive_sdk::proton_sdk_rs2::session::ProtonAPISession;
 use proton_drive_sdk::utils::PotentialObject;
 use serde::{Deserialize, Serialize};
 
+use crate::transfer_progress::{Labels, Outcome, Stage, TransferProgress};
 use crate::{credentials, daemon, flags, fs};
+
+const SYNC_LABELS: Labels = Labels {
+    verb: "Syncing",
+    noun: "files",
+    done: "transferred",
+};
 
 const STATE_FILE: &str = "computers.json";
 
@@ -300,7 +308,8 @@ async fn finish_job(drive: &ProtonDriveClient, job: &SyncJob) -> anyhow::Result<
         daemon::request_retry_sync_now().ok();
         Ok(())
     } else {
-        sync_job(drive, job).await
+        let progress = Arc::new(TransferProgress::new(SYNC_LABELS));
+        progress.drive(sync_job(drive, job, &progress)).await
     }
 }
 
@@ -424,11 +433,17 @@ pub fn unsync(id_or_name: &str) -> anyhow::Result<bool> {
     Ok(removed)
 }
 
-pub async fn sync_job(drive: &ProtonDriveClient, job: &SyncJob) -> anyhow::Result<()> {
+pub async fn sync_job(
+    drive: &ProtonDriveClient,
+    job: &SyncJob,
+    progress: &Arc<TransferProgress>,
+) -> anyhow::Result<()> {
     let local = PathBuf::from(&job.local_path);
     std::fs::create_dir_all(&local)?;
     let remote = NodeUid::parse(&job.remote_uid).map_err(|e| anyhow::anyhow!(e))?;
-    Box::pin(sync_tree(drive, &local, remote)).await
+    let mut plan = Vec::new();
+    Box::pin(plan_tree(drive, &local, remote, &mut plan, progress)).await?;
+    run_plan(drive, plan, progress).await
 }
 
 pub async fn sync_loop(drive: ProtonDriveClient) {
@@ -436,7 +451,8 @@ pub async fn sync_loop(drive: ProtonDriveClient) {
         if fs::is_online() && !fs::is_sync_paused() {
             let jobs = load_state().jobs;
             for job in jobs {
-                if let Err(e) = sync_job(&drive, &job).await {
+                let progress = Arc::new(TransferProgress::hidden(SYNC_LABELS));
+                if let Err(e) = sync_job(&drive, &job, &progress).await {
                     tracing::warn!(
                         job = %job.name,
                         path = %job.local_path,
@@ -521,11 +537,13 @@ async fn child_folder(
     }))
 }
 
+#[derive(Clone)]
 struct RemoteChild {
     name: String,
     uid: NodeUid,
     is_dir: bool,
     mtime: i64,
+    size: u64,
     revision: Option<RevisionUid>,
 }
 
@@ -547,6 +565,7 @@ async fn list_children(
                     uid: folder.base.uid,
                     is_dir: true,
                     mtime: folder.base.creation_time.timestamp(),
+                    size: 0,
                     revision: None,
                 });
             }
@@ -563,6 +582,11 @@ async fn list_children(
                         .claimed_modification_time
                         .map(|t| t.timestamp())
                         .unwrap_or_else(|| file.base.base.creation_time.timestamp()),
+                    size: file
+                        .active_revision
+                        .claimed_size
+                        .unwrap_or(file.total_size_on_cloud_storage)
+                        .max(0) as u64,
                     revision: Some(file.active_revision.uid.clone()),
                 });
             }
@@ -572,7 +596,54 @@ async fn list_children(
     Ok(children)
 }
 
-async fn sync_tree(drive: &ProtonDriveClient, local: &Path, remote: NodeUid) -> anyhow::Result<()> {
+/// A file transfer found while comparing a local folder with its backup.
+enum SyncAction {
+    Upload {
+        parent: NodeUid,
+        path: PathBuf,
+        name: String,
+    },
+    /// Both sides changed and the local copy is newer: keep the remote one as a conflict copy.
+    ReplaceRemote {
+        child: RemoteChild,
+        path: PathBuf,
+    },
+    /// Both sides changed and the remote copy is newer: keep the local one as a conflict copy.
+    ReplaceLocal {
+        child: RemoteChild,
+        path: PathBuf,
+    },
+    Download {
+        child: RemoteChild,
+        path: PathBuf,
+    },
+}
+
+struct PlannedSync {
+    action: SyncAction,
+    // Every byte this action moves, used to order and measure the sync.
+    size: u64,
+}
+
+impl PlannedSync {
+    fn path(&self) -> &Path {
+        match &self.action {
+            SyncAction::Upload { path, .. }
+            | SyncAction::ReplaceRemote { path, .. }
+            | SyncAction::ReplaceLocal { path, .. }
+            | SyncAction::Download { path, .. } => path,
+        }
+    }
+}
+
+/// Creates missing folders on both sides and lists the file transfers still needed.
+async fn plan_tree(
+    drive: &ProtonDriveClient,
+    local: &Path,
+    remote: NodeUid,
+    plan: &mut Vec<PlannedSync>,
+    progress: &TransferProgress,
+) -> anyhow::Result<()> {
     let remote_children = list_children(drive, remote.clone()).await?;
     let by_name: HashMap<String, &RemoteChild> = remote_children
         .iter()
@@ -605,7 +676,10 @@ async fn sync_tree(drive: &ProtonDriveClient, local: &Path, remote: NodeUid) -> 
             let child = match by_name.get(name) {
                 Some(child) if child.is_dir => child.uid.clone(),
                 Some(_) => {
-                    tracing::warn!(path = %path.display(), "skipping local folder; remote is a file");
+                    progress.warn(&format!(
+                        "skipping local folder {}; remote is a file",
+                        path.display()
+                    ));
                     continue;
                 }
                 None => {
@@ -616,36 +690,51 @@ async fn sync_tree(drive: &ProtonDriveClient, local: &Path, remote: NodeUid) -> 
                         .uid
                 }
             };
-            Box::pin(sync_tree(drive, &path, child)).await?;
+            Box::pin(plan_tree(drive, &path, child, plan, progress)).await?;
         } else if file_type.is_file() {
-            match by_name.get(name) {
+            let local_size = entry.metadata()?.len();
+            let planned = match by_name.get(name) {
                 Some(child) if child.is_dir => {
-                    tracing::warn!(path = %path.display(), "skipping local file; remote is a folder");
+                    progress.warn(&format!(
+                        "skipping local file {}; remote is a folder",
+                        path.display()
+                    ));
+                    None
                 }
                 Some(child) => {
                     let local_mtime = file_mtime(&path);
                     if local_mtime > child.mtime {
-                        let conflict = copy_conflict_file(&path, "remote")?;
-                        download_file(drive, child, &conflict).await?;
-                        tracing::warn!(
-                            path = %path.display(),
-                            conflict = %conflict.display(),
-                            "local and remote changed; preserved the remote copy"
-                        );
-                        upload_revision(drive, child, &path).await?;
+                        Some(PlannedSync {
+                            size: child.size + local_size,
+                            action: SyncAction::ReplaceRemote {
+                                child: (*child).clone(),
+                                path,
+                            },
+                        })
                     } else if child.mtime > local_mtime {
-                        let conflict = copy_conflict_file(&path, "local")?;
-                        tracing::warn!(
-                            path = %path.display(),
-                            conflict = %conflict.display(),
-                            "local and remote changed; preserved the local copy"
-                        );
-                        download_file(drive, child, &path).await?;
+                        Some(PlannedSync {
+                            size: child.size,
+                            action: SyncAction::ReplaceLocal {
+                                child: (*child).clone(),
+                                path,
+                            },
+                        })
+                    } else {
+                        None
                     }
                 }
-                None => upload_new(drive, remote.clone(), &path, name).await?,
-            }
+                None => Some(PlannedSync {
+                    size: local_size,
+                    action: SyncAction::Upload {
+                        parent: remote.clone(),
+                        path,
+                        name: name.to_string(),
+                    },
+                }),
+            };
+            plan.extend(planned);
         }
+        progress.status(Some(format!("comparing: {} transfers found", plan.len())));
     }
 
     // ponytail: no deletes. add a recycle confirm if mirroring is required.
@@ -656,10 +745,79 @@ async fn sync_tree(drive: &ProtonDriveClient, local: &Path, remote: NodeUid) -> 
         let dest = local.join(&child.name);
         if child.is_dir {
             std::fs::create_dir_all(&dest)?;
-            Box::pin(sync_tree(drive, &dest, child.uid.clone())).await?;
+            Box::pin(plan_tree(drive, &dest, child.uid.clone(), plan, progress)).await?;
         } else {
-            download_file(drive, child, &dest).await?;
+            plan.push(PlannedSync {
+                size: child.size,
+                action: SyncAction::Download {
+                    child: child.clone(),
+                    path: dest,
+                },
+            });
         }
+    }
+    Ok(())
+}
+
+/// Runs the planned transfers smallest first, stopping at the first failure.
+async fn run_plan(
+    drive: &ProtonDriveClient,
+    mut plan: Vec<PlannedSync>,
+    progress: &Arc<TransferProgress>,
+) -> anyhow::Result<()> {
+    // Stable, so equal sizes keep their folder order.
+    plan.sort_by_key(|item| item.size);
+    progress.status(None);
+    progress.set_totals(plan.len(), plan.iter().map(|item| item.size).sum());
+    for (id, item) in plan.iter().enumerate() {
+        progress.start(id, item.path().display().to_string(), item.size);
+        let result = match &item.action {
+            SyncAction::Upload { parent, path, name } => {
+                upload_new(drive, parent.clone(), path, name, progress, id).await
+            }
+            SyncAction::ReplaceRemote { child, path } => {
+                async {
+                    let conflict = copy_conflict_file(path, "remote")?;
+                    download_file(drive, child, &conflict, progress.callback(id), progress, id)
+                        .await?;
+                    progress.warn(&format!(
+                        "{} changed on both sides; kept the remote copy as {}",
+                        path.display(),
+                        conflict.display()
+                    ));
+                    upload_revision(
+                        drive,
+                        child,
+                        path,
+                        progress.callback_after(id, child.size),
+                        progress,
+                        id,
+                    )
+                    .await
+                }
+                .await
+            }
+            SyncAction::ReplaceLocal { child, path } => {
+                async {
+                    let conflict = copy_conflict_file(path, "local")?;
+                    progress.warn(&format!(
+                        "{} changed on both sides; kept the local copy as {}",
+                        path.display(),
+                        conflict.display()
+                    ));
+                    download_file(drive, child, path, progress.callback(id), progress, id).await
+                }
+                .await
+            }
+            SyncAction::Download { child, path } => {
+                download_file(drive, child, path, progress.callback(id), progress, id).await
+            }
+        };
+        if let Err(error) = result {
+            progress.finish(id, Outcome::Failed);
+            return Err(error.context(format!("sync {}", item.path().display())));
+        }
+        progress.finish(id, Outcome::Transferred);
     }
     Ok(())
 }
@@ -715,6 +873,8 @@ async fn upload_new(
     parent: NodeUid,
     path: &Path,
     name: &str,
+    progress: &Arc<TransferProgress>,
+    id: usize,
 ) -> anyhow::Result<()> {
     let meta = std::fs::metadata(path)?;
     let size = meta.len() as i64;
@@ -736,10 +896,11 @@ async fn upload_new(
         .await?;
     let file = tokio::fs::File::open(path).await?;
     let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(file);
+    progress.stage(id, Stage::Uploading);
     uploader
-        .upload_from_stream(reader, vec![], Box::new(|_, _| {}))
+        .upload_from_stream(reader, vec![], progress.callback(id))
         .await?;
-    tracing::info!(path = %path.display(), "uploaded to computer backup");
+    progress.log(&format!("uploaded {}", path.display()));
     Ok(())
 }
 
@@ -747,9 +908,15 @@ async fn upload_revision(
     drive: &ProtonDriveClient,
     child: &RemoteChild,
     path: &Path,
+    on_progress: Box<dyn Fn(i64, i64) + Send + Sync>,
+    progress: &TransferProgress,
+    id: usize,
 ) -> anyhow::Result<()> {
     let Some(revision) = child.revision.clone() else {
-        tracing::warn!(path = %path.display(), "remote file has no revision; skip");
+        progress.warn(&format!(
+            "remote file {} has no revision; skipped",
+            path.display()
+        ));
         return Ok(());
     };
     let meta = std::fs::metadata(path)?;
@@ -764,10 +931,11 @@ async fn upload_revision(
         .await?;
     let file = tokio::fs::File::open(path).await?;
     let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(file);
+    progress.stage(id, Stage::Uploading);
     uploader
-        .upload_from_stream(reader, vec![], Box::new(|_, _| {}))
+        .upload_from_stream(reader, vec![], on_progress)
         .await?;
-    tracing::info!(path = %path.display(), "updated computer backup");
+    progress.log(&format!("updated {}", path.display()));
     Ok(())
 }
 
@@ -775,18 +943,22 @@ async fn download_file(
     drive: &ProtonDriveClient,
     child: &RemoteChild,
     path: &Path,
+    on_progress: Box<dyn Fn(i64, i64) + Send + Sync>,
+    progress: &TransferProgress,
+    id: usize,
 ) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    progress.stage(id, Stage::Downloading);
     drive
-        .download_to_file(child.uid.clone(), path, Box::new(|_, _| {}))
+        .download_to_file(child.uid.clone(), path, on_progress)
         .await?;
     if child.mtime > 0 {
         let time = filetime::FileTime::from_unix_time(child.mtime, 0);
         let _ = filetime::set_file_mtime(path, time);
     }
-    tracing::info!(path = %path.display(), "restored from computer backup");
+    progress.log(&format!("downloaded {}", path.display()));
     Ok(())
 }
 

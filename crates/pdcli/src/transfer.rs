@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TransferEntry {
     pub id: usize,
     pub filename: String,

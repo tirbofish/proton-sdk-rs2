@@ -53,13 +53,26 @@ pub fn reload() -> anyhow::Result<()> {
 pub fn enable() -> anyhow::Result<()> {
     ensure_linux()?;
     run_systemctl(["daemon-reload"])?;
-    run_systemctl(["enable", "--now", SERVICE_NAME])
+    // `reenable` drops install symlinks from older units that used a
+    // different `WantedBy=` target.
+    run_systemctl(["reenable", SERVICE_NAME])?;
+    run_systemctl(["restart", SERVICE_NAME])
 }
 
 /// Stop and disable the pdcli user service.
 pub fn disable() -> anyhow::Result<()> {
     ensure_linux()?;
     run_systemctl(["disable", "--now", SERVICE_NAME])
+}
+
+/// Whether the user service is enabled to start at login.
+pub fn is_enabled() -> anyhow::Result<bool> {
+    ensure_linux()?;
+    let output = Command::new("systemctl")
+        .args(["--user", "--quiet", "is-enabled", SERVICE_NAME])
+        .output()
+        .context("failed to run systemctl --user; is systemd installed?")?;
+    Ok(output.status.success())
 }
 
 /// Return `systemctl status` output. Inactive services are valid status, so
@@ -131,7 +144,7 @@ fn run_systemctl<const N: usize>(args: [&str; N]) -> anyhow::Result<()> {
 
 fn unit_contents(executable: &Path) -> String {
     format!(
-        "[Unit]\nDescription=pdcli filesystem daemon (unofficial Proton Drive client)\nWants=network-online.target\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={} daemon --no-tray\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=30\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=pdcli filesystem daemon (unofficial Proton Drive client)\nPartOf=graphical-session.target\nAfter=graphical-session.target\nStartLimitIntervalSec=0\n\n[Service]\nType=simple\nExecStart={} daemon --no-tray\nRestart=on-failure\nRestartSec=15\nTimeoutStopSec=30\n\n[Install]\nWantedBy=graphical-session.target\n",
         systemd_quote(executable)
     )
 }
@@ -155,7 +168,8 @@ mod tests {
     fn generated_unit_uses_absolute_executable_and_no_tray() {
         let unit = unit_contents(Path::new("/home/test user/.local/bin/pdcli"));
         assert!(unit.contains("ExecStart=\"/home/test user/.local/bin/pdcli\" daemon --no-tray"));
-        assert!(unit.contains("WantedBy=default.target"));
+        assert!(unit.contains("WantedBy=graphical-session.target"));
+        assert!(unit.contains("StartLimitIntervalSec=0"));
     }
 
     #[test]

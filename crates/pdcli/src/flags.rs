@@ -83,6 +83,21 @@ pub enum Command {
     },
     /// Export My Files to a local directory with a resumable manifest
     Takeout { destination: std::path::PathBuf },
+    /// Show used and total Proton storage
+    Storage {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List files kept on this device, keep files offline, or free up space
+    Offline {
+        #[command(subcommand)]
+        command: OfflineCommand,
+    },
+    /// Open a Proton Docs or Sheets shortcut from the mount in the browser
+    OpenDocument { path: std::path::PathBuf },
+    /// Register the Proton Docs and Sheets file types, icons and opener for this user
+    Integrate,
     /// Manage the systemd user service
     Service {
         #[command(subcommand)]
@@ -145,6 +160,12 @@ pub enum PhotosCommand {
         /// Include video files when recursively importing a folder
         #[arg(long)]
         include_videos: bool,
+        /// Number of photos to upload at the same time
+        #[arg(long, short = 'j', default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=32))]
+        jobs: u8,
+        /// Days to trust the local record of uploaded photos before rechecking the library (0 disables)
+        #[arg(long, default_value_t = 30)]
+        cache_ttl_days: u32,
     },
     /// Scan the entire timeline for exact content duplicates and report JSON
     Duplicates {
@@ -199,6 +220,36 @@ pub enum PhotosCommand {
         /// Request the larger preview image instead of the small thumbnail
         #[arg(long)]
         preview: bool,
+    },
+    /// Stream thumbnails for photo UIDs read from stdin, one per line. Each result is
+    /// a JSON header line, followed by `size` raw image bytes when it succeeded.
+    Thumbnails,
+    /// Download one photo's original file to DESTINATION
+    Download {
+        uid: String,
+        destination: std::path::PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum OfflineCommand {
+    /// List every file with a local copy
+    List {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Download files so they open without a connection (folders apply to every file inside)
+    Keep {
+        /// Paths inside ~/ProtonDrive or node UIDs
+        #[arg(required = true)]
+        targets: Vec<String>,
+    },
+    /// Remove local copies; files stay in Proton Drive and download again when opened
+    Free {
+        /// Paths inside ~/ProtonDrive or node UIDs
+        #[arg(required = true)]
+        targets: Vec<String>,
     },
 }
 
@@ -306,6 +357,8 @@ pub enum ServiceCommand {
     Reload,
     /// Show the user service status
     Status,
+    /// Print `enabled` when the user service starts at login, otherwise `disabled`
+    IsEnabled,
 }
 
 #[derive(Clone, Default)]

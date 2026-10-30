@@ -3,6 +3,6 @@ Type=Application
 Name=pdcli Desktop
 Comment=Unofficial Proton Drive desktop app
 Exec=pdcli gui
-Icon=folder-remote
+Icon=io.github.tirbofish.pdcli
 Categories=Network;
 StartupNotify=true

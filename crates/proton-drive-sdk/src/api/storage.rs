@@ -8,6 +8,13 @@ use tokio::time::sleep;
 
 const MAX_RETRIES: u32 = 3;
 
+/// Bytes of a blob sent so far in the current attempt; restarts at 0 on a retry.
+pub type BlobProgress = std::sync::Arc<dyn Fn(i64) + Send + Sync>;
+
+/// How much of a blob is handed to the connection at a time, which is also how
+/// often upload progress is reported.
+const BLOB_CHUNK_SIZE: usize = 64 * 1024;
+
 #[async_trait]
 pub trait StorageApiClient: Send + Sync {
     async fn upload_blob(
@@ -16,6 +23,20 @@ pub trait StorageApiClient: Send + Sync {
         token: &str,
         data: bytes::Bytes,
     ) -> anyhow::Result<ApiResponse>;
+
+    /// Like `upload_blob`, reporting bytes as they are sent.
+    async fn upload_blob_with_progress(
+        &self,
+        base_url: &str,
+        token: &str,
+        data: bytes::Bytes,
+        on_sent: BlobProgress,
+    ) -> anyhow::Result<ApiResponse> {
+        let len = data.len() as i64;
+        let response = self.upload_blob(base_url, token, data).await?;
+        on_sent(len);
+        Ok(response)
+    }
 
     async fn get_blob_stream(
         &self,
@@ -63,6 +84,24 @@ impl DefaultStorageApiClient {
     }
 }
 
+/// A request body that hands `data` over in chunks, reporting each one as the
+/// connection takes it.
+fn counted_body(data: Bytes, on_sent: BlobProgress) -> reqwest::Body {
+    let chunks = futures::stream::unfold(0usize, move |offset| {
+        let data = data.clone();
+        let on_sent = on_sent.clone();
+        async move {
+            if offset >= data.len() {
+                return None;
+            }
+            let end = (offset + BLOB_CHUNK_SIZE).min(data.len());
+            on_sent(end as i64);
+            Some((Ok::<_, std::io::Error>(data.slice(offset..end)), end))
+        }
+    });
+    reqwest::Body::wrap_stream(chunks)
+}
+
 #[async_trait]
 impl StorageApiClient for DefaultStorageApiClient {
     async fn upload_blob(
@@ -70,6 +109,17 @@ impl StorageApiClient for DefaultStorageApiClient {
         base_url: &str,
         token: &str,
         data: Bytes,
+    ) -> anyhow::Result<ApiResponse> {
+        self.upload_blob_with_progress(base_url, token, data, std::sync::Arc::new(|_| {}))
+            .await
+    }
+
+    async fn upload_blob_with_progress(
+        &self,
+        base_url: &str,
+        token: &str,
+        data: Bytes,
+        on_sent: BlobProgress,
     ) -> anyhow::Result<ApiResponse> {
         let mut last_err = None;
 
@@ -79,9 +129,13 @@ impl StorageApiClient for DefaultStorageApiClient {
                 sleep(delay).await;
             }
 
-            let blob_part = reqwest::multipart::Part::bytes(Vec::<u8>::from(data.clone()))
-                .file_name("blob")
-                .mime_str("application/octet-stream")?;
+            on_sent(0);
+            let blob_part = reqwest::multipart::Part::stream_with_length(
+                counted_body(data.clone(), on_sent.clone()),
+                data.len() as u64,
+            )
+            .file_name("blob")
+            .mime_str("application/octet-stream")?;
 
             let form = reqwest::multipart::Form::new().part("Block", blob_part);
 

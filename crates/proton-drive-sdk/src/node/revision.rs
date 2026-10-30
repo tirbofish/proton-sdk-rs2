@@ -346,6 +346,69 @@ pub struct RevisionWriter {
     photos: Option<PhotoUploadContext>,
 }
 
+/// Upload progress across blocks sent in parallel: finished blocks plus the
+/// share of each in-flight block already sent, in plaintext bytes.
+struct UploadProgress {
+    done: std::sync::atomic::AtomicI64,
+    in_flight: std::sync::Mutex<std::collections::HashMap<i32, i64>>,
+    expected: i64,
+    on_progress: Arc<dyn Fn(i64, i64) + Send + Sync>,
+}
+
+impl UploadProgress {
+    fn block_sent(&self, block: i32, plain_size: i64, sent: i64, encrypted_size: i64) {
+        let share = if encrypted_size > 0 {
+            plain_size * sent.min(encrypted_size) / encrypted_size
+        } else {
+            0
+        };
+        self.in_flight.lock().unwrap().insert(block, share);
+        self.report();
+    }
+
+    fn block_done(&self, block: i32, plain_size: i64) {
+        self.in_flight.lock().unwrap().remove(&block);
+        self.done
+            .fetch_add(plain_size, std::sync::atomic::Ordering::SeqCst);
+        self.report();
+    }
+
+    fn report(&self) {
+        let partial: i64 = self.in_flight.lock().unwrap().values().sum();
+        let mut total = self.done.load(std::sync::atomic::Ordering::SeqCst) + partial;
+        if self.expected > 0 {
+            total = total.min(self.expected);
+        }
+        (self.on_progress)(total, self.expected);
+    }
+}
+
+fn spawn_block_upload(
+    client: Arc<ProtonDriveClient>,
+    draft: RevisionDraft,
+    encrypted_block: crate::block::upload::EncryptedBlock,
+    block_size: i32,
+    progress: Arc<UploadProgress>,
+) -> tokio::task::JoinHandle<anyhow::Result<(i32, BlockUploadResult, i32)>> {
+    tokio::spawn(async move {
+        let block_number = encrypted_block.block_number;
+        let plain_size = encrypted_block.plain_size as i64;
+        let encrypted_size = encrypted_block.encrypted_data.len() as i64;
+        let on_sent: crate::api::storage::BlobProgress = {
+            let progress = progress.clone();
+            Arc::new(move |sent| {
+                progress.block_sent(block_number, plain_size, sent, encrypted_size)
+            })
+        };
+        let result = client
+            .block_uploader()
+            .upload_encrypted_block(&client, &draft, encrypted_block, on_sent)
+            .await?;
+        progress.block_done(block_number, plain_size);
+        Ok((block_number, result, block_size))
+    })
+}
+
 impl RevisionWriter {
     /// Maximum number of blocks being uploaded concurrently.
     /// Matches the TypeScript SDK's MAX_UPLOADING_BLOCKS = 5.
@@ -374,7 +437,12 @@ impl RevisionWriter {
         let (tx, mut rx) = mpsc::channel::<(EncryptedBlock, i32)>(Self::MAX_BUFFERED_BLOCKS);
 
         // Shared state for collecting results
-        let uploaded_bytes = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let progress = Arc::new(UploadProgress {
+            done: std::sync::atomic::AtomicI64::new(0),
+            in_flight: std::sync::Mutex::new(std::collections::HashMap::new()),
+            expected: self.expected_size,
+            on_progress,
+        });
         let block_results: Arc<Mutex<Vec<(i32, BlockUploadResult, i32)>>> =
             Arc::new(Mutex::new(Vec::new()));
 
@@ -453,32 +521,13 @@ impl RevisionWriter {
                 crate::node::download::wait_while_paused(&mut pause_rx).await;
                 match rx.try_recv() {
                     Ok((encrypted_block, block_size)) => {
-                        let block_number = encrypted_block.block_number;
-                        let plain_size = encrypted_block.plain_size;
-
-                        // Spawn upload task
-                        let client = self.client.clone();
-                        let draft = self.draft.clone();
-                        let on_progress = on_progress.clone();
-                        let expected_size = self.expected_size;
-                        let uploaded_bytes = uploaded_bytes.clone();
-
-                        let handle = tokio::spawn(async move {
-                            let result = client
-                                .block_uploader()
-                                .upload_encrypted_block(&client, &draft, encrypted_block)
-                                .await?;
-
-                            // Update progress
-                            let new_total = uploaded_bytes
-                                .fetch_add(plain_size as i64, std::sync::atomic::Ordering::SeqCst)
-                                + plain_size as i64;
-                            on_progress(new_total, expected_size);
-
-                            Ok((block_number, result, block_size))
-                        });
-
-                        upload_futures.push(handle);
+                        upload_futures.push(spawn_block_upload(
+                            self.client.clone(),
+                            self.draft.clone(),
+                            encrypted_block,
+                            block_size,
+                            progress.clone(),
+                        ));
                     }
                     Err(mpsc::error::TryRecvError::Empty) => {
                         // No blocks ready, break to wait for uploads or new blocks
@@ -502,27 +551,13 @@ impl RevisionWriter {
                 // No uploads in progress, wait for producer to send a block
                 match rx.recv().await {
                     Some((encrypted_block, block_size)) => {
-                        let block_number = encrypted_block.block_number;
-                        let plain_size = encrypted_block.plain_size;
-
-                        let client = self.client.clone();
-                        let draft = self.draft.clone();
-                        let on_progress = on_progress.clone();
-                        let expected_size = self.expected_size;
-                        let uploaded_bytes = uploaded_bytes.clone();
-
-                        let handle = tokio::spawn(async move {
-                            let result = client
-                                .block_uploader()
-                                .upload_encrypted_block(&client, &draft, encrypted_block)
-                                .await?;
-                            let new_total = uploaded_bytes
-                                .fetch_add(plain_size as i64, std::sync::atomic::Ordering::SeqCst)
-                                + plain_size as i64;
-                            on_progress(new_total, expected_size);
-                            Ok((block_number, result, block_size))
-                        });
-                        upload_futures.push(handle);
+                        upload_futures.push(spawn_block_upload(
+                            self.client.clone(),
+                            self.draft.clone(),
+                            encrypted_block,
+                            block_size,
+                            progress.clone(),
+                        ));
                     }
                     None => {
                         producer_done = true;
@@ -539,26 +574,13 @@ impl RevisionWriter {
                     block_opt = rx.recv(), if !producer_done && upload_futures.len() < Self::MAX_CONCURRENT_UPLOADS => {
                         match block_opt {
                             Some((encrypted_block, block_size)) => {
-                                let block_number = encrypted_block.block_number;
-                                let plain_size = encrypted_block.plain_size;
-
-                                let client = self.client.clone();
-                                let draft = self.draft.clone();
-                                let on_progress = on_progress.clone();
-                                let expected_size = self.expected_size;
-                                let uploaded_bytes = uploaded_bytes.clone();
-
-                                let handle = tokio::spawn(async move {
-                                    let result = client
-                                        .block_uploader()
-                                        .upload_encrypted_block(&client, &draft, encrypted_block)
-                                        .await?;
-                                    let new_total = uploaded_bytes.fetch_add(plain_size as i64, std::sync::atomic::Ordering::SeqCst)
-                                        + plain_size as i64;
-                                    on_progress(new_total, expected_size);
-                                    Ok((block_number, result, block_size))
-                                });
-                                upload_futures.push(handle);
+                                upload_futures.push(spawn_block_upload(
+                                    self.client.clone(),
+                                    self.draft.clone(),
+                                    encrypted_block,
+                                    block_size,
+                                    progress.clone(),
+                                ));
                             }
                             None => {
                                 producer_done = true;
@@ -807,7 +829,32 @@ impl RevisionWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_contiguous_blocks, next_block_page_start};
+    use super::{UploadProgress, ensure_contiguous_blocks, next_block_page_start};
+    use std::sync::Arc;
+
+    #[test]
+    fn upload_progress_counts_partly_sent_blocks() {
+        let reports = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let progress = UploadProgress {
+            done: std::sync::atomic::AtomicI64::new(0),
+            in_flight: std::sync::Mutex::new(std::collections::HashMap::new()),
+            expected: 300,
+            on_progress: {
+                let reports = reports.clone();
+                Arc::new(move |done, total| reports.lock().unwrap().push((done, total)))
+            },
+        };
+        // Two 150-byte blocks whose encrypted forms are 200 bytes.
+        progress.block_sent(1, 150, 100, 200);
+        progress.block_sent(2, 150, 40, 200);
+        progress.block_done(1, 150);
+        progress.block_sent(2, 150, 400, 200);
+        progress.block_done(2, 150);
+        assert_eq!(
+            *reports.lock().unwrap(),
+            [(75, 300), (105, 300), (180, 300), (300, 300), (300, 300)]
+        );
+    }
     use crate::api::block::BlockDto;
 
     fn blocks(indexes: std::ops::RangeInclusive<i32>) -> Vec<BlockDto> {

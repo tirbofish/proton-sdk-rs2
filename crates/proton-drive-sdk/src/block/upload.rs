@@ -95,12 +95,13 @@ impl BlockUploader {
 
     /// Uploads a pre-encrypted block to storage.
     /// This is the I/O-bound portion.
-    #[tracing::instrument(skip(self, client, draft, encrypted_block))]
+    #[tracing::instrument(skip(self, client, draft, encrypted_block, on_sent))]
     pub async fn upload_encrypted_block(
         &self,
         client: &ProtonDriveClient,
         draft: &RevisionDraft,
         encrypted_block: EncryptedBlock,
+        on_sent: crate::api::storage::BlobProgress,
     ) -> anyhow::Result<BlockUploadResult> {
         let _permit = self.queue.start_block().await?;
         tracing::debug!(
@@ -138,10 +139,11 @@ impl BlockUploader {
         client
             .api()
             .storage()
-            .upload_blob(
+            .upload_blob_with_progress(
                 &target.bare_url,
                 &target.token,
                 encrypted_block.encrypted_data.into(),
+                on_sent,
             )
             .await?;
 

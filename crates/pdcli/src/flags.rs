@@ -94,6 +94,16 @@ pub enum Command {
         #[command(subcommand)]
         command: OfflineCommand,
     },
+    /// List, restore or permanently delete items in the Drive trash
+    Trash {
+        #[command(subcommand)]
+        command: TrashCommand,
+    },
+    /// List, restore, download or delete earlier versions of a file
+    Versions {
+        #[command(subcommand)]
+        command: VersionsCommand,
+    },
     /// Open a Proton Docs or Sheets shortcut from the mount in the browser
     OpenDocument { path: std::path::PathBuf },
     /// Register the Proton Docs and Sheets file types, icons and opener for this user
@@ -246,6 +256,49 @@ pub enum PhotosCommand {
         uid: String,
         destination: std::path::PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+pub enum TrashCommand {
+    /// List trashed items, most recent first
+    List {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Move items back to where they were trashed from
+    Restore {
+        #[arg(required = true)]
+        uids: Vec<String>,
+    },
+    /// Permanently delete items from the trash (cannot be undone)
+    Delete {
+        #[arg(required = true)]
+        uids: Vec<String>,
+    },
+    /// Permanently delete everything in the trash (cannot be undone)
+    Empty,
+}
+
+#[derive(Subcommand)]
+pub enum VersionsCommand {
+    /// List a file's versions, newest first
+    List {
+        /// File node UID
+        node: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Make an earlier version the current one
+    Restore { version: String },
+    /// Save a version's content to DESTINATION
+    Download {
+        version: String,
+        destination: std::path::PathBuf,
+    },
+    /// Permanently delete an earlier version
+    Delete { version: String },
 }
 
 #[derive(Subcommand)]

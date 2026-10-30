@@ -497,6 +497,171 @@ mod desktop {
         })
     }
 
+    /// Pseudo-folder UID for the Drive trash.
+    const TRASH_VIEW: &str = "pdcli:trash";
+
+    fn trash_view() -> Folder {
+        Folder {
+            uid: TRASH_VIEW.into(),
+            name: "Trash".into(),
+        }
+    }
+
+    fn in_trash(trail: &[Folder]) -> bool {
+        trail.last().is_some_and(|folder| folder.uid == TRASH_VIEW)
+    }
+
+    fn load_trash() -> Result<FileListing, String> {
+        #[derive(Deserialize)]
+        struct TrashItem {
+            uid: String,
+            name: String,
+            kind: String,
+            size: Option<i64>,
+        }
+        let text = run_command(&["trash".into(), "list".into(), "--json".into()])?;
+        let items: Vec<TrashItem> =
+            serde_json::from_str(&text).map_err(|e| format!("Invalid trash response: {e}"))?;
+        Ok(FileListing {
+            folder: trash_view(),
+            items: items
+                .into_iter()
+                .map(|item| FileItem {
+                    uid: item.uid,
+                    name: item.name,
+                    kind: item.kind,
+                    size: item.size,
+                    degraded: false,
+                    error: None,
+                    available_offline: None,
+                    web_url: None,
+                })
+                .collect(),
+        })
+    }
+
+    #[derive(Deserialize)]
+    struct VersionItem {
+        uid: String,
+        current: bool,
+        created_at: String,
+        size: Option<i64>,
+    }
+
+    /// Lists a file's versions; earlier ones can be restored or saved elsewhere.
+    fn show_versions(window: &adw::ApplicationWindow, tx: &Sender<Event>, item: &FileItem) {
+        let dialog = adw::Window::builder()
+            .title(format!("Versions of {}", item.name))
+            .transient_for(window)
+            .modal(true)
+            .default_width(520)
+            .default_height(560)
+            .build();
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+        let header = adw::HeaderBar::new();
+        header.set_title_widget(Some(&adw::WindowTitle::new("Version History", &item.name)));
+        content.append(&header);
+        let status = gtk4::Label::new(Some("Loading versions…"));
+        status.add_css_class("dim-label");
+        content.append(&status);
+        let list = boxed_list();
+        list.set_margin_start(12);
+        list.set_margin_end(12);
+        list.set_margin_bottom(12);
+        let scroll = gtk4::ScrolledWindow::new();
+        scroll.set_vexpand(true);
+        scroll.set_child(Some(&list));
+        content.append(&scroll);
+        dialog.set_content(Some(&content));
+        dialog.present();
+
+        let uid = item.uid.clone();
+        let name = item.name.clone();
+        let tx = tx.clone();
+        let task = gtk4::gio::spawn_blocking(move || {
+            run_command(&["versions".into(), "list".into(), uid, "--json".into()]).and_then(
+                |text| {
+                    serde_json::from_str::<Vec<VersionItem>>(&text)
+                        .map_err(|e| format!("Invalid versions response: {e}"))
+                },
+            )
+        });
+        gtk4::glib::spawn_future_local(async move {
+            let versions = match task.await {
+                Ok(Ok(versions)) => versions,
+                Ok(Err(error)) => {
+                    status.set_text(&format!("Could not load versions: {error}"));
+                    return;
+                }
+                Err(_) => return,
+            };
+            status.set_text(&plural(versions.len(), "version", "versions"));
+            for version in versions {
+                let subtitle = match version.size.filter(|size| *size >= 0) {
+                    Some(size) => gtk4::glib::format_size(size as u64).to_string(),
+                    None => String::new(),
+                };
+                let row = info_row(&capture_label(&version.created_at), &subtitle);
+                if version.current {
+                    let current = gtk4::Label::new(Some("Current"));
+                    current.add_css_class("dim-label");
+                    row.add_suffix(&current);
+                } else {
+                    let restore = button("Restore", {
+                        let tx = tx.clone();
+                        let dialog = dialog.clone();
+                        let version = version.uid.clone();
+                        move || {
+                            command(
+                                &tx,
+                                "Files restore version",
+                                vec!["versions".into(), "restore".into(), version.clone()],
+                            );
+                            dialog.close();
+                        }
+                    });
+                    row.add_suffix(&restore);
+                }
+                let save = icon_button("document-save-symbolic", "Save a Copy…", {
+                    let tx = tx.clone();
+                    let dialog = dialog.clone();
+                    let version = version.uid.clone();
+                    let name = name.clone();
+                    move || {
+                        let chooser = gtk4::FileChooserNative::builder()
+                            .title("Save Version As")
+                            .action(gtk4::FileChooserAction::Save)
+                            .transient_for(&dialog)
+                            .build();
+                        chooser.set_current_name(&name);
+                        let tx = tx.clone();
+                        let version = version.clone();
+                        chooser.connect_response(move |chooser, response| {
+                            if response == gtk4::ResponseType::Accept
+                                && let Some(path) = chooser.file().and_then(|file| file.path())
+                            {
+                                command(
+                                    &tx,
+                                    "Files save version",
+                                    vec![
+                                        "versions".into(),
+                                        "download".into(),
+                                        version.clone(),
+                                        path.to_string_lossy().into_owned(),
+                                    ],
+                                );
+                            }
+                            chooser.destroy();
+                        });
+                        chooser.show();
+                    }
+                });
+                row.add_suffix(&save);
+                list.append(&row);
+            }
+        });
+    }
+
     fn load_files(tx: &Sender<Event>, state: &Rc<RefCell<FilesState>>, trail: Vec<Folder>) {
         let mut state = state.borrow_mut();
         state.request += 1;
@@ -509,6 +674,10 @@ mod desktop {
                 .is_some_and(|folder| folder.uid == OFFLINE_VIEW)
             {
                 let _ = tx.send(Event::Files(request, trail, load_offline_files()));
+                return;
+            }
+            if in_trash(&trail) {
+                let _ = tx.send(Event::Files(request, trail, load_trash()));
                 return;
             }
             let mut args = vec!["browse".into(), "list".into()];
@@ -1259,6 +1428,48 @@ mod desktop {
                 load_files(&tx, &state, trail);
             }
         });
+        let trash_toggle = gtk4::ToggleButton::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Show Trash")
+            .css_classes(["flat"])
+            .build();
+        trash_toggle.connect_clicked({
+            let state = files_state.clone();
+            let tx = tx.clone();
+            let status = files_status.clone();
+            move |button| {
+                status.set_text("Loading files…");
+                let trail = if button.is_active() {
+                    vec![trash_view()]
+                } else {
+                    Vec::new()
+                };
+                load_files(&tx, &state, trail);
+            }
+        });
+        let empty_trash = icon_button("edit-clear-all-symbolic", "Empty Trash", {
+            let tx = tx.clone();
+            let window = window.clone();
+            move || {
+                let tx = tx.clone();
+                confirm_dialog(
+                    &window,
+                    "Empty Trash?",
+                    "Everything in the trash will be permanently deleted. This cannot be undone.",
+                    "Empty Trash",
+                    move || {
+                        command(
+                            &tx,
+                            "Files empty trash",
+                            vec!["trash".into(), "empty".into()],
+                        )
+                    },
+                );
+            }
+        });
+        empty_trash.set_visible(false);
+        files_end.append(&empty_trash);
+        files_end.append(&trash_toggle);
         files_end.append(&offline_filter);
         files_end.append(&create);
         files_end.append(&files_refresh);
@@ -1653,6 +1864,58 @@ mod desktop {
                 }
             });
         }
+        let restore_trashed = gtk4::gio::SimpleAction::new("restore", None);
+        restore_trashed.connect_activate({
+            let state = files_state.clone();
+            let tx = tx.clone();
+            move |_, _| {
+                if let Some(item) = state.borrow().selected.as_ref() {
+                    command(
+                        &tx,
+                        "Files restore",
+                        vec!["trash".into(), "restore".into(), item.uid.clone()],
+                    );
+                }
+            }
+        });
+        let delete_forever = gtk4::gio::SimpleAction::new("delete-forever", None);
+        delete_forever.connect_activate({
+            let state = files_state.clone();
+            let tx = tx.clone();
+            let window = window.clone();
+            move |_, _| {
+                if let Some(item) = state.borrow().selected.clone() {
+                    let tx = tx.clone();
+                    confirm_dialog(
+                        &window,
+                        "Delete Permanently?",
+                        &format!(
+                            "“{}” will be deleted forever. This cannot be undone.",
+                            item.name
+                        ),
+                        "Delete",
+                        move || {
+                            command(
+                                &tx,
+                                "Files delete permanently",
+                                vec!["trash".into(), "delete".into(), item.uid.clone()],
+                            );
+                        },
+                    );
+                }
+            }
+        });
+        let versions = gtk4::gio::SimpleAction::new("versions", None);
+        versions.connect_activate({
+            let state = files_state.clone();
+            let tx = tx.clone();
+            let window = window.clone();
+            move |_, _| {
+                if let Some(item) = state.borrow().selected.as_ref() {
+                    show_versions(&window, &tx, item);
+                }
+            }
+        });
         for action in [
             &open_folder,
             &rename,
@@ -1661,6 +1924,9 @@ mod desktop {
             &trash,
             &keep_offline,
             &free_space,
+            &restore_trashed,
+            &delete_forever,
+            &versions,
         ] {
             action.set_enabled(false);
             file_actions.add_action(action);
@@ -1674,6 +1940,7 @@ mod desktop {
         edit_section.append(Some("Rename…"), Some("file.rename"));
         edit_section.append(Some("Share…"), Some("file.share"));
         edit_section.append(Some("Copy Web Link"), Some("file.web-link"));
+        edit_section.append(Some("Version History…"), Some("file.versions"));
         file_menu_model.append_section(None, &edit_section);
         let availability_section = gtk4::gio::Menu::new();
         availability_section.append(
@@ -1684,6 +1951,8 @@ mod desktop {
         file_menu_model.append_section(None, &availability_section);
         let trash_section = gtk4::gio::Menu::new();
         trash_section.append(Some("Move to Trash"), Some("file.trash"));
+        trash_section.append(Some("Restore"), Some("file.restore"));
+        trash_section.append(Some("Delete Permanently…"), Some("file.delete-forever"));
         file_menu_model.append_section(None, &trash_section);
         let file_menu = gtk4::PopoverMenu::from_model(Some(&file_menu_model));
         file_menu.set_has_arrow(false);
@@ -1743,9 +2012,22 @@ mod desktop {
             let web = web.clone();
             let keep_offline = keep_offline.clone();
             let free_space = free_space.clone();
+            let restore_trashed = restore_trashed.clone();
+            let delete_forever = delete_forever.clone();
+            let versions = versions.clone();
             move |_, row| {
                 let selected =
                     row.and_then(|row| state.borrow().items.get(row.index() as usize).cloned());
+                // Trashed items can only be restored or deleted.
+                let trashed = in_trash(&state.borrow().trail);
+                restore_trashed.set_enabled(trashed && selected.is_some());
+                delete_forever.set_enabled(trashed && selected.is_some());
+                let row_item = selected.clone();
+                let selected_live = selected.filter(|_| !trashed);
+                versions.set_enabled(selected_live.as_ref().is_some_and(|item| {
+                    !item.degraded && item.web_url.is_none() && item.kind == "file"
+                }));
+                let selected = selected_live;
                 let mutable = selected.as_ref().is_some_and(|item| !item.degraded);
                 // Docs and Sheets have no local copy to keep or free.
                 let downloadable =
@@ -1770,7 +2052,7 @@ mod desktop {
                 share.set_enabled(selected.is_some());
                 trash.set_enabled(mutable);
                 web.set_enabled(selected.is_some());
-                state.borrow_mut().selected = selected;
+                state.borrow_mut().selected = row_item;
             }
         });
         files_list.connect_row_activated({
@@ -2595,6 +2877,9 @@ mod desktop {
                                     &trash,
                                     &keep_offline,
                                     &free_space,
+                                    &restore_trashed,
+                                    &delete_forever,
+                                    &versions,
                                 ] {
                                     action.set_enabled(false);
                                 }
@@ -2672,12 +2957,19 @@ mod desktop {
                                     .trail
                                     .last()
                                     .is_some_and(|folder| folder.uid == OFFLINE_VIEW);
+                                let trashed = in_trash(&files_state.borrow().trail);
                                 if offline_only && count == 0 {
                                     files_status.set_text("No files are kept on this device.");
                                 }
+                                if trashed && count == 0 {
+                                    files_status.set_text("The trash is empty.");
+                                }
                                 offline_filter.set_active(offline_only);
+                                trash_toggle.set_active(trashed);
+                                empty_trash.set_visible(trashed);
+                                empty_trash.set_sensitive(count > 0);
                                 back.set_sensitive(files_state.borrow().trail.len() > 1);
-                                create.set_sensitive(!offline_only);
+                                create.set_sensitive(!offline_only && !trashed);
                                 files_refresh.set_sensitive(true);
                             }
                             Err(error) => {
@@ -3143,6 +3435,10 @@ mod desktop {
                                             | "Files trash"
                                             | "Files keep offline"
                                             | "Files free up space"
+                                            | "Files restore"
+                                            | "Files delete permanently"
+                                            | "Files empty trash"
+                                            | "Files restore version"
                                     )
                                 {
                                     files_status.set_text("Loading files…");

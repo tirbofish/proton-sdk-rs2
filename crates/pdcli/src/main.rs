@@ -28,8 +28,10 @@ mod takeout;
 mod thumbnail;
 mod transfer;
 mod transfer_progress;
+mod trash;
 mod tray;
 mod version;
+mod versions;
 
 fn main() {
     // ponytail: ML-DSA key parsing overflows default worker stacks; revisit when upstream reduces stack use.
@@ -117,6 +119,10 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Browse { command }) => browser::run_cli(flags.force_offline, command).await,
         Some(Command::Photos { command }) => photos::run_cli(flags.force_offline, command).await,
         Some(Command::Offline { command }) => offline::run_cli(flags.force_offline, command).await,
+        Some(Command::Trash { command }) => trash::run_cli(flags.force_offline, command).await,
+        Some(Command::Versions { command }) => {
+            versions::run_cli(flags.force_offline, command).await
+        }
         Some(Command::OpenDocument { path }) => shortcuts::open(&path),
         Some(Command::Integrate) => shortcuts::install(),
         Some(Command::Tray) => daemon::attach_tray(),

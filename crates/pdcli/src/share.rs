@@ -1,10 +1,12 @@
 use proton_drive_sdk::api::share::{AbuseCategory, MemberRole};
-use proton_drive_sdk::node::NodeUid;
 use proton_drive_sdk::node::revision::RevisionUid;
+use proton_drive_sdk::node::{DegradedNode, Node, NodeUid};
 use proton_drive_sdk::sharing::{
     ReportDirectShareAbuseSettings, ShareNodeSettings, ShareUrlSettings, ShareUser,
     UnshareNodeSettings,
 };
+use proton_drive_sdk::utils::PotentialObject;
+use serde::Serialize;
 use tokio::io::AsyncReadExt;
 
 use crate::{daemon, flags::ShareCommand};
@@ -107,6 +109,57 @@ pub async fn run_cli(force_offline: bool, command: ShareCommand) -> anyhow::Resu
                 .await?;
             println!("public link removed");
         }
+        ShareCommand::WithMe { json } => {
+            print_shared(drive.enumerate_shared_nodes_with_me().await?, json)?;
+        }
+        ShareCommand::ByMe { json } => {
+            print_shared(drive.enumerate_shared_nodes().await?, json)?;
+        }
+        ShareCommand::Invitations { json } => {
+            let invitations: Vec<Invitation> = drive
+                .iterate_invitations()
+                .await?
+                .into_iter()
+                .map(|entry| Invitation {
+                    uid: entry.invitation.uid,
+                    node: entry.node_uid.to_string(),
+                    name: entry.node_name,
+                    invited_by: entry.invitation.added_by_email,
+                    role: role_name(entry.invitation.role),
+                    invited_at: entry
+                        .invitation
+                        .invitation_time
+                        .map(|time| time.to_rfc3339()),
+                })
+                .collect();
+            if json {
+                println!("{}", serde_json::to_string(&invitations)?);
+            } else if invitations.is_empty() {
+                println!("no pending invitations");
+            } else {
+                for invitation in invitations {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        invitation.name.as_deref().unwrap_or("-"),
+                        invitation.invited_by,
+                        invitation.role,
+                        invitation.uid
+                    );
+                }
+            }
+        }
+        ShareCommand::Accept { invitation } => {
+            drive.accept_invitation(&invitation).await?;
+            println!("invitation accepted");
+        }
+        ShareCommand::Reject { invitation } => {
+            drive.reject_invitation(&invitation).await?;
+            println!("invitation declined");
+        }
+        ShareCommand::Leave { node } => {
+            drive.leave_shared_node(parse_node(&node)?).await?;
+            println!("left shared item");
+        }
         ShareCommand::Invite { node, email, role } => {
             anyhow::ensure!(!email.trim().is_empty(), "email is required");
             drive
@@ -178,6 +231,77 @@ pub async fn run_cli(force_offline: bool, command: ShareCommand) -> anyhow::Resu
     Ok(())
 }
 
+#[derive(Serialize)]
+struct SharedItem {
+    uid: String,
+    name: String,
+    kind: &'static str,
+}
+
+#[derive(Serialize)]
+struct Invitation {
+    uid: String,
+    node: String,
+    name: Option<String>,
+    invited_by: String,
+    role: &'static str,
+    invited_at: Option<String>,
+}
+
+fn role_name(role: MemberRole) -> &'static str {
+    match role {
+        MemberRole::Viewer => "viewer",
+        MemberRole::Editor => "editor",
+        MemberRole::Admin => "admin",
+    }
+}
+
+fn shared_item(node: PotentialObject<Node, DegradedNode>) -> SharedItem {
+    match node {
+        PotentialObject::Node(node) => SharedItem {
+            uid: node.uid().raw(),
+            name: node.base().name.clone(),
+            kind: match &node {
+                Node::Folder(_) => "folder",
+                Node::Album(_) => "album",
+                Node::File(_) => "file",
+                Node::Photo(_) => "photo",
+            },
+        },
+        PotentialObject::Degraded(node) => {
+            let (kind, base) = match &node {
+                DegradedNode::Folder(folder) => ("folder", &folder.base),
+                DegradedNode::Album(folder) => ("album", &folder.base),
+                DegradedNode::File(file) => ("file", &file.base),
+                DegradedNode::Photo(file) => ("photo", &file.base),
+            };
+            SharedItem {
+                uid: node.uid().raw(),
+                name: match &base.name {
+                    PotentialObject::Node(name) => name.clone(),
+                    PotentialObject::Degraded(_) => "Unable to decrypt name".into(),
+                },
+                kind,
+            }
+        }
+    }
+}
+
+fn print_shared(nodes: Vec<PotentialObject<Node, DegradedNode>>, json: bool) -> anyhow::Result<()> {
+    let mut items: Vec<SharedItem> = nodes.into_iter().map(shared_item).collect();
+    items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    if json {
+        println!("{}", serde_json::to_string(&items)?);
+    } else if items.is_empty() {
+        println!("nothing shared");
+    } else {
+        for item in items {
+            println!("{}\t{}\t{}", item.kind, item.name, item.uid);
+        }
+    }
+    Ok(())
+}
+
 fn empty_to_none(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         let trimmed = value.trim();
@@ -205,6 +329,30 @@ fn parse_role(value: &str) -> anyhow::Result<MemberRole> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn shared_item_commands_parse() {
+        for (args, expected) in [
+            (vec!["share", "with-me", "--json"], "with-me"),
+            (vec!["share", "by-me"], "by-me"),
+            (vec!["share", "accept", "invite-id"], "accept"),
+            (vec!["share", "leave", "volume~node"], "leave"),
+        ] {
+            let cli =
+                crate::flags::Cli::try_parse_from(std::iter::once("pdcli").chain(args)).unwrap();
+            let Some(crate::flags::Command::Share { command }) = cli.command else {
+                panic!("not a share command");
+            };
+            let parsed = match command {
+                ShareCommand::WithMe { json: true } => "with-me",
+                ShareCommand::ByMe { json: false } => "by-me",
+                ShareCommand::Accept { invitation } if invitation == "invite-id" => "accept",
+                ShareCommand::Leave { node } if node == "volume~node" => "leave",
+                _ => "other",
+            };
+            assert_eq!(parsed, expected);
+        }
+    }
 
     #[test]
     fn sharing_commands_parse_without_exposing_password_on_argv() {

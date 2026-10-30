@@ -63,6 +63,9 @@ mod desktop {
         available_offline: Option<bool>,
         #[serde(default)]
         web_url: Option<String>,
+        /// Set in the Shared view: "with you" or "by you".
+        #[serde(skip)]
+        shared: Option<&'static str>,
     }
 
     #[derive(Deserialize)]
@@ -491,6 +494,7 @@ mod desktop {
                         error: None,
                         available_offline: Some(true),
                         web_url: None,
+                        shared: None,
                     })
                 })
                 .collect(),
@@ -535,8 +539,49 @@ mod desktop {
                     error: None,
                     available_offline: None,
                     web_url: None,
+                    shared: None,
                 })
                 .collect(),
+        })
+    }
+
+    /// Pseudo-folder UID for items shared with or by this account.
+    const SHARED_VIEW: &str = "pdcli:shared";
+
+    fn shared_view() -> Folder {
+        Folder {
+            uid: SHARED_VIEW.into(),
+            name: "Shared".into(),
+        }
+    }
+
+    fn load_shared() -> Result<FileListing, String> {
+        #[derive(Deserialize)]
+        struct SharedItem {
+            uid: String,
+            name: String,
+            kind: String,
+        }
+        let mut items = Vec::new();
+        for (subcommand, shared) in [("with-me", "with you"), ("by-me", "by you")] {
+            let text = run_command(&["share".into(), subcommand.into(), "--json".into()])?;
+            let listed: Vec<SharedItem> = serde_json::from_str(&text)
+                .map_err(|e| format!("Invalid shared items response: {e}"))?;
+            items.extend(listed.into_iter().map(|item| FileItem {
+                uid: item.uid,
+                name: item.name,
+                kind: item.kind,
+                size: None,
+                degraded: false,
+                error: None,
+                available_offline: None,
+                web_url: None,
+                shared: Some(shared),
+            }));
+        }
+        Ok(FileListing {
+            folder: shared_view(),
+            items,
         })
     }
 
@@ -678,6 +723,10 @@ mod desktop {
             }
             if in_trash(&trail) {
                 let _ = tx.send(Event::Files(request, trail, load_trash()));
+                return;
+            }
+            if trail.last().is_some_and(|folder| folder.uid == SHARED_VIEW) {
+                let _ = tx.send(Event::Files(request, trail, load_shared()));
                 return;
             }
             let mut args = vec!["browse".into(), "list".into()];
@@ -1447,6 +1496,25 @@ mod desktop {
                 load_files(&tx, &state, trail);
             }
         });
+        let shared_toggle = gtk4::ToggleButton::builder()
+            .icon_name("folder-publicshare-symbolic")
+            .tooltip_text("Show Shared Items")
+            .css_classes(["flat"])
+            .build();
+        shared_toggle.connect_clicked({
+            let state = files_state.clone();
+            let tx = tx.clone();
+            let status = files_status.clone();
+            move |button| {
+                status.set_text("Loading files…");
+                let trail = if button.is_active() {
+                    vec![shared_view()]
+                } else {
+                    Vec::new()
+                };
+                load_files(&tx, &state, trail);
+            }
+        });
         let empty_trash = icon_button("edit-clear-all-symbolic", "Empty Trash", {
             let tx = tx.clone();
             let window = window.clone();
@@ -1470,6 +1538,7 @@ mod desktop {
         empty_trash.set_visible(false);
         files_end.append(&empty_trash);
         files_end.append(&trash_toggle);
+        files_end.append(&shared_toggle);
         files_end.append(&offline_filter);
         files_end.append(&create);
         files_end.append(&files_refresh);
@@ -1905,6 +1974,33 @@ mod desktop {
                 }
             }
         });
+        let leave_shared = gtk4::gio::SimpleAction::new("leave-shared", None);
+        leave_shared.connect_activate({
+            let state = files_state.clone();
+            let tx = tx.clone();
+            let window = window.clone();
+            move |_, _| {
+                if let Some(item) = state.borrow().selected.clone() {
+                    let tx = tx.clone();
+                    confirm_dialog(
+                        &window,
+                        "Leave Shared Item?",
+                        &format!(
+                            "You will lose access to “{}” until its owner invites you again.",
+                            item.name
+                        ),
+                        "Leave",
+                        move || {
+                            command(
+                                &tx,
+                                "Files leave shared",
+                                vec!["share".into(), "leave".into(), item.uid.clone()],
+                            );
+                        },
+                    );
+                }
+            }
+        });
         let versions = gtk4::gio::SimpleAction::new("versions", None);
         versions.connect_activate({
             let state = files_state.clone();
@@ -1926,6 +2022,7 @@ mod desktop {
             &free_space,
             &restore_trashed,
             &delete_forever,
+            &leave_shared,
             &versions,
         ] {
             action.set_enabled(false);
@@ -1953,6 +2050,7 @@ mod desktop {
         trash_section.append(Some("Move to Trash"), Some("file.trash"));
         trash_section.append(Some("Restore"), Some("file.restore"));
         trash_section.append(Some("Delete Permanently…"), Some("file.delete-forever"));
+        trash_section.append(Some("Leave…"), Some("file.leave-shared"));
         file_menu_model.append_section(None, &trash_section);
         let file_menu = gtk4::PopoverMenu::from_model(Some(&file_menu_model));
         file_menu.set_has_arrow(false);
@@ -2014,6 +2112,7 @@ mod desktop {
             let free_space = free_space.clone();
             let restore_trashed = restore_trashed.clone();
             let delete_forever = delete_forever.clone();
+            let leave_shared = leave_shared.clone();
             let versions = versions.clone();
             move |_, row| {
                 let selected =
@@ -2022,6 +2121,11 @@ mod desktop {
                 let trashed = in_trash(&state.borrow().trail);
                 restore_trashed.set_enabled(trashed && selected.is_some());
                 delete_forever.set_enabled(trashed && selected.is_some());
+                leave_shared.set_enabled(
+                    selected
+                        .as_ref()
+                        .is_some_and(|item| item.shared == Some("with you")),
+                );
                 let row_item = selected.clone();
                 let selected_live = selected.filter(|_| !trashed);
                 versions.set_enabled(selected_live.as_ref().is_some_and(|item| {
@@ -2879,6 +2983,7 @@ mod desktop {
                                     &free_space,
                                     &restore_trashed,
                                     &delete_forever,
+                                    &leave_shared,
                                     &versions,
                                 ] {
                                     action.set_enabled(false);
@@ -2890,6 +2995,8 @@ mod desktop {
                                             || "Unavailable".to_string(),
                                             |error| format!("Unavailable: {error}"),
                                         )
+                                    } else if let Some(shared) = item.shared {
+                                        format!("{}, shared {shared}", capitalized(&item.kind))
                                     } else if let Some(size) = item.size.filter(|size| *size >= 0) {
                                         gtk4::glib::format_size(size as u64).to_string()
                                     } else {
@@ -2958,6 +3065,19 @@ mod desktop {
                                     .last()
                                     .is_some_and(|folder| folder.uid == OFFLINE_VIEW);
                                 let trashed = in_trash(&files_state.borrow().trail);
+                                let shared_root = files_state
+                                    .borrow()
+                                    .trail
+                                    .last()
+                                    .is_some_and(|folder| folder.uid == SHARED_VIEW);
+                                let in_shared = files_state
+                                    .borrow()
+                                    .trail
+                                    .first()
+                                    .is_some_and(|folder| folder.uid == SHARED_VIEW);
+                                if shared_root && count == 0 {
+                                    files_status.set_text("Nothing is shared with or by you.");
+                                }
                                 if offline_only && count == 0 {
                                     files_status.set_text("No files are kept on this device.");
                                 }
@@ -2966,10 +3086,11 @@ mod desktop {
                                 }
                                 offline_filter.set_active(offline_only);
                                 trash_toggle.set_active(trashed);
+                                shared_toggle.set_active(in_shared);
                                 empty_trash.set_visible(trashed);
                                 empty_trash.set_sensitive(count > 0);
                                 back.set_sensitive(files_state.borrow().trail.len() > 1);
-                                create.set_sensitive(!offline_only && !trashed);
+                                create.set_sensitive(!offline_only && !trashed && !shared_root);
                                 files_refresh.set_sensitive(true);
                             }
                             Err(error) => {
@@ -3438,6 +3559,7 @@ mod desktop {
                                             | "Files restore"
                                             | "Files delete permanently"
                                             | "Files empty trash"
+                                            | "Files leave shared"
                                             | "Files restore version"
                                     )
                                 {

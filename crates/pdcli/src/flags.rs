@@ -409,6 +409,27 @@ pub enum ShareCommand {
     },
     /// Remove the public link for a node UID
     Remove { node: String },
+    /// List files and folders other people have shared with you
+    WithMe {
+        #[arg(long)]
+        json: bool,
+    },
+    /// List your files and folders that are shared with others or by link
+    ByMe {
+        #[arg(long)]
+        json: bool,
+    },
+    /// List pending invitations to other people's files and folders
+    Invitations {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Accept a pending invitation
+    Accept { invitation: String },
+    /// Decline a pending invitation
+    Reject { invitation: String },
+    /// Give up your access to a file or folder someone shared with you
+    Leave { node: String },
     /// Invite a person to a file or folder
     Invite {
         node: String,

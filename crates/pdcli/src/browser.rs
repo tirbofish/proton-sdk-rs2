@@ -201,6 +201,39 @@ pub async fn run_cli(force_offline: bool, command: BrowseCommand) -> anyhow::Res
             let results = drive.trash_nodes(vec![uid.clone()]).await?;
             require_success(&uid, &results)?;
         }
+        BrowseCommand::Download { node, destination } => {
+            let revision = match drive
+                .get_node(parse_uid(&node)?)
+                .await?
+                .result()
+                .map_err(|error| anyhow::anyhow!("{error}"))?
+            {
+                Node::File(file) | Node::Photo(file) => file.active_revision.uid,
+                _ => anyhow::bail!("node is not a file"),
+            };
+            // Written beside the destination first, so a failed download never
+            // leaves a truncated file behind.
+            let partial = destination.with_extension("pdcli-partial");
+            let file = std::fs::File::create(&partial)?;
+            let download = async {
+                drive
+                    .get_file_downloader(revision)
+                    .await?
+                    .download_to_stream(Box::new(file), Box::new(|_, _| {}))
+                    .completion
+                    .await??;
+                Ok::<_, anyhow::Error>(())
+            };
+            if let Err(error) = download.await {
+                let _ = std::fs::remove_file(&partial);
+                return Err(error);
+            }
+            std::fs::rename(&partial, &destination)?;
+            println!(
+                "{}",
+                serde_json::json!({ "uid": node, "path": destination })
+            );
+        }
         BrowseCommand::Url { node } => {
             println!("{}", drive.get_node_url(parse_uid(&node)?).await?);
         }

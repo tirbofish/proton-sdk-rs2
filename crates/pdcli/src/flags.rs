@@ -132,11 +132,28 @@ pub enum Command {
 
 #[derive(Subcommand)]
 pub enum BrowseCommand {
-    List { folder: Option<String> },
-    Mkdir { parent: String, name: String },
-    Rename { node: String, name: String },
-    Trash { node: String },
-    Url { node: String },
+    List {
+        folder: Option<String>,
+    },
+    Mkdir {
+        parent: String,
+        name: String,
+    },
+    Rename {
+        node: String,
+        name: String,
+    },
+    Trash {
+        node: String,
+    },
+    Url {
+        node: String,
+    },
+    /// Download a file's current version to DESTINATION
+    Download {
+        node: String,
+        destination: std::path::PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]

@@ -2671,11 +2671,33 @@ fn reply_xattr(reply: fuser::ReplyXattr, size: u32, value: &[u8]) {
     }
 }
 
+/// Older SDK builds listed only the first page of 10 blocks, cutting every larger
+/// download off at exactly this size.
+const TRUNCATED_DOWNLOAD_SIZE: u64 = 10 * 4 * 1024 * 1024;
+
 fn reconcile_cached_file_sizes(db: &FuseDb) {
     for (ino, cached_path) in db.cached_file_inodes() {
         let Ok(metadata) = std::fs::metadata(&cached_path) else {
             continue;
         };
+        if metadata.len() == TRUNCATED_DOWNLOAD_SIZE
+            && let Some(row) = db.get_inode(ino)
+        {
+            if row.dirty || db.has_pending_journal(ino) {
+                tracing::warn!(
+                    name = %row.name,
+                    "local copy may be truncated at 40 MiB but has unsynced edits; check it before they upload"
+                );
+            } else if row.revision_uid.is_some() {
+                // Dropping the copy and relisting the folder restores the real
+                // size; the file downloads in full on next open.
+                let _ = std::fs::remove_file(&cached_path);
+                let _ = db.set_cached_path(ino, None);
+                let _ = db.clear_children_populated(row.parent_ino);
+                tracing::warn!(name = %row.name, "removed local copy truncated by an older download bug");
+                continue;
+            }
+        }
         let _ = db.update_size_only(ino, metadata.len());
     }
 }

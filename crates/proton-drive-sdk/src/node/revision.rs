@@ -230,7 +230,9 @@ impl RevisionOperations {
             "Getting revision blocks for revision_id={}",
             revision_uid.revision_id.raw()
         );
-        let revision_response = client
+        // The API lists blocks a page at a time; a full page means more follow.
+        let page_size = crate::node::download::DEFAULT_BLOCK_PAGE_SIZE;
+        let mut revision_response = client
             .api()
             .files()
             .get_revision(
@@ -238,11 +240,34 @@ impl RevisionOperations {
                 revision_uid.node_uid.link_id.clone(),
                 revision_uid.revision_id.clone(),
                 Some(crate::node::download::MIN_BLOCK_INDEX),
-                Some(crate::node::download::DEFAULT_BLOCK_PAGE_SIZE),
+                Some(page_size),
                 false,
             )
             .await
             .context("Failed to get revision from API")?;
+        let mut page_len = revision_response.revision.blocks.len();
+        while let Some(from_index) =
+            next_block_page_start(&revision_response.revision.blocks, page_len, page_size)
+        {
+            let page = client
+                .api()
+                .files()
+                .get_revision(
+                    revision_uid.node_uid.volume_id.clone(),
+                    revision_uid.node_uid.link_id.clone(),
+                    revision_uid.revision_id.clone(),
+                    Some(from_index),
+                    Some(page_size),
+                    false,
+                )
+                .await
+                .context("Failed to get revision blocks from API")?
+                .revision
+                .blocks;
+            page_len = page.len();
+            revision_response.revision.blocks.extend(page);
+        }
+        ensure_contiguous_blocks(&revision_response.revision.blocks)?;
 
         tracing::debug!(
             "Download state created for revision {:?}: {} blocks, size={}",
@@ -272,6 +297,31 @@ impl RevisionOperations {
             release_block_listing_action,
         )
     }
+}
+
+/// Where the next block page starts, or `None` once a short page ended the listing.
+fn next_block_page_start(
+    blocks: &[crate::api::block::BlockDto],
+    last_page_len: usize,
+    page_size: i32,
+) -> Option<i32> {
+    if last_page_len == 0 || last_page_len < page_size as usize {
+        return None;
+    }
+    blocks.last().map(|block| block.index + 1)
+}
+
+/// Blocks must run 1, 2, 3, ... so no part of the file is silently skipped.
+fn ensure_contiguous_blocks(blocks: &[crate::api::block::BlockDto]) -> anyhow::Result<()> {
+    for (position, block) in blocks.iter().enumerate() {
+        let expected = crate::node::download::MIN_BLOCK_INDEX + position as i32;
+        anyhow::ensure!(
+            block.index == expected,
+            "revision block listing has block {} where {expected} was expected",
+            block.index
+        );
+    }
+    Ok(())
 }
 
 pub struct RevisionWriter {
@@ -752,5 +802,35 @@ impl RevisionWriter {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_contiguous_blocks, next_block_page_start};
+    use crate::api::block::BlockDto;
+
+    fn blocks(indexes: std::ops::RangeInclusive<i32>) -> Vec<BlockDto> {
+        indexes
+            .map(|index| serde_json::from_value(serde_json::json!({ "Index": index })).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn block_listing_keeps_paging_past_the_first_full_page() {
+        // A 48 MB file has 12 blocks: one full page of 10, then a page of 2.
+        let first = blocks(1..=10);
+        assert_eq!(next_block_page_start(&first, 10, 10), Some(11));
+        let all = blocks(1..=12);
+        assert_eq!(next_block_page_start(&all, 2, 10), None);
+        assert_eq!(next_block_page_start(&[], 0, 10), None);
+    }
+
+    #[test]
+    fn block_listing_with_gaps_is_rejected() {
+        assert!(ensure_contiguous_blocks(&blocks(1..=12)).is_ok());
+        let mut gap = blocks(1..=10);
+        gap.extend(blocks(12..=12));
+        assert!(ensure_contiguous_blocks(&gap).is_err());
     }
 }

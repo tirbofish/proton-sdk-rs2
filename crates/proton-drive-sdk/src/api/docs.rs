@@ -83,7 +83,6 @@ pub struct SeedCommitResponse {
     pub link_id: Option<String>,
 }
 
-
 #[async_trait]
 pub trait DocsApiClient: Send + Sync {
     async fn get_meta(
@@ -157,7 +156,6 @@ pub trait DocsApiClient: Send + Sync {
     ) -> anyhow::Result<()>;
 }
 
-
 pub struct DefaultDocsApiClient {
     client: ClientWithMiddleware,
     base_url: Url,
@@ -178,11 +176,7 @@ impl DefaultDocsApiClient {
     }
 
     fn document_path(&self, volume_id: &VolumeId, link_id: &LinkId) -> String {
-        format!(
-            "volumes/{}/documents/{}",
-            volume_id.raw(),
-            link_id.raw()
-        )
+        format!("volumes/{}/documents/{}", volume_id.raw(), link_id.raw())
     }
 
     async fn add_auth(
@@ -227,7 +221,6 @@ impl DefaultDocsApiClient {
         Ok(bytes.to_vec())
     }
 }
-
 
 async fn parse_json<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> anyhow::Result<T> {
     let status = resp.status();
@@ -329,17 +322,20 @@ impl DocsApiClient for DefaultDocsApiClient {
         link_id: &LinkId,
         last_commit_id: Option<&str>,
     ) -> anyhow::Result<ValetTokenDto> {
-        let url = self
-            .base_url
-            .join(&format!("{}/tokens", self.document_path(volume_id, link_id)))?;
+        let url = self.base_url.join(&format!(
+            "{}/tokens",
+            self.document_path(volume_id, link_id)
+        ))?;
         let builder = self
             .add_auth(self.client.post(url).json(&serde_json::json!({
                 "LastCommitID": last_commit_id,
             })))
             .await?;
-        Ok(parse_json::<CreateValetTokenResponse>(builder.send().await?)
-            .await?
-            .valet_token)
+        Ok(
+            parse_json::<CreateValetTokenResponse>(builder.send().await?)
+                .await?
+                .valet_token,
+        )
     }
 
     async fn get_public_meta(
@@ -453,9 +449,10 @@ impl DocsApiClient for DefaultDocsApiClient {
         link_id: &LinkId,
         lock_id: &str,
     ) -> anyhow::Result<()> {
-        let url = self
-            .base_url
-            .join(&format!("{}/unlock", self.document_path(volume_id, link_id)))?;
+        let url = self.base_url.join(&format!(
+            "{}/unlock",
+            self.document_path(volume_id, link_id)
+        ))?;
         let builder = self
             .add_auth(self.client.post(url).json(&serde_json::json!({
                 "LockID": lock_id,

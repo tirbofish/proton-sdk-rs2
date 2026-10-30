@@ -41,6 +41,8 @@ pub mod client;
 pub mod crypto;
 pub mod device_ops;
 pub mod diagnostic;
+#[cfg(feature = "docs")]
+pub mod docs;
 pub mod easy_switch;
 pub mod error;
 pub mod event_scheduler;

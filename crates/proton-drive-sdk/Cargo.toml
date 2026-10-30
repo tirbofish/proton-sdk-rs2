@@ -46,6 +46,8 @@ image = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 aes-gcm = { workspace = true, optional = true }
 keyring = { workspace = true, optional = true }
+yrs = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
 
 [build-dependencies]
 prost-build.workspace = true
@@ -61,6 +63,9 @@ cache-encrypted = ["aes-gcm"]
 
 # System keyring storage for secrets
 cache-keyring = ["keyring"]
+
+# Proton Docs reading, export and editing
+docs = ["yrs", "aes-gcm", "flate2"]
 
 # Thumbnail generation from images
 thumbnail-generation = ["image"]

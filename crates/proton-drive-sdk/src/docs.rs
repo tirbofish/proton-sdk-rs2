@@ -1,6 +1,5 @@
 use crate::api::docs::{DocumentMetaDto, RecentDocumentDto};
 
-
 use crate::client::ProtonDriveClient;
 use crate::node::file::FileOperations;
 use crate::node::{
@@ -14,7 +13,6 @@ use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::aes::Aes256;
 use aes_gcm::{AesGcm, KeyInit as AesKeyInit};
 use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
-
 
 use prost::Message;
 use sha2::Sha256;
@@ -78,7 +76,6 @@ pub struct SquashCommit {
     pub commit: Option<Commit>,
 }
 
-
 #[derive(Clone, PartialEq, Message)]
 pub struct SignedPlaintextContent {
     #[prost(bytes = "vec", tag = "1")]
@@ -114,14 +111,15 @@ impl DocumentKind {
 
 #[derive(Debug, Clone)]
 pub enum DocsTarget {
-    Private { uid: NodeUid },
+    Private {
+        uid: NodeUid,
+    },
     Public {
         token: String,
         link_id: String,
         password: Option<String>,
     },
 }
-
 
 #[derive(Debug, Clone)]
 pub struct DecryptedUpdate {
@@ -151,7 +149,6 @@ impl OpenedDocument {
         updates_to_markdown(&self.updates)
     }
 }
-
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct DdocPublish {
@@ -203,7 +200,6 @@ pub fn strip_duplicate_title(markdown: &str, title: &str) -> String {
         .join("\n")
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveSyncTick {
     Changed,
@@ -231,30 +227,47 @@ pub fn live_sync_tick(
     }
 }
 
-
 #[derive(serde::Deserialize)]
 struct DdocCreateResponse {
     data: DdocPublish,
 }
 
-pub fn updates_to_markdown(updates: &[DecryptedUpdate]) -> anyhow::Result<String> {
-    use yrs::updates::decoder::Decode;
-    use yrs::{GetString, ReadTxn, Transact, Update};
-
+fn apply_updates(updates: &[DecryptedUpdate]) -> (yrs::Doc, usize) {
+    use yrs::Transact;
 
     let doc = yrs::Doc::new();
     let mut applied = 0usize;
     {
         let mut txn = doc.transact_mut();
         for update in updates {
-            for payload in yjs_payloads(&update.content) {
-                if let Ok(decoded) = Update::decode_v1(payload).or_else(|_| Update::decode_v2(payload))
-                {
-                    if txn.apply_update(decoded).is_ok() {
-                        applied += 1;
-                    }
+            if let Some(decoded) = yjs_update(&update.content) {
+                if txn.apply_update(decoded).is_ok() {
+                    applied += 1;
                 }
             }
+        }
+    }
+    (doc, applied)
+}
+
+pub fn updates_to_markdown(updates: &[DecryptedUpdate]) -> anyhow::Result<String> {
+    use yrs::{GetString, ReadTxn, Transact};
+
+    // Proton Docs is a Lexical editor; its own layout is read first, on a
+    // separate copy because reading it fixes the type of the `root` entry.
+    let markdown = lexical_markdown(&apply_updates(updates).0);
+    if !markdown.trim().is_empty() {
+        return Ok(markdown.trim().to_string());
+    }
+
+    let (doc, applied) = apply_updates(updates);
+    {
+        let txn = doc.transact();
+        if txn
+            .root_refs()
+            .any(|(name, _)| name == "sheetDataV2" || name == "sheets")
+        {
+            anyhow::bail!("exporting Proton Sheets spreadsheets is not supported");
         }
     }
 
@@ -315,19 +328,269 @@ pub fn updates_to_markdown(updates: &[DecryptedUpdate]) -> anyhow::Result<String
     Ok(md)
 }
 
-fn yjs_payloads(raw: &[u8]) -> Vec<&[u8]> {
-    if raw.len() >= 2 && raw[0] == 0 && matches!(raw[1], 1 | 2) {
-        vec![&raw[2..]]
-    } else if !raw.is_empty() && raw[0] == 1 {
-        Vec::new()
-    } else if raw.len() >= 2 && raw[0] == 0 && raw[1] == 0 {
-        Vec::new()
-    } else {
-        vec![raw]
+/// Converts a document stored by Lexical's Yjs binding: `root` is an XmlText
+/// whose embedded XmlTexts are block elements (their attributes say which), and
+/// each run of text is preceded by a Map embed holding the text node's format.
+fn lexical_markdown(doc: &yrs::Doc) -> String {
+    use yrs::Transact;
+    use yrs::types::text::YChange;
+    use yrs::{Out, Text};
+
+    let root = doc.get_or_insert_text("root");
+    let txn = doc.transact();
+    let mut blocks = Vec::new();
+    for chunk in root.diff(&txn, YChange::identity) {
+        if let Out::YXmlText(block) = chunk.insert {
+            lexical_block(&txn, &block, 0, &mut blocks);
+        }
+    }
+    blocks.join("\n\n")
+}
+
+fn lexical_attr<T: yrs::ReadTxn>(txn: &T, element: &yrs::XmlTextRef, name: &str) -> String {
+    use yrs::Xml;
+    match element.get_attribute(txn, name) {
+        Some(yrs::Out::Any(yrs::Any::String(value))) => value.to_string(),
+        Some(yrs::Out::Any(yrs::Any::Number(value))) => lexical_number(value).to_string(),
+        Some(yrs::Out::Any(yrs::Any::Bool(value))) => value.to_string(),
+        _ => String::new(),
     }
 }
 
+fn lexical_number(value: yrs::any::Number) -> i64 {
+    match value {
+        yrs::any::Number::Int(value) => value,
+        yrs::any::Number::Float(value) => value as i64,
+    }
+}
 
+fn lexical_block<T: yrs::ReadTxn>(
+    txn: &T,
+    block: &yrs::XmlTextRef,
+    depth: usize,
+    out: &mut Vec<String>,
+) {
+    let kind = lexical_attr(txn, block, "__type");
+    match kind.as_str() {
+        "list" => {
+            let list_type = lexical_attr(txn, block, "__listType");
+            let mut items = Vec::new();
+            let mut number = lexical_attr(txn, block, "__start").parse().unwrap_or(1u64);
+            for child in lexical_children(txn, block) {
+                let checked = lexical_attr(txn, &child, "__checked") == "true";
+                let marker = match list_type.as_str() {
+                    "number" => {
+                        number += 1;
+                        format!("{}.", number - 1)
+                    }
+                    "check" if checked => "- [x]".to_string(),
+                    "check" => "- [ ]".to_string(),
+                    _ => "-".to_string(),
+                };
+                let mut nested = Vec::new();
+                let text = lexical_inline(txn, &child, &mut |list| {
+                    lexical_block(txn, list, depth + 1, &mut nested)
+                });
+                let indent = "  ".repeat(depth);
+                if !text.is_empty() || nested.is_empty() {
+                    items.push(format!("{indent}{marker} {text}"));
+                }
+                items.extend(nested);
+            }
+            out.push(items.join("\n"));
+        }
+        "table" => {
+            let mut rows = Vec::new();
+            for (index, row) in lexical_children(txn, block).into_iter().enumerate() {
+                let cells: Vec<String> = lexical_children(txn, &row)
+                    .iter()
+                    .map(|cell| {
+                        let mut parts = Vec::new();
+                        for paragraph in lexical_children(txn, cell) {
+                            lexical_block(txn, &paragraph, 0, &mut parts);
+                        }
+                        parts.join(" ").replace('|', "\\|").replace('\n', " ")
+                    })
+                    .collect();
+                rows.push(format!("| {} |", cells.join(" | ")));
+                if index == 0 {
+                    rows.push(format!("|{}", " --- |".repeat(cells.len())));
+                }
+            }
+            out.push(rows.join("\n"));
+        }
+        "horizontalrule" => out.push("---".into()),
+        "code" => {
+            let language = lexical_attr(txn, block, "__language");
+            let text = lexical_plain(txn, block);
+            out.push(format!("```{language}\n{text}\n```"));
+        }
+        _ => {
+            let mut nested = Vec::new();
+            let text = lexical_inline(txn, block, &mut |child| {
+                lexical_block(txn, child, depth, &mut nested)
+            });
+            let prefix = match kind.as_str() {
+                "heading" => {
+                    let level = lexical_attr(txn, block, "__tag")
+                        .trim_start_matches('h')
+                        .parse()
+                        .unwrap_or(1usize);
+                    format!("{} ", "#".repeat(level.clamp(1, 6)))
+                }
+                "quote" => "> ".into(),
+                _ => String::new(),
+            };
+            if !text.is_empty() {
+                out.push(format!("{prefix}{text}"));
+            }
+            out.extend(nested);
+        }
+    }
+}
+
+fn lexical_children<T: yrs::ReadTxn>(txn: &T, element: &yrs::XmlTextRef) -> Vec<yrs::XmlTextRef> {
+    use yrs::Text;
+    use yrs::types::text::YChange;
+    element
+        .diff(txn, YChange::identity)
+        .into_iter()
+        .filter_map(|chunk| match chunk.insert {
+            yrs::Out::YXmlText(child) => Some(child),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An element's text with formatting; links render inline, and any other
+/// nested element (a sublist inside a list item) is passed to `block`.
+fn lexical_inline<T: yrs::ReadTxn>(
+    txn: &T,
+    element: &yrs::XmlTextRef,
+    block: &mut dyn FnMut(&yrs::XmlTextRef),
+) -> String {
+    use yrs::types::text::YChange;
+    use yrs::{Map, Out, Text};
+
+    let mut text = String::new();
+    let mut format = 0i64;
+    for chunk in element.diff(txn, YChange::identity) {
+        match chunk.insert {
+            Out::YMap(node) => {
+                let field = |name: &str| node.get(txn, name);
+                match field("__type") {
+                    Some(Out::Any(yrs::Any::String(kind))) if &*kind == "linebreak" => {
+                        text.push_str("  \n");
+                        format = 0;
+                    }
+                    _ => {
+                        format = match field("__format") {
+                            Some(Out::Any(yrs::Any::Number(value))) => lexical_number(value),
+                            _ => 0,
+                        };
+                    }
+                }
+            }
+            Out::Any(yrs::Any::String(run)) => text.push_str(&lexical_format(&run, format)),
+            Out::YXmlText(child) => match lexical_attr(txn, &child, "__type").as_str() {
+                "link" | "autolink" => {
+                    let url = lexical_attr(txn, &child, "__url");
+                    let label = lexical_inline(txn, &child, block);
+                    text.push_str(&format!("[{label}]({url})"));
+                }
+                _ => block(&child),
+            },
+            _ => {}
+        }
+    }
+    text
+}
+
+fn lexical_plain<T: yrs::ReadTxn>(txn: &T, element: &yrs::XmlTextRef) -> String {
+    use yrs::types::text::YChange;
+    use yrs::{Map, Out, Text};
+    let mut text = String::new();
+    for chunk in element.diff(txn, YChange::identity) {
+        match chunk.insert {
+            Out::Any(yrs::Any::String(run)) => text.push_str(&run),
+            Out::YMap(node) => {
+                if matches!(node.get(txn, "__type"), Some(Out::Any(yrs::Any::String(kind))) if &*kind == "linebreak")
+                {
+                    text.push('\n');
+                }
+            }
+            _ => {}
+        }
+    }
+    text
+}
+
+/// Lexical's text format bits: 1 bold, 2 italic, 4 strikethrough, 16 code.
+fn lexical_format(run: &str, format: i64) -> String {
+    if format == 0 || run.trim().is_empty() {
+        return run.to_string();
+    }
+    let mut marked = run.trim().to_string();
+    if format & 16 != 0 {
+        marked = format!("`{marked}`");
+    }
+    if format & 4 != 0 {
+        marked = format!("~~{marked}~~");
+    }
+    if format & 2 != 0 {
+        marked = format!("*{marked}*");
+    }
+    if format & 1 != 0 {
+        marked = format!("**{marked}**");
+    }
+    // Markdown emphasis cannot open or close on whitespace, so it stays outside.
+    let leading = &run[..run.len() - run.trim_start().len()];
+    let trailing = &run[run.trim_end().len()..];
+    format!("{leading}{marked}{trailing}")
+}
+
+/// The Yjs update inside a decrypted Docs update. Newer clients gzip it, and
+/// some updates arrive in a y-protocols sync message (`0`, step `1`/`2`, a
+/// length, then the update). A bare update with one client also starts with
+/// `0x01`, so the bare form is tried before any envelope.
+fn yjs_update(raw: &[u8]) -> Option<yrs::Update> {
+    use std::io::Read;
+    use yrs::updates::decoder::Decode;
+
+    let inflated;
+    let raw = if raw.starts_with(&[0x1f, 0x8b]) {
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(raw)
+            .read_to_end(&mut out)
+            .ok()?;
+        inflated = out;
+        &inflated[..]
+    } else {
+        raw
+    };
+    let decode = |bytes: &[u8]| {
+        yrs::Update::decode_v1(bytes)
+            .or_else(|_| yrs::Update::decode_v2(bytes))
+            .ok()
+    };
+    if let Some(update) = decode(raw) {
+        return Some(update);
+    }
+    if raw.len() > 2 && raw[0] == 0 && matches!(raw[1], 1 | 2) {
+        let mut rest = &raw[2..];
+        let mut length = 0usize;
+        for shift in (0..64).step_by(7) {
+            let (&byte, tail) = rest.split_first()?;
+            rest = tail;
+            length |= ((byte & 0x7f) as usize) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+        }
+        return decode(rest.get(..length)?);
+    }
+    None
+}
 
 fn unique_chunks(chunks: Vec<String>) -> String {
     let mut seen = std::collections::BTreeSet::new();
@@ -351,11 +614,7 @@ fn json_text(bytes: &[u8]) -> Option<String> {
     let mut out = String::new();
     collect_json_strings(&v, &mut out);
     let out = out.trim().to_string();
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 fn collect_json_strings(v: &serde_json::Value, out: &mut String) {
@@ -437,7 +696,6 @@ fn flush_run(cur: &mut String, out: &mut String) {
     cur.clear();
 }
 
-
 fn xml_to_markdown(xml: &str) -> String {
     let mut out = xml.to_string();
     for (pat, repl) in [
@@ -516,8 +774,6 @@ pub async fn publish_to_ddocs(
         .map_err(|e| anyhow::anyhow!("ddocs response: {e}. body: {body}"))
 }
 
-
-
 pub fn parse_docs_target(input: &str) -> anyhow::Result<DocsTarget> {
     let trimmed = input.trim();
     if let Ok(url) = reqwest::Url::parse(trimmed) {
@@ -587,7 +843,10 @@ fn associated_data(update: &DocumentUpdate) -> String {
     } else {
         update.author_address.as_str()
     };
-    format!("docs.rts.{}.{}.{}", update.version, author, update.timestamp)
+    format!(
+        "docs.rts.{}.{}.{}",
+        update.version, author, update.timestamp
+    )
 }
 
 fn decrypt_docs_message(
@@ -620,9 +879,8 @@ fn decrypt_docs_message(
 
 fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], length: usize) -> anyhow::Result<Vec<u8>> {
     const HASH_LEN: usize = 32;
-    let mut mac =
-        <HmacSha256 as HmacKeyInit>::new_from_slice(salt)
-            .map_err(|_| anyhow::anyhow!("HKDF extract failed"))?;
+    let mut mac = <HmacSha256 as HmacKeyInit>::new_from_slice(salt)
+        .map_err(|_| anyhow::anyhow!("HKDF extract failed"))?;
 
     mac.update(ikm);
     let prk = mac.finalize().into_bytes();
@@ -633,9 +891,8 @@ fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], length: usize) -> anyhow::R
     let mut okm = Vec::with_capacity(n * HASH_LEN);
     let mut t = Vec::new();
     for i in 1..=(n as u8) {
-        let mut mac =
-            <HmacSha256 as HmacKeyInit>::new_from_slice(&prk)
-                .map_err(|_| anyhow::anyhow!("HKDF expand failed"))?;
+        let mut mac = <HmacSha256 as HmacKeyInit>::new_from_slice(&prk)
+            .map_err(|_| anyhow::anyhow!("HKDF expand failed"))?;
 
         mac.update(&t);
         mac.update(info);
@@ -677,9 +934,6 @@ fn encrypt_docs_message(
 
 pub fn markdown_to_yjs(markdown: &str) -> anyhow::Result<Vec<u8>> {
     use yrs::{ReadTxn, Text, Transact, WriteTxn, XmlFragment, XmlTextPrelim};
-
-
-
 
     let doc = yrs::Doc::new();
     {
@@ -758,8 +1012,8 @@ pub async fn fetch_ddoc(
     if !status.is_success() {
         anyhow::bail!("ddocs API {status}: {body}");
     }
-    let parsed: DdocGet = serde_json::from_str(&body)
-        .map_err(|e| anyhow::anyhow!("ddocs get: {e}. body: {body}"))?;
+    let parsed: DdocGet =
+        serde_json::from_str(&body).map_err(|e| anyhow::anyhow!("ddocs get: {e}. body: {body}"))?;
     let title = parsed
         .title
         .or_else(|| parsed.data.as_ref().and_then(|d| d.title.clone()))
@@ -767,17 +1021,10 @@ pub async fn fetch_ddoc(
     let content = parsed
         .file_content
         .or(parsed.content)
-        .or_else(|| {
-            parsed
-                .data
-                .and_then(|d| d.file_content.or(d.content))
-        })
+        .or_else(|| parsed.data.and_then(|d| d.file_content.or(d.content)))
         .ok_or_else(|| anyhow::anyhow!("ddocs document has no content"))?;
     Ok((title, content))
 }
-
-
-
 
 fn merge_chunked_updates(updates: Vec<DocumentUpdate>) -> Vec<DocumentUpdate> {
     let header_len = CHUNK_SIGNAL.len() + 4;
@@ -801,7 +1048,9 @@ fn merge_chunked_updates(updates: Vec<DocumentUpdate>) -> Vec<DocumentUpdate> {
             continue;
         }
         let content = update.encrypted_content[header_len..].to_vec();
-        let entry = pending.entry(id).or_insert_with(|| (total, Default::default()));
+        let entry = pending
+            .entry(id)
+            .or_insert_with(|| (total, Default::default()));
         entry.1.insert(index, content);
         if entry.1.len() as u8 == entry.0 {
             let mut merged = Vec::new();
@@ -1062,7 +1311,6 @@ impl ProtonDriveClient {
     }
 }
 
-
 pub const PROTON_DOC_MIME: &str = PROTON_DOC_MEDIA_TYPE;
 pub const PROTON_SHEET_MIME: &str = PROTON_SHEET_MEDIA_TYPE;
 
@@ -1071,12 +1319,7 @@ mod tests {
     use super::*;
     use rand::Rng;
 
-
-    fn encrypt_docs_message(
-        plaintext: &[u8],
-        content_key: &PgpSessionKey,
-        aad: &[u8],
-    ) -> Vec<u8> {
+    fn encrypt_docs_message(plaintext: &[u8], content_key: &PgpSessionKey, aad: &[u8]) -> Vec<u8> {
         let mut salt = vec![0u8; HKDF_SALT_SIZE];
         let mut iv = vec![0u8; GCM_IV_SIZE];
         rand::rng().fill_bytes(&mut salt);
@@ -1139,7 +1382,6 @@ mod tests {
             DocsTarget::Public { password, .. } => assert_eq!(password.as_deref(), Some("secret")),
             _ => panic!("expected public with password"),
         }
-
 
         let uid = parse_docs_target("vol~link").unwrap();
         match uid {
@@ -1232,7 +1474,9 @@ mod tests {
             let mut txn = src.transact_mut();
             text.insert(&mut txn, 0, "hello ddocs");
         }
-        let update = src.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+        let update = src
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
         let md = updates_to_markdown(&[DecryptedUpdate {
             content: update,
             signature: Vec::new(),
@@ -1242,6 +1486,71 @@ mod tests {
         }])
         .unwrap();
         assert!(md.contains("hello ddocs"));
+    }
+
+    fn lexical_update() -> Vec<u8> {
+        use yrs::{Any, MapPrelim, ReadTxn, Text, Transact, Xml, XmlTextPrelim};
+
+        let src = yrs::Doc::new();
+        let root = src.get_or_insert_text("root");
+        let mut txn = src.transact_mut();
+        let text_node = |format: i64| {
+            MapPrelim::from([
+                ("__type".to_string(), Any::from("text")),
+                ("__format".to_string(), Any::from(format)),
+            ])
+        };
+        let heading = root.insert_embed(&mut txn, 0, XmlTextPrelim::new(""));
+        heading.insert_attribute(&mut txn, "__type", "heading");
+        heading.insert_attribute(&mut txn, "__tag", "h2");
+        heading.insert_embed(&mut txn, 0, text_node(0));
+        heading.insert(&mut txn, 1, "Plan");
+        let paragraph = root.insert_embed(&mut txn, 1, XmlTextPrelim::new(""));
+        paragraph.insert_attribute(&mut txn, "__type", "paragraph");
+        paragraph.insert_embed(&mut txn, 0, text_node(0));
+        paragraph.insert(&mut txn, 1, "Ship ");
+        paragraph.insert_embed(&mut txn, 6, text_node(1));
+        paragraph.insert(&mut txn, 7, "today");
+        let list = root.insert_embed(&mut txn, 2, XmlTextPrelim::new(""));
+        list.insert_attribute(&mut txn, "__type", "list");
+        list.insert_attribute(&mut txn, "__listType", "number");
+        for (index, item) in ["one", "two"].into_iter().enumerate() {
+            let entry = list.insert_embed(&mut txn, index as u32, XmlTextPrelim::new(""));
+            entry.insert_attribute(&mut txn, "__type", "listitem");
+            entry.insert_embed(&mut txn, 0, text_node(0));
+            entry.insert(&mut txn, 1, item);
+        }
+        drop(txn);
+        src.transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default())
+    }
+
+    fn decrypted(content: Vec<u8>) -> DecryptedUpdate {
+        DecryptedUpdate {
+            content,
+            signature: Vec::new(),
+            author_address: String::new(),
+            timestamp: 0,
+            uuid: String::new(),
+        }
+    }
+
+    #[test]
+    fn lexical_documents_export_as_markdown() {
+        let update = lexical_update();
+        // One editing client, so the bare update starts like a sync message.
+        assert_eq!(update[0], 1);
+        let md = updates_to_markdown(&[decrypted(update)]).unwrap();
+        assert_eq!(md, "## Plan\n\nShip **today**\n\n1. one\n2. two");
+    }
+
+    #[test]
+    fn gzipped_updates_are_inflated() {
+        use std::io::Write;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&lexical_update()).unwrap();
+        let md = updates_to_markdown(&[decrypted(gz.finish().unwrap())]).unwrap();
+        assert!(md.starts_with("## Plan"));
     }
 
     #[test]
@@ -1265,13 +1574,9 @@ mod tests {
 
     #[test]
     fn strips_title_heading_from_body() {
-        assert_eq!(
-            strip_duplicate_title("# Notes\n\nhello", "Notes"),
-            "hello"
-        );
+        assert_eq!(strip_duplicate_title("# Notes\n\nhello", "Notes"), "hello");
         assert_eq!(strip_duplicate_title("hello", "Notes"), "hello");
     }
-
 
     #[test]
     fn markdown_roundtrips_through_yjs() {
@@ -1352,9 +1657,4 @@ mod tests {
         .unwrap();
         assert!(md.contains("hello from lexical"));
     }
-
-
-
-
-
 }

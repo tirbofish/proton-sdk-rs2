@@ -1255,6 +1255,7 @@ pub struct PhotosApiClients {
     trash: Arc<DefaultTrashApiClient>,
     events: Arc<DefaultEventsApiClient>,
     devices: Arc<crate::api::devices::DefaultDevicesApiClient>,
+    docs: Arc<crate::api::docs::DefaultDocsApiClient>,
 }
 
 impl PhotosApiClients {
@@ -1309,6 +1310,11 @@ impl PhotosApiClients {
                 token_credential.clone(),
             )),
             devices: Arc::new(crate::api::devices::DefaultDevicesApiClient::new(
+                default_client.clone(),
+                default_api_base_url.clone(),
+                token_credential.clone(),
+            )),
+            docs: Arc::new(crate::api::docs::DefaultDocsApiClient::new(
                 default_client,
                 default_api_base_url,
                 token_credential,
@@ -1345,5 +1351,9 @@ impl DriveApiClients for PhotosApiClients {
 
     fn devices(&self) -> Arc<dyn DevicesApiClient> {
         self.devices.clone()
+    }
+
+    fn docs(&self) -> Arc<dyn crate::api::docs::DocsApiClient> {
+        self.docs.clone()
     }
 }

@@ -1,6 +1,7 @@
 pub mod attr;
 pub mod block;
 pub mod devices;
+pub mod docs;
 pub mod events;
 pub mod file;
 pub mod folder;
@@ -58,6 +59,7 @@ impl DriveApiClientsFactory for DefaultDriveApiClientsFactory {
     }
 }
 use crate::api::devices::{DefaultDevicesApiClient, DevicesApiClient};
+use crate::api::docs::{DefaultDocsApiClient, DocsApiClient};
 use crate::api::events::{DefaultEventsApiClient, EventsApiClient};
 use crate::api::file::{DefaultFilesApiClient, FilesApiClient};
 use crate::api::folder::{DefaultFoldersApiClient, FoldersApiClient};
@@ -79,6 +81,7 @@ pub trait DriveApiClients: Send + Sync {
     fn trash(&self) -> Arc<dyn TrashApiClient>;
     fn events(&self) -> Arc<dyn EventsApiClient>;
     fn devices(&self) -> Arc<dyn DevicesApiClient>;
+    fn docs(&self) -> Arc<dyn DocsApiClient>;
 }
 
 pub struct DefaultDriveApiClients {
@@ -190,6 +193,14 @@ impl DriveApiClients for DefaultDriveApiClients {
 
     fn devices(&self) -> Arc<dyn DevicesApiClient> {
         Arc::new(DefaultDevicesApiClient::new(
+            self.default_api_http_client.clone(),
+            self.default_api_base_url.clone(),
+            self.token_credential.clone(),
+        ))
+    }
+
+    fn docs(&self) -> Arc<dyn DocsApiClient> {
+        Arc::new(DefaultDocsApiClient::new(
             self.default_api_http_client.clone(),
             self.default_api_base_url.clone(),
             self.token_credential.clone(),

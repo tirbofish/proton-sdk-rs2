@@ -54,4 +54,6 @@ image = { version = "0.25", features = ["png", "jpeg", "webp"] }
 rpassword = "7.4"
 rusqlite = { version = "0.39", features = ["bundled-sqlcipher-vendored-openssl"] }
 aes-gcm = "0.10"
+yrs = "0.28"
+flate2 = "1"
 keyring = { version = "3.6", features = ["linux-native", "sync-secret-service", "windows-native", "apple-native"] }

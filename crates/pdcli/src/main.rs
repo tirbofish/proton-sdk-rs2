@@ -12,6 +12,7 @@ mod computers;
 mod credentials;
 mod daemon;
 mod db;
+mod docs;
 mod flags;
 mod fs;
 mod job_control;
@@ -119,6 +120,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Browse { command }) => browser::run_cli(flags.force_offline, command).await,
         Some(Command::Photos { command }) => photos::run_cli(flags.force_offline, command).await,
         Some(Command::Offline { command }) => offline::run_cli(flags.force_offline, command).await,
+        Some(Command::Docs { command }) => docs::run(command, flags.force_offline).await,
         Some(Command::Trash { command }) => trash::run_cli(flags.force_offline, command).await,
         Some(Command::Versions { command }) => {
             versions::run_cli(flags.force_offline, command).await

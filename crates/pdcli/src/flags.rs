@@ -104,6 +104,11 @@ pub enum Command {
         #[command(subcommand)]
         command: VersionsCommand,
     },
+    /// Read, export, or sync Proton Docs documents
+    Docs {
+        #[command(subcommand)]
+        command: DocsCommand,
+    },
     /// Open a Proton Docs or Sheets shortcut from the mount in the browser
     OpenDocument { path: std::path::PathBuf },
     /// Register the Proton Docs and Sheets file types, icons and opener for this user
@@ -256,6 +261,30 @@ pub enum PhotosCommand {
         uid: String,
         destination: std::path::PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+pub enum DocsCommand {
+    /// Show a document's name, kind and history
+    Open {
+        /// Node UID or docs.proton.me link
+        target: String,
+        /// Password for a protected public link
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Export a document's text as Markdown (stdout unless --output is given)
+    Export {
+        /// Node UID or docs.proton.me link
+        target: String,
+        #[arg(long, short)]
+        output: Option<std::path::PathBuf>,
+        /// Password for a protected public link
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// List recently opened documents
+    Recents,
 }
 
 #[derive(Subcommand)]

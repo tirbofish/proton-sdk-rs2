@@ -198,15 +198,50 @@ fn transfer_label(entry: &TransferEntry) -> String {
         TransferDirection::Upload => '↑',
     };
     let name = truncated(&entry.filename, 40);
-    if entry.total_bytes > 0 {
+    if entry.bytes_transferred == 0 {
+        let step = match entry.direction {
+            TransferDirection::Upload => "encrypting",
+            TransferDirection::Download => "starting",
+        };
+        return if entry.total_bytes > 0 {
+            format!(
+                "{arrow} {name} — {step} ({})",
+                format_bytes(entry.total_bytes)
+            )
+        } else {
+            format!("{arrow} {name} — {step}")
+        };
+    }
+    let mut label = if entry.total_bytes > 0 {
         format!(
-            "{arrow} {name} — {:.0}% ({} of {})",
+            "{arrow} {name} — {:.1}% · {} of {}",
             entry.progress_fraction().clamp(0.0, 1.0) * 100.0,
             format_bytes(entry.bytes_transferred),
             format_bytes(entry.total_bytes)
         )
     } else {
         format!("{arrow} {name} — {}", format_bytes(entry.bytes_transferred))
+    };
+    if entry.bytes_per_second > 0 {
+        label.push_str(&format!(" · {}/s", format_bytes(entry.bytes_per_second)));
+        let remaining = entry.total_bytes - entry.bytes_transferred;
+        if remaining > 0 {
+            label.push_str(&format!(
+                " · {} left",
+                format_duration(remaining / entry.bytes_per_second)
+            ));
+        } else if entry.total_bytes > 0 {
+            label.push_str(" · finishing");
+        }
+    }
+    label
+}
+
+fn format_duration(seconds: i64) -> String {
+    match seconds {
+        ..60 => format!("{}s", seconds.max(1)),
+        60..3600 => format!("{}m {:02}s", seconds / 60, seconds % 60),
+        _ => format!("{}h {:02}m", seconds / 3600, seconds % 3600 / 60),
     }
 }
 
@@ -230,7 +265,11 @@ fn transfers_summary(transfers: &[TransferEntry]) -> String {
     }
     let mut summary = parts.join(", ");
     if let Some(Some(fraction)) = overall_progress(transfers) {
-        summary.push_str(&format!(" — {:.0}%", fraction * 100.0));
+        summary.push_str(&format!(" — {:.1}%", fraction * 100.0));
+    }
+    let speed: i64 = transfers.iter().map(|entry| entry.bytes_per_second).sum();
+    if speed > 0 {
+        summary.push_str(&format!(" · {}/s", format_bytes(speed)));
     }
     summary
 }
@@ -472,6 +511,7 @@ mod tests {
             bytes_transferred: done,
             total_bytes: total,
             cancellable: false,
+            bytes_per_second: 0,
         }
     }
 
@@ -508,11 +548,21 @@ mod tests {
         ];
         assert_eq!(
             transfers_summary(&transfers),
-            "1 downloading, 1 uploading — 50%"
+            "1 downloading, 1 uploading — 50.0%"
         );
         assert_eq!(
             transfer_label(&transfers[0]),
-            "↓ clip.mp4 — 50% (1.0 KB of 2.0 KB)"
+            "↓ clip.mp4 — 50.0% · 1.0 KB of 2.0 KB"
         );
+        assert_eq!(transfer_label(&transfers[1]), "↑ clip.mp4 — encrypting");
+        let moving = TransferEntry {
+            bytes_per_second: 512,
+            ..entry(TransferDirection::Upload, 1024, 1024 * 91)
+        };
+        assert_eq!(
+            transfer_label(&moving),
+            "↑ clip.mp4 — 1.1% · 1.0 KB of 91.0 KB · 512 B/s · 3m 00s left"
+        );
+        assert_eq!(transfers_summary(&[moving]), "1 uploading — 1.1% · 512 B/s");
     }
 }

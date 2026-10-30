@@ -12,6 +12,9 @@ pub struct TransferEntry {
     pub bytes_transferred: i64,
     pub total_bytes: i64,
     pub cancellable: bool,
+    /// Average speed since the first byte moved; 0 until there is a second's worth.
+    #[serde(default)]
+    pub bytes_per_second: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -43,6 +46,8 @@ pub struct TransferTracker {
             usize,
             HashMap<usize, TransferEntry>,
             HashMap<usize, tokio::task::AbortHandle>,
+            // When each transfer first moved, and how far it was then.
+            HashMap<usize, (std::time::Instant, i64)>,
         )>,
     >,
 }
@@ -65,6 +70,7 @@ impl TransferTracker {
                 bytes_transferred: 0,
                 total_bytes,
                 cancellable: false,
+                bytes_per_second: 0,
             },
         );
         idx
@@ -77,6 +83,12 @@ impl TransferTracker {
                 if let Some(entry) = entries.1.get_mut(&index) {
                     entry.bytes_transferred = transferred;
                     entry.total_bytes = total;
+                    if transferred > 0 {
+                        entries
+                            .3
+                            .entry(index)
+                            .or_insert((std::time::Instant::now(), transferred));
+                    }
                 }
             }
         })
@@ -85,6 +97,15 @@ impl TransferTracker {
     pub fn snapshot(&self) -> Vec<TransferEntry> {
         let state = self.inner.lock().unwrap();
         let mut entries: Vec<_> = state.1.values().cloned().collect();
+        for entry in &mut entries {
+            if let Some((started, start_bytes)) = state.3.get(&entry.id) {
+                let elapsed = started.elapsed().as_secs_f64();
+                if elapsed >= 1.0 {
+                    entry.bytes_per_second =
+                        ((entry.bytes_transferred - start_bytes).max(0) as f64 / elapsed) as i64;
+                }
+            }
+        }
         entries.sort_by_key(|entry| entry.id);
         entries
     }
@@ -110,6 +131,7 @@ impl TransferTracker {
         if let Ok(mut entries) = self.inner.lock() {
             entries.1.remove(&index);
             entries.2.remove(&index);
+            entries.3.remove(&index);
         }
     }
 
@@ -117,6 +139,7 @@ impl TransferTracker {
         if let Ok(mut entries) = self.inner.lock() {
             entries.1.remove(&index);
             entries.2.remove(&index);
+            entries.3.remove(&index);
         }
     }
 

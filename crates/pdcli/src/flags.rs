@@ -104,6 +104,11 @@ pub enum Command {
         #[command(subcommand)]
         command: VersionsCommand,
     },
+    /// Inspect or download public share links, and manage link bookmarks
+    Public {
+        #[command(subcommand)]
+        command: PublicCommand,
+    },
     /// Read, export, or sync Proton Docs documents
     Docs {
         #[command(subcommand)]
@@ -285,6 +290,35 @@ pub enum DocsCommand {
     },
     /// List recently opened documents
     Recents,
+}
+
+#[derive(Subcommand)]
+pub enum PublicCommand {
+    /// Show the name, kind and size behind a public link
+    Info {
+        url: String,
+        /// Read the link's custom password from standard input
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Download a public link's file, or its folder and everything in it
+    Download {
+        url: String,
+        /// Target path, or an existing directory to download into
+        destination: std::path::PathBuf,
+        /// Read the link's custom password from standard input
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// List bookmarked public links
+    Bookmarks {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Bookmark a public link
+    Bookmark { url: String },
+    /// Remove a bookmark by its ID or URL
+    Unbookmark { bookmark: String },
 }
 
 #[derive(Subcommand)]

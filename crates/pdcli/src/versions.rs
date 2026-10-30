@@ -71,26 +71,8 @@ pub async fn run_cli(force_offline: bool, command: VersionsCommand) -> anyhow::R
             version,
             destination,
         } => {
-            let revision = parse_revision(&version)?;
-            // Written beside the destination first, so a failed download never
-            // leaves a truncated file behind.
-            let partial = destination.with_extension("pdcli-partial");
-            let file = std::fs::File::create(&partial)
-                .with_context(|| format!("create {}", partial.display()))?;
-            let download = async {
-                drive
-                    .get_file_revision_downloader(revision)
-                    .await?
-                    .download_to_stream(Box::new(file), Box::new(|_, _| {}))
-                    .completion
-                    .await??;
-                Ok::<_, anyhow::Error>(())
-            };
-            if let Err(error) = download.await {
-                let _ = std::fs::remove_file(&partial);
-                return Err(error);
-            }
-            std::fs::rename(&partial, &destination)?;
+            crate::browser::download_to_path(&drive, parse_revision(&version)?, &destination)
+                .await?;
             println!(
                 "{}",
                 serde_json::json!({ "version": version, "path": destination })

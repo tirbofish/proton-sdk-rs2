@@ -1,6 +1,10 @@
 use std::collections::HashMap;
+use std::path::Path;
+
+use anyhow::Context;
 
 use proton_drive_sdk::client::ProtonDriveClient;
+use proton_drive_sdk::node::revision::RevisionUid;
 use proton_drive_sdk::node::{
     DegradedNode, Node, NodeUid, is_proton_document, is_proton_sheet, node_web_url,
 };
@@ -211,24 +215,7 @@ pub async fn run_cli(force_offline: bool, command: BrowseCommand) -> anyhow::Res
                 Node::File(file) | Node::Photo(file) => file.active_revision.uid,
                 _ => anyhow::bail!("node is not a file"),
             };
-            // Written beside the destination first, so a failed download never
-            // leaves a truncated file behind.
-            let partial = destination.with_extension("pdcli-partial");
-            let file = std::fs::File::create(&partial)?;
-            let download = async {
-                drive
-                    .get_file_downloader(revision)
-                    .await?
-                    .download_to_stream(Box::new(file), Box::new(|_, _| {}))
-                    .completion
-                    .await??;
-                Ok::<_, anyhow::Error>(())
-            };
-            if let Err(error) = download.await {
-                let _ = std::fs::remove_file(&partial);
-                return Err(error);
-            }
-            std::fs::rename(&partial, &destination)?;
+            download_to_path(&drive, revision, &destination).await?;
             println!(
                 "{}",
                 serde_json::json!({ "uid": node, "path": destination })
@@ -238,6 +225,33 @@ pub async fn run_cli(force_offline: bool, command: BrowseCommand) -> anyhow::Res
             println!("{}", drive.get_node_url(parse_uid(&node)?).await?);
         }
     }
+    Ok(())
+}
+
+/// Downloads one revision to `destination`, writing beside it first so a
+/// failed download never leaves a truncated file behind.
+pub async fn download_to_path(
+    drive: &ProtonDriveClient,
+    revision: RevisionUid,
+    destination: &Path,
+) -> anyhow::Result<()> {
+    let partial = destination.with_extension("pdcli-partial");
+    let file =
+        std::fs::File::create(&partial).with_context(|| format!("create {}", partial.display()))?;
+    let download = async {
+        drive
+            .get_file_downloader(revision)
+            .await?
+            .download_to_stream(Box::new(file), Box::new(|_, _| {}))
+            .completion
+            .await??;
+        Ok::<_, anyhow::Error>(())
+    };
+    if let Err(error) = download.await {
+        let _ = std::fs::remove_file(&partial);
+        return Err(error);
+    }
+    std::fs::rename(&partial, destination)?;
     Ok(())
 }
 

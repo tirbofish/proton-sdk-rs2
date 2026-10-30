@@ -21,6 +21,7 @@ mod offline;
 mod pdignore;
 mod photo_cache;
 mod photos;
+mod public;
 mod quoted;
 mod service;
 mod share;
@@ -121,6 +122,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Photos { command }) => photos::run_cli(flags.force_offline, command).await,
         Some(Command::Offline { command }) => offline::run_cli(flags.force_offline, command).await,
         Some(Command::Docs { command }) => docs::run(command, flags.force_offline).await,
+        Some(Command::Public { command }) => public::run_cli(flags.force_offline, command).await,
         Some(Command::Trash { command }) => trash::run_cli(flags.force_offline, command).await,
         Some(Command::Versions { command }) => {
             versions::run_cli(flags.force_offline, command).await

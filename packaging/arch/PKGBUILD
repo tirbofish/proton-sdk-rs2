@@ -25,12 +25,12 @@ package() {
     "$pkgdir/usr/lib/systemd/user/pdcli.service"
   install -Dm644 packaging/icons/hicolor/scalable/apps/io.github.tirbofish.pdcli.svg \
     "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.tirbofish.pdcli.svg"
-  install -Dm644 packaging/io.github.tirbofish.pdcli.open-document.desktop \
+  install -Dm644 crates/pdcli/assets/io.github.tirbofish.pdcli.open-document.desktop \
     "$pkgdir/usr/share/applications/io.github.tirbofish.pdcli.open-document.desktop"
-  install -Dm644 packaging/mime/io.github.tirbofish.pdcli.xml \
+  install -Dm644 crates/pdcli/assets/mime/io.github.tirbofish.pdcli.xml \
     "$pkgdir/usr/share/mime/packages/io.github.tirbofish.pdcli.xml"
   install -Dm644 -t "$pkgdir/usr/share/icons/hicolor/scalable/mimetypes" \
-    packaging/icons/hicolor/scalable/mimetypes/application-vnd.proton.doc.svg \
-    packaging/icons/hicolor/scalable/mimetypes/application-vnd.proton.sheet.svg
+    crates/pdcli/assets/icons/application-vnd.proton.doc.svg \
+    crates/pdcli/assets/icons/application-vnd.proton.sheet.svg
   install -Dm644 LICENSE.md "$pkgdir/usr/share/licenses/$pkgname/LICENSE.md"
 }

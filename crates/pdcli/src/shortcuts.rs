@@ -7,22 +7,18 @@ use std::process::Command;
 use anyhow::Context;
 use serde::Deserialize;
 
-const MIME_XML: &str = include_str!("../../../packaging/mime/io.github.tirbofish.pdcli.xml");
+const MIME_XML: &str = include_str!("../assets/mime/io.github.tirbofish.pdcli.xml");
 const OPENER_DESKTOP: &str =
-    include_str!("../../../packaging/io.github.tirbofish.pdcli.open-document.desktop");
+    include_str!("../assets/io.github.tirbofish.pdcli.open-document.desktop");
 const OPENER_DESKTOP_NAME: &str = "io.github.tirbofish.pdcli.open-document.desktop";
 const ICONS: [(&str, &str); 2] = [
     (
         "application-vnd.proton.doc.svg",
-        include_str!(
-            "../../../packaging/icons/hicolor/scalable/mimetypes/application-vnd.proton.doc.svg"
-        ),
+        include_str!("../assets/icons/application-vnd.proton.doc.svg"),
     ),
     (
         "application-vnd.proton.sheet.svg",
-        include_str!(
-            "../../../packaging/icons/hicolor/scalable/mimetypes/application-vnd.proton.sheet.svg"
-        ),
+        include_str!("../assets/icons/application-vnd.proton.sheet.svg"),
     ),
 ];
 

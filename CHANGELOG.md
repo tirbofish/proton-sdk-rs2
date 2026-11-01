@@ -1,7 +1,22 @@
 # Changelog
 
-## 0.5.0 - 2026-10-22
+## 0.5.0 - 2026-11-02 (GTK rehaul)
 
+- feat(pdcli): remove a computer and its backups
+- feat(pdcli): show transfer speed, time left and step in the tray
+- feat(pdcli): download public links and manage link bookmarks
+- feat(pdcli): shared-with-me, shared-by-me and invitations
+- feat(pdcli): read and export Proton Docs from the command line
+- feat(pdcli): trash and version history
+- feat(pdcli): stream large files from the mount instead of downloading them whole
+- feat(pdcli): offline availability, photo previews, tray progress, Docs shortcuts
+- feat(pdcli): recursive photo uploading
+- feat(drive-sdk): report upload progress as bytes are sent
+- fix(drive-sdk): download every block of files over 40 MiB
+- fix(drive-sdk): report failed device deletions
+- fix(pdcli): commit the tray icon that *.png was ignoring
+- chore: remove unused code that caused build warnings
+- docs: rewrite the READMEs and add desktop screenshots
 - Bump all workspace crates from 0.4.0 to 0.5.0. `get_available_name` takes a node type, `delete_album` takes `save_to_timeline`, and the experimental search traits follow upstream's new interface.
 - feat(drive-sdk): sync upstream SDK v0.22.2
 - feat(drive-sdk): sync crypto time with the API

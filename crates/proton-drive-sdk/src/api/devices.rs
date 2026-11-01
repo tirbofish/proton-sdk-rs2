@@ -206,8 +206,9 @@ impl DevicesApiClient for DefaultDevicesApiClient {
     async fn delete_device(&self, device_id: &str) -> anyhow::Result<()> {
         let url = self.base_url.join(&format!("devices/{device_id}"))?;
         let builder = self.add_auth(self.client.delete(url)).await?;
-        builder.send().await?;
-        Ok(())
+        ApiResponse::from_response(builder.send().await?)
+            .await?
+            .to_result()
     }
 
     async fn clear_device_share_name(&self, device_id: &str) -> anyhow::Result<()> {

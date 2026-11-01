@@ -22,7 +22,6 @@ mod pdignore;
 mod photo_cache;
 mod photos;
 mod public;
-mod quoted;
 mod service;
 mod share;
 mod shortcuts;

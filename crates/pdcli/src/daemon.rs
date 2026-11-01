@@ -133,13 +133,6 @@ pub fn open_folder() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn recent_events() -> Vec<crate::db::SyncEvent> {
-    request("events")
-        .ok()
-        .and_then(|response| serde_json::from_str(&response).ok())
-        .unwrap_or_default()
-}
-
 pub fn request_quit() -> anyhow::Result<()> {
     let mut stream = UnixStream::connect(socket_path()?)?;
     stream.set_write_timeout(Some(Duration::from_millis(500)))?;

@@ -1465,7 +1465,6 @@ mod tests {
 
     #[test]
     fn yjs_text_update_to_markdown() {
-        use yrs::updates::encoder::Encode;
         use yrs::{ReadTxn, Text, Transact};
 
         let src = yrs::Doc::new();
@@ -1621,7 +1620,7 @@ mod tests {
 
     #[test]
     fn reads_y_protocols_wrapped_update() {
-        use yrs::{ReadTxn, Text, Transact, WriteTxn};
+        use yrs::{ReadTxn, Text, Transact};
         let src = yrs::Doc::new();
         {
             let text = src.get_or_insert_text("weird-root");

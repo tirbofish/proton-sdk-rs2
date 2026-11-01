@@ -70,7 +70,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml crates/pdcli/Cargo.toml debian/changelog \
+          git add Cargo.toml Cargo.lock crates/pdcli/Cargo.toml debian/changelog \
             packaging/rpm/pdcli.spec packaging/arch/PKGBUILD docs/RELEASE.md CHANGELOG.md
           git commit -m "release: v${{ steps.prepare.outputs.version }}"
           git tag "v${{ steps.prepare.outputs.version }}"

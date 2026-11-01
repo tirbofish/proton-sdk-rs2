@@ -12,6 +12,25 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+WORKSPACE_CRATES = ("proton-sdk-rs2", "proton-drive-sdk", "pdcli")
+
+
+def read(path: pathlib.Path) -> str:
+    """Reads a file without translating CRLF line endings."""
+    with open(path, encoding="utf-8", newline="") as handle:
+        return handle.read()
+
+
+def write(path: pathlib.Path, text: str) -> None:
+    """Writes a file exactly as given, so existing line endings survive."""
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        handle.write(text)
+
+
+def in_file_style(existing: str, added: str) -> str:
+    """Gives new text the line ending the existing file mostly uses."""
+    crlf = existing.count("\r\n")
+    return added.replace("\n", "\r\n") if crlf > existing.count("\n") - crlf else added
 
 
 def run(args: list[str]) -> str:
@@ -21,7 +40,7 @@ def run(args: list[str]) -> str:
 def current_version() -> str:
     match = re.search(
         r'^package\.version\s*=\s*"([^"]+)"',
-        (ROOT / "Cargo.toml").read_text(),
+        read(ROOT / "Cargo.toml"),
         re.M,
     )
     if not match:
@@ -48,11 +67,11 @@ def crate_req(version: str) -> str:
 
 
 def replace_file(path: pathlib.Path, pattern: str, repl: str, count: int = 1) -> None:
-    text = path.read_text()
+    text = read(path)
     updated, n = re.subn(pattern, repl, text, count=count, flags=re.M)
     if n == 0:
         raise SystemExit(f"no match for {pattern!r} in {path}")
-    path.write_text(updated)
+    write(path, updated)
 
 
 def previous_tag() -> str | None:
@@ -106,48 +125,55 @@ def update_files(old: str, new: str, notes: list[str]) -> None:
         f'proton-drive-sdk = {{ version = "{new_req}", path = "../proton-drive-sdk"',
     )
 
+    lock = ROOT / "Cargo.lock"
+    for crate in WORKSPACE_CRATES:
+        replace_file(
+            lock,
+            rf'^(name = "{re.escape(crate)}"\r?\nversion = )"{re.escape(old)}"',
+            rf'\g<1>"{new}"',
+        )
+
     debian = ROOT / "debian/changelog"
-    debian.write_text(
-        f"pdcli ({new}-1) unstable; urgency=medium\n\n"
-        f"  * Release {new}.\n\n"
-        f" -- pdcli contributors <4tkbytes@pm.me>  {rfc2822_now()}\n\n"
-        + debian.read_text()
+    debian_text = read(debian)
+    write(
+        debian,
+        in_file_style(
+            debian_text,
+            f"pdcli ({new}-1) unstable; urgency=medium\n\n"
+            f"  * Release {new}.\n\n"
+            f" -- pdcli contributors <4tkbytes@pm.me>  {rfc2822_now()}\n\n",
+        )
+        + debian_text,
     )
 
-    spec = ROOT / "packaging/rpm/pdcli.spec"
-    spec_text = spec.read_text()
-    spec_text = re.sub(r"^Version:\s+.*$", f"Version:        {new}", spec_text, count=1, flags=re.M)
-    spec_text = spec_text.replace(
-        "%changelog\n",
-        "%changelog\n"
-        f"* {rpm_date()} pdcli contributors <4tkbytes@pm.me> - {new}-1\n"
-        f"- Release {new}\n",
-        1,
+    replace_file(ROOT / "packaging/rpm/pdcli.spec", r"^Version:[ \t]+[^\r\n]*", f"Version:        {new}")
+    replace_file(
+        ROOT / "packaging/rpm/pdcli.spec",
+        r"^%changelog(\r?\n)",
+        rf"%changelog\g<1>* {rpm_date()} pdcli contributors <4tkbytes@pm.me> - {new}-1\g<1>- Release {new}\g<1>",
     )
-    spec.write_text(spec_text)
-
-    replace_file(ROOT / "packaging/arch/PKGBUILD", r"^pkgver=.*$", f"pkgver={new}")
-
-    release_doc = ROOT / "docs/RELEASE.md"
-    release_text = release_doc.read_text()
-    release_text = re.sub(r"^# pdcli .*$", f"# pdcli {new}", release_text, count=1, flags=re.M)
-    release_doc.write_text(release_text)
+    replace_file(ROOT / "packaging/arch/PKGBUILD", r"^pkgver=[^\r\n]*", f"pkgver={new}")
+    replace_file(ROOT / "docs/RELEASE.md", r"^# pdcli [^\r\n]*", f"# pdcli {new}")
 
     changelog = ROOT / "CHANGELOG.md"
     section = f"## {new} - {iso_date()}\n\n" + "\n".join(notes) + "\n\n"
     if changelog.exists():
-        body = changelog.read_text()
+        body = read(changelog)
         if not body.startswith("# Changelog"):
-            body = "# Changelog\n\n" + body
-        parts = body.split("\n", 2)
-        rest = parts[2] if len(parts) == 3 else ""
-        changelog.write_text("# Changelog\n\n" + section + rest.lstrip("\n"))
+            body = in_file_style(body, "# Changelog\n\n") + body
+        heading, _, rest = body.partition("\n")
+        rest = rest.lstrip("\r\n")
+        write(changelog, heading + "\n" + in_file_style(body, "\n" + section) + rest)
     else:
-        changelog.write_text("# Changelog\n\n" + section)
+        write(changelog, "# Changelog\n\n" + section)
 
+    write_release_notes(new, notes)
+
+
+def write_release_notes(version: str, notes: list[str]) -> None:
     notes_path = ROOT / "dist/release-notes.md"
     notes_path.parent.mkdir(parents=True, exist_ok=True)
-    notes_path.write_text(f"# pdcli {new}\n\n" + "\n".join(notes) + "\n")
+    write(notes_path, f"# pdcli {version}\n\n" + "\n".join(notes) + "\n")
 
 
 def main() -> int:
@@ -161,9 +187,7 @@ def main() -> int:
     if args.bump != "none":
         update_files(old, new, notes)
     else:
-        notes_path = ROOT / "dist/release-notes.md"
-        notes_path.parent.mkdir(parents=True, exist_ok=True)
-        notes_path.write_text(f"# pdcli {new}\n\n" + "\n".join(notes) + "\n")
+        write_release_notes(new, notes)
 
     output = f"version={new}\ntag=v{new}\n"
     print(output, end="")

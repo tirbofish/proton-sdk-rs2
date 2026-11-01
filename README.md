@@ -2,9 +2,9 @@
 
 An unofficial Rust port of the Proton Drive SDK, plus **pdcli**, a GTK4 and FUSE Proton Drive client for Linux.
 
-![pdcli Desktop showing a Drive folder](docs/screenshots/files.png)
+![pdcli Desktop showing a Drive folder](https://raw.githubusercontent.com/tirbofish/proton-sdk-rs2/main/docs/screenshots/files.png)
 
-![The actual files being shown](docs/screenshots/dolphin.png)
+![The actual files being shown](https://raw.githubusercontent.com/tirbofish/proton-sdk-rs2/main/docs/screenshots/dolphin.png)
 
 > This is community software, not a Proton product. It can change files in your
 > Drive. Keep an independent backup of anything important, and always remember the 3-2-1 backup rule. 
@@ -22,22 +22,22 @@ pdcli mount
 ls ~/ProtonDrive/MyFiles
 ```
 
-See the [pdcli README](crates/pdcli/README.md) for features and commands.
+See the [pdcli README](https://github.com/tirbofish/proton-sdk-rs2/blob/main/crates/pdcli/README.md) for features and commands.
 
 ## Crates
 
 | Crate | Purpose |
 | --- | --- |
-| [`proton-sdk-rs2`](crates/proton-sdk-rs2) | Authentication, sessions and account APIs |
-| [`proton-drive-sdk`](crates/proton-drive-sdk) | Drive, Photos, sharing, transfers and encrypted caching |
-| [`pdcli`](crates/pdcli) | The command-line client, desktop app and FUSE mount |
+| [`proton-sdk-rs2`](https://crates.io/crates/proton-sdk-rs2) | Authentication, sessions and account APIs |
+| [`proton-drive-sdk`](https://crates.io/crates/proton-drive-sdk) | Drive, Photos, sharing, transfers and encrypted caching |
+| [`pdcli`](https://crates.io/crates/pdcli) | The command-line client, desktop app and FUSE mount |
 
 ## Install
 
 Release builds and `.deb` packages are on the
 [releases page](https://github.com/tirbofish/proton-sdk-rs2/releases). Recipes
 for Debian, Fedora and Arch packages are in
-[`packaging/README.md`](packaging/README.md).
+[`packaging/README.md`](https://github.com/tirbofish/proton-sdk-rs2/blob/main/packaging/README.md).
 
 ### From source
 
@@ -64,4 +64,4 @@ cargo install --locked --path crates/pdcli
 
 ## License
 
-MIT. See [`LICENSE.md`](LICENSE.md).
+MIT. See [`LICENSE.md`](https://github.com/tirbofish/proton-sdk-rs2/blob/main/LICENSE.md).

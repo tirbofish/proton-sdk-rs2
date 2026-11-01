@@ -1,8 +1,10 @@
 #[cfg(target_os = "linux")]
 #[path = "../credentials.rs"]
+#[allow(dead_code)] // shared with pdcli; the GUI only reads credentials
 mod credentials;
 #[cfg(target_os = "linux")]
 #[path = "../pdignore.rs"]
+#[allow(dead_code)] // shared with pdcli; the GUI only edits the global file
 mod pdignore;
 
 #[cfg(target_os = "linux")]
@@ -1099,6 +1101,46 @@ mod desktop {
         dialog.set_close_response("cancel");
         dialog.connect_response(Some("confirm"), move |_, _| apply());
         dialog.present();
+    }
+
+    fn remove_computer_button(
+        window: &adw::ApplicationWindow,
+        tx: &Sender<Event>,
+        id: String,
+        name: String,
+    ) -> gtk4::Button {
+        let button = gtk4::Button::from_icon_name("user-trash-symbolic");
+        button.set_tooltip_text(Some("Remove Computer"));
+        button.set_valign(gtk4::Align::Center);
+        button.add_css_class("flat");
+        let window = window.clone();
+        let tx = tx.clone();
+        button.connect_clicked(move |_| {
+            let tx = tx.clone();
+            let id = id.clone();
+            confirm_dialog(
+                &window,
+                "Remove Computer?",
+                &format!(
+                    "“{name}” and all of its backups will be deleted from Drive. \
+                     Files on your computers are kept. This cannot be undone."
+                ),
+                "Remove",
+                move || {
+                    command(
+                        &tx,
+                        "Remove computer",
+                        vec![
+                            "computers".into(),
+                            "remove".into(),
+                            id.clone(),
+                            "--yes".into(),
+                        ],
+                    );
+                },
+            );
+        });
+        button
     }
 
     fn present_about(window: &adw::ApplicationWindow) {
@@ -3364,6 +3406,12 @@ mod desktop {
                                                     );
                                                     expander.add_row(&job_row);
                                                 }
+                                                expander.add_suffix(&remove_computer_button(
+                                                    &window,
+                                                    &tx,
+                                                    computer.id,
+                                                    computer.name,
+                                                ));
                                                 computer_rows.append(&expander);
                                             }
                                         }
@@ -3569,6 +3617,7 @@ mod desktop {
                                 } else if action == "Register computer"
                                     || action == "Add backup"
                                     || action == "Unsync"
+                                    || action == "Remove computer"
                                     || action == "Restore"
                                 {
                                     command(

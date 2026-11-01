@@ -44,7 +44,6 @@ pub struct ComputersState {
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub this_device_id: Option<String>,
-    pub this_name: Option<String>,
     pub computers: Vec<Device>,
     pub jobs: Vec<SyncJob>,
 }
@@ -60,6 +59,14 @@ impl ComputersState {
         }
         self.jobs.push(job);
         Ok(())
+    }
+
+    fn forget_device(&mut self, device_id: &str) {
+        self.jobs.retain(|job| job.device_id != device_id);
+        if self.device_id.as_deref() == Some(device_id) {
+            self.device_id = None;
+            self.name = None;
+        }
     }
 
     fn remove_job(&mut self, id_or_name: &str) -> bool {
@@ -292,6 +299,14 @@ pub async fn run_cli(
                 job.name, computer, job.local_path
             );
         }
+        Some(flags::ComputersCommand::Remove { computer, yes }) => {
+            let device = find_device(&drive, &computer).await?;
+            if !yes && !confirm_remove(&device.name)? {
+                anyhow::bail!("cancelled");
+            }
+            remove(&drive, &device).await?;
+            println!("removed {} and its backups from Drive", device.name);
+        }
         Some(flags::ComputersCommand::Unsync { job }) => {
             if unsync(&job)? {
                 println!("removed sync job {job}");
@@ -318,7 +333,6 @@ pub async fn snapshot(drive: &ProtonDriveClient) -> anyhow::Result<Snapshot> {
     let computers = drive.list_devices().await?;
     Ok(Snapshot {
         this_device_id: state.device_id,
-        this_name: state.name,
         computers,
         jobs: state.jobs,
     })
@@ -399,11 +413,7 @@ pub async fn restore(
     std::fs::create_dir_all(&local_path)?;
     let local_path = std::fs::canonicalize(&local_path).unwrap_or(local_path);
 
-    let devices = drive.list_devices().await?;
-    let device = devices
-        .into_iter()
-        .find(|device| device.device_id == computer || device.name.eq_ignore_ascii_case(computer))
-        .ok_or_else(|| anyhow::anyhow!("computer '{computer}' not found"))?;
+    let device = find_device(drive, computer).await?;
 
     let remote = resolve_remote_folder(drive, device.root_uid.clone(), folder).await?;
     let name = split_remote_path(folder)
@@ -422,6 +432,44 @@ pub async fn restore(
     state.add_job(job.clone())?;
     save_state(&state)?;
     Ok(job)
+}
+
+async fn find_device(drive: &ProtonDriveClient, computer: &str) -> anyhow::Result<Device> {
+    let devices = drive.list_devices().await?;
+    if let Some(device) = devices.iter().find(|device| device.device_id == computer) {
+        return Ok(device.clone());
+    }
+    let mut named = devices
+        .into_iter()
+        .filter(|device| device.name.eq_ignore_ascii_case(computer));
+    match (named.next(), named.next()) {
+        (Some(device), None) => Ok(device),
+        (Some(_), Some(_)) => {
+            anyhow::bail!("more than one computer is named '{computer}'; use its ID instead")
+        }
+        _ => anyhow::bail!("computer '{computer}' not found"),
+    }
+}
+
+fn confirm_remove(name: &str) -> anyhow::Result<bool> {
+    use std::io::{BufRead, IsTerminal, Write};
+    anyhow::ensure!(
+        std::io::stdin().is_terminal(),
+        "pass --yes to remove '{name}' without a prompt"
+    );
+    eprint!("Delete '{name}' and all of its backups from Drive? This cannot be undone. [y/N] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
+}
+
+/// Deletes the computer from Drive, then forgets every local job that synced to it.
+pub async fn remove(drive: &ProtonDriveClient, device: &Device) -> anyhow::Result<()> {
+    drive.delete_device(&device.device_id).await?;
+    let mut state = load_state();
+    state.forget_device(&device.device_id);
+    save_state(&state)
 }
 
 pub fn unsync(id_or_name: &str) -> anyhow::Result<bool> {
@@ -986,6 +1034,36 @@ mod tests {
             split_remote_path("/Documents/Work/"),
             vec!["Documents", "Work"]
         );
+    }
+
+    #[test]
+    fn removing_a_computer_forgets_its_jobs_and_registration() {
+        let job = |path: &str, device: &str| SyncJob {
+            id: path.into(),
+            name: path.into(),
+            local_path: path.into(),
+            remote_uid: "vol~link".into(),
+            device_id: device.into(),
+        };
+        let mut state = ComputersState {
+            device_id: Some("gone".into()),
+            name: Some("Old PC".into()),
+            jobs: vec![job("/a", "gone"), job("/b", "kept"), job("/c", "gone")],
+        };
+        state.forget_device("gone");
+        assert_eq!(state.device_id, None);
+        assert_eq!(state.name, None);
+        let remaining: Vec<_> = state
+            .jobs
+            .iter()
+            .map(|job| job.local_path.as_str())
+            .collect();
+        assert_eq!(remaining, ["/b"]);
+
+        state.device_id = Some("kept".into());
+        state.forget_device("other");
+        assert_eq!(state.device_id.as_deref(), Some("kept"));
+        assert_eq!(state.jobs.len(), 1);
     }
 
     #[test]

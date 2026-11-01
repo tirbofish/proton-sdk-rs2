@@ -415,6 +415,14 @@ pub enum ComputersCommand {
     },
     /// Stop a sync job without deleting local or cloud files
     Unsync { job: String },
+    /// Delete a computer and all of its backups from Drive. Local files are kept
+    Remove {
+        /// Computer name or ID
+        computer: String,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]

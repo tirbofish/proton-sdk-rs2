@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.1 - 2026-11-02
+
+- docs: use absolute links in the root README so crates.io shows the screenshots
+
 ## 0.5.0 - 2026-11-02 (GTK rehaul)
 
 - feat(pdcli): remove a computer and its backups

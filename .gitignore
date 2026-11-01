@@ -26,6 +26,8 @@ cache.json
 proton-sdk-c-sharp
 sdk
 *.png
+!crates/pdcli/icon.png
+!docs/screenshots/*.png
 
 GEMINI.md
 
